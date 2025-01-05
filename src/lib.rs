@@ -1,3 +1,5 @@
+mod interrupt;
+
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -53,9 +55,25 @@ impl Exec {
         Ok((status, std_out, std_err))
     }
 
+    pub async fn terminate(&mut self, graceful_shutdown_timeout: Duration) -> io::Result<()> {
+        // Try graceful shutdown first.
+        interrupt::send_interrupt(&self.child).await?;
+
+        // Wait with timeout
+        match tokio::time::timeout(graceful_shutdown_timeout, self.child.wait()).await {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // Force kill if timeout
+                self.kill().await
+            }
+        }
+    }
+
     #[allow(unused)]
     pub async fn kill(&mut self) -> io::Result<()> {
-        self.child.kill().await
+        self.child.kill().await?;
+        self.child.wait().await?;
+        Ok(())
     }
 }
 
@@ -169,11 +187,11 @@ impl OutputStream {
     pub fn inspect_async<F>(&self, f: F) -> Inspector
     where
         F: Fn(
-            String,
-        )
-            -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send>>
-        + Send
-        + 'static,
+                String,
+            )
+                -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send>>
+            + Send
+            + 'static,
     {
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -254,12 +272,12 @@ impl OutputStream {
     where
         T: Debug + Send + Sync + 'static,
         F: Fn(
-            String,
-            &mut T,
-        ) -> Pin<
-            Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + '_>,
-        > + Send
-        + 'static,
+                String,
+                &mut T,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + '_>,
+            > + Send
+            + 'static,
     {
         let target = Arc::new(RwLock::new(into));
 
