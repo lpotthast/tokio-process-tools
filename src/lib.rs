@@ -18,7 +18,7 @@ use tracing::info;
 
 #[derive(Debug)]
 pub struct TerminateOnDrop {
-    pub(crate) exec: ProcessHandle,
+    pub(crate) process_handle: ProcessHandle,
     pub(crate) graceful_termination_timeout: Option<Duration>,
     pub(crate) forceful_termination_timeout: Option<Duration>,
 }
@@ -50,9 +50,9 @@ impl Drop for TerminateOnDrop {
         // or because we crashed due to a panic.
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                tracing::debug!("Terminating process");
+                tracing::debug!(process = self.process_handle.name, "Terminating process");
                 match self
-                    .exec
+                    .process_handle
                     .terminate(
                         self.graceful_termination_timeout,
                         self.forceful_termination_timeout,
@@ -60,10 +60,17 @@ impl Drop for TerminateOnDrop {
                     .await
                 {
                     Ok(exit_status) => {
-                        tracing::debug!(exit_status, "Successfully Terminated process")
+                        tracing::debug!(
+                            process = self.process_handle.name,
+                            ?exit_status,
+                            "Successfully Terminated process"
+                        )
                     }
                     Err(err) => {
-                        panic!("Failed to terminate process: {}", err);
+                        panic!(
+                            "Failed to terminate process '{}': {}",
+                            self.process_handle.name, err
+                        );
                     }
                 };
             });
@@ -119,7 +126,7 @@ impl ProcessHandle {
         forceful_termination_timeout: Option<Duration>,
     ) -> TerminateOnDrop {
         TerminateOnDrop {
-            exec: self,
+            process_handle: self,
             graceful_termination_timeout,
             forceful_termination_timeout,
         }
