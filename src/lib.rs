@@ -16,16 +16,74 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::error::Elapsed;
 use tracing::info;
 
-pub struct Exec {
+#[derive(Debug)]
+pub struct TerminateOnDrop {
+    pub(crate) exec: ProcessHandle,
+    pub(crate) graceful_termination_timeout: Option<Duration>,
+    pub(crate) forceful_termination_timeout: Option<Duration>,
+}
+
+impl Drop for TerminateOnDrop {
+    fn drop(&mut self) {
+        // 1. First, we're in a Drop implementation which is synchronous - it can't be async.
+        // But we need to execute an async operation (the `terminate` call).
+        //
+        // 2. `block_on` is needed because it takes an async operation and runs it to completion
+        // synchronously - it's how we can execute our async terminate call within the synchronous
+        // drop.
+        //
+        // 3. However, block_on by itself isn't safe to call from within an async context
+        // (which we are in since we're inside the Tokio runtime).
+        // This is because it could lead to deadlocks - imagine if the current thread is needed to
+        // process some task that our blocked async operation is waiting on.
+        //
+        // 4. This is where block_in_place comes in - it tells Tokio:
+        // "hey, I'm about to block this thread, please make sure other threads are available to
+        // still process tasks". It essentially moves the blocking work to a dedicated thread pool
+        // so that the async runtime can continue functioning.
+        //
+        // 5. Note that `block_in_place` requires a multithreaded tokio runtime to be active!
+        // So use `#[tokio::test(flavor = "multi_thread")]` in tokio-enabled tests.
+        //
+        // 6. Also note that `block_in_place` enforces that the given closure run to completion,
+        // even when the async executor is terminated - this might be because our program ended
+        // or because we crashed due to a panic.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tracing::debug!("Terminating process");
+                match self
+                    .exec
+                    .terminate(
+                        self.graceful_termination_timeout,
+                        self.forceful_termination_timeout,
+                    )
+                    .await
+                {
+                    Ok(exit_status) => {
+                        tracing::debug!(exit_status, "Successfully Terminated process")
+                    }
+                    Err(err) => {
+                        panic!("Failed to terminate process: {}", err);
+                    }
+                };
+            });
+        });
+    }
+}
+
+pub struct ProcessHandle {
+    name: &'static str,
     child: Child,
     std_out_stream: OutputStream,
     std_err_stream: OutputStream,
 }
 
-impl Exec {
-    pub fn new_from_child_with_piped_io(child: Child) -> Self {
+impl ProcessHandle {
+    // TODO: Take an additional `name` arg for logging purposes only.
+    pub fn new_from_child_with_piped_io(name: &'static str, child: Child) -> Self {
         let (child, std_out_stream, std_err_stream) = extract_output_streams(child);
         Self {
+            name,
             child,
             std_out_stream,
             std_err_stream,
@@ -53,6 +111,18 @@ impl Exec {
         let std_err = err_collector.abort().await;
 
         Ok((status, std_out, std_err))
+    }
+
+    pub fn terminate_on_drop(
+        self,
+        graceful_termination_timeout: Option<Duration>,
+        forceful_termination_timeout: Option<Duration>,
+    ) -> TerminateOnDrop {
+        TerminateOnDrop {
+            exec: self,
+            graceful_termination_timeout,
+            forceful_termination_timeout,
+        }
     }
 
     pub async fn terminate(
@@ -88,7 +158,7 @@ impl Exec {
     }
 }
 
-impl Debug for Exec {
+impl Debug for ProcessHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Exec")
             .field("child", &self.child)
@@ -481,7 +551,7 @@ mod test {
 
     use tokio::process::Command;
 
-    use crate::Exec;
+    use crate::ProcessHandle;
 
     #[tokio::test]
     async fn test() {
@@ -490,7 +560,7 @@ mod test {
             .stderr(Stdio::piped())
             .spawn()
             .expect("Failed to spawn `ls` command");
-        let mut exec = Exec::new_from_child_with_piped_io(child);
+        let mut exec = ProcessHandle::new_from_child_with_piped_io("ls", child);
         let (status, stdout, stderr) = exec.wait_with_output().await.unwrap();
         println!("{:?}", status);
         println!("{:?}", stdout);
@@ -504,7 +574,7 @@ mod test {
             .stderr(Stdio::piped())
             .spawn()
             .expect("Failed to spawn `ls` command");
-        let mut exec = Exec::new_from_child_with_piped_io(child);
+        let mut exec = ProcessHandle::new_from_child_with_piped_io("ls", child);
 
         let mut temp_file_out = tempfile::tempfile().unwrap();
         let mut temp_file_err = tempfile::tempfile().unwrap();
@@ -536,7 +606,7 @@ mod test {
             .stderr(Stdio::piped())
             .spawn()
             .expect("Failed to spawn `ls` command");
-        let mut exec = Exec::new_from_child_with_piped_io(child);
+        let mut exec = ProcessHandle::new_from_child_with_piped_io("ls", child);
 
         let mut temp_file_out: File = tempfile::tempfile().unwrap();
         let mut temp_file_err: File = tempfile::tempfile().unwrap();
