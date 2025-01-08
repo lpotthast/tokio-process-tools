@@ -55,25 +55,36 @@ impl Exec {
         Ok((status, std_out, std_err))
     }
 
-    pub async fn terminate(&mut self, graceful_shutdown_timeout: Duration) -> io::Result<()> {
-        // Try graceful shutdown first.
+    pub async fn terminate(
+        &mut self,
+        graceful_shutdown_timeout: Option<Duration>,
+        forceful_shutdown_timeout: Option<Duration>,
+    ) -> io::Result<ExitStatus> {
+        // Try a graceful shutdown first.
         interrupt::send_interrupt(&self.child).await?;
 
-        // Wait with timeout
-        match tokio::time::timeout(graceful_shutdown_timeout, self.child.wait()).await {
-            Ok(_) => Ok(()),
-            Err(_) => {
-                // Force kill if timeout
-                self.kill().await
+        // Wait for process termination.
+        match self.await_termination(graceful_shutdown_timeout).await {
+            Ok(exit_status) => Ok(exit_status),
+            Err(_err) => {
+                // Graceful shutdown did not lead to process termination.
+                // Try a forceful kill.
+                self.child.kill().await?;
+
+                // And again, wait for termination.
+                self.await_termination(forceful_shutdown_timeout).await
             }
         }
     }
 
-    #[allow(unused)]
-    pub async fn kill(&mut self) -> io::Result<()> {
-        self.child.kill().await?;
-        self.child.wait().await?;
-        Ok(())
+    async fn await_termination(&mut self, timeout: Option<Duration>) -> io::Result<ExitStatus> {
+        match timeout {
+            None => self.child.wait().await,
+            Some(timeout) => match tokio::time::timeout(timeout, self.child.wait()).await {
+                Ok(exit_status) => exit_status,
+                Err(err) => Err(err.into()),
+            },
+        }
     }
 }
 
