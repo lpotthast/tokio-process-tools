@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::Child;
 use tokio::sync::RwLock;
 use tokio::task::{AbortHandle, JoinHandle};
@@ -262,6 +262,33 @@ impl OutputStream {
         self.collect(Vec::new(), |line, vec| vec.push(line))
     }
 
+    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+    pub fn collect_into_write<W: Sink + AsyncWriteExt + Unpin>(&self, write: W) -> Collector<W> {
+        self.collect_async(write, move |line, write| {
+            Box::pin(async move {
+                write.write_all(line.as_bytes()).await?;
+                write.write_all("\n".as_bytes()).await?;
+                Ok(())
+            })
+        })
+    }
+
+    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+    pub fn collect_into_write_mapped<W: Sink + AsyncWriteExt + Unpin, B: AsRef<[u8]> + Send>(
+        &self,
+        write: W,
+        mapper: impl Fn(String) -> B + Send + Sync + Copy + 'static,
+    ) -> Collector<W> {
+        self.collect_async(write, move |line, write| {
+            Box::pin(async move {
+                let mapped = mapper(line);
+                let mapped = mapped.as_ref();
+                write.write_all(mapped).await?;
+                Ok(())
+            })
+        })
+    }
+
     /// This function is cancel safe.
     pub async fn wait_for(&self, predicate: impl Fn(String) -> bool + Send + 'static) -> WaitFor {
         let mut receiver = self.subscribe();
@@ -362,4 +389,44 @@ pub(crate) fn extract_output_streams(
             sender: tx_stderr,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ProcessHandle;
+    use std::process::Stdio;
+
+    #[tokio::test]
+    async fn collect_into_write() {
+        let child = tokio::process::Command::new("ls")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let mut handle = ProcessHandle::new_from_child_with_piped_io("ls", child);
+
+        let file1 = tokio::fs::File::create(
+            std::env::temp_dir()
+                .join("tokio_process_tools_test_write_with_predefined_collector_1.txt"),
+        )
+        .await
+        .unwrap();
+        let file2 = tokio::fs::File::create(
+            std::env::temp_dir()
+                .join("tokio_process_tools_test_write_with_predefined_collector_2.txt"),
+        )
+        .await
+        .unwrap();
+
+        let collector1 = handle.stdout().collect_into_write(file1);
+
+        let collector2 = handle
+            .stdout()
+            .collect_into_write_mapped(file2, |line| format!("ok-{}", line));
+
+        let _exit_status = handle.wait().await.unwrap();
+        let _file = collector1.abort().await.unwrap();
+        let _file = collector2.abort().await.unwrap();
+    }
 }

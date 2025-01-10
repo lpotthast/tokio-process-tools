@@ -1,5 +1,4 @@
 mod collector;
-pub mod collectors;
 mod inspector;
 mod interrupt;
 mod output_stream;
