@@ -52,17 +52,19 @@ Add the following line to your `Cargo.toml` to include this library as part of y
 
 ```toml
 [dependencies]
-tokio-process-tools = { path = "path/to/tokio-process-tools" }
+tokio-process-tools = "0.1.0"
 ```
 
-Ensure that `tokio` runtime is also set up in your project, use the `"full"` feature if needed:
+Ensure that the `tokio` runtime is also set up in your project. Only use the features you need!:
 
 ```toml
 [dependencies]
 tokio = { version = "1.43.0", features = ["full"] }
 ```
 
-**IMPORTANT**: This libraries `TerminateOnDrop` type requires your code to run in a multithreaded runtime! Dropping a
+**IMPORTANT**:
+
+This libraries `TerminateOnDrop` type requires your code to run in a multithreaded runtime! Dropping a
 `TerminateOnDrop` in a single-threaded runtime will lead to a panic.
 
 This also holds for unit tests! Annotate your tokio-enabled tests dealing with a `TerminateOnDrop` with
