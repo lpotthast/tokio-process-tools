@@ -61,6 +61,16 @@ mod test {
             .return_const(());
         out_mock
             .expect_call_function()
+            .with(predicate::eq("LICENSE-APACHE".to_string()))
+            .times(1)
+            .return_const(());
+        out_mock
+            .expect_call_function()
+            .with(predicate::eq("LICENSE-MIT".to_string()))
+            .times(1)
+            .return_const(());
+        out_mock
+            .expect_call_function()
             .with(predicate::eq("README.md".to_string()))
             .times(1)
             .return_const(());
