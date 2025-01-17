@@ -2,6 +2,16 @@
 name = "tokio-process-tools"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.78.0"
+repository = "https://github.com/lpotthast/tokio-process-tools"
+description = """
+Interact with processes spawned by tokio.
+"""
+categories = ["asynchronous", "concurrency"]
+keywords = ["tokio", "process", "management", "collector"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+authors = ["Lukas Potthast <privat@lukas-potthast.de>"]
 
 [dependencies]
 thiserror = "2.0.10"
