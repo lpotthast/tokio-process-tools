@@ -45,7 +45,7 @@ Add the following line to your `Cargo.toml` to include this library as part of y
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.1.0"
+tokio-process-tools = "0.3.0"
 ```
 
 Ensure that the `tokio` runtime is also set up in your project. Only use the features you need!:
