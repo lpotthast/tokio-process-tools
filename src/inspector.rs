@@ -22,7 +22,7 @@ pub struct Inspector {
 impl Inspector {
     pub async fn abort(mut self) -> Result<(), InspectorError> {
         if let Some(task_termination_sender) = self.task_termination_sender.take() {
-            // Safety: This `expect` call SHOULD neve fail. The receiver lives in the tokio task,
+            // Safety: This `expect` call SHOULD never fail. The receiver lives in the tokio task,
             // and is only dropped after receiving the termination signal.
             // The task is only awaited-and-dropped after THIS send and only ONCE, gated by taking
             // it out the `Option`, which can only be done once.
