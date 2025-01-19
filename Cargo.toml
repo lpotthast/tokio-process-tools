@@ -1,6 +1,6 @@
 [package]
 name = "tokio-process-tools"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.78.0"
 repository = "https://github.com/lpotthast/tokio-process-tools"
@@ -22,7 +22,7 @@ tracing = "0.1.40"
 nix = { version = "0.29.0", features = ["signal", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Console"] }
 
 [dev-dependencies]
 tempfile = "3.15.0"
