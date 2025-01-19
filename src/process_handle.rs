@@ -62,11 +62,35 @@ pub struct ProcessHandle {
 }
 
 impl ProcessHandle {
-    pub fn spawn(
-        name: impl Into<Cow<'static, str>>,
-        mut cmd: tokio::process::Command,
-    ) -> io::Result<Self> {
-        let child = cmd
+    /// On Windows, you can only send `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` to process groups,
+    /// which works more like `killpg`. Sending to the current process ID will likely trigger
+    /// undefined behavior of sending the event to every process that's attached to the console,
+    /// i.e. sending the event to group ID 0. Therefore, we need to create a new process group
+    /// for the child process we are about to spawn.
+    ///
+    /// See: https://stackoverflow.com/questions/44124338/trying-to-implement-signal-ctrl-c-event-in-python3-6
+    fn prepare_platform_specifics(
+        command: &mut tokio::process::Command,
+    ) -> &mut tokio::process::Command {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+            let flag = if self.graceful_exit {
+                CREATE_NEW_PROCESS_GROUP.0
+            } else {
+                0
+            };
+            command.creation_flags(flag)
+        }
+        #[cfg(not(windows))]
+        {
+            command
+        }
+    }
+
+    fn prepare_command(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+        Self::prepare_platform_specifics(command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // It is much too easy to leave dangling resources here and there.
@@ -75,15 +99,32 @@ impl ProcessHandle {
             // type of solution, less graceful as the `terminate_on_drop` effect but at least
             // capable of cleaning up.
             .kill_on_drop(true)
-            .spawn()?;
-        Ok(Self::new_from_child_with_piped_io(name, child))
     }
 
-    pub fn new_from_child_with_piped_io(name: impl Into<Cow<'static, str>>, child: Child) -> Self {
-        Self::new_from_child_with_piped_io_and_capacity(name, child, 128, 128)
+    pub fn spawn(
+        name: impl Into<Cow<'static, str>>,
+        cmd: tokio::process::Command,
+    ) -> io::Result<Self> {
+        Self::spawn_with_capacity(name, cmd, 128, 128)
     }
 
-    pub fn new_from_child_with_piped_io_and_capacity(
+    pub fn spawn_with_capacity(
+        name: impl Into<Cow<'static, str>>,
+        mut cmd: tokio::process::Command,
+        stdout_channel_capacity: usize,
+        stderr_channel_capacity: usize,
+    ) -> io::Result<Self> {
+        Self::prepare_command(&mut cmd).spawn().map(|child| {
+            Self::new_from_child_with_piped_io_and_capacity(
+                name,
+                child,
+                stdout_channel_capacity,
+                stderr_channel_capacity,
+            )
+        })
+    }
+
+    fn new_from_child_with_piped_io_and_capacity(
         name: impl Into<Cow<'static, str>>,
         child: Child,
         stdout_channel_capacity: usize,

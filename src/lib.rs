@@ -17,17 +17,12 @@ mod test {
     use mockall::*;
     use std::fs::File;
     use std::io::Write;
-    use std::process::Stdio;
     use tokio::process::Command;
 
     #[tokio::test]
     async fn test() {
-        let child = Command::new("ls")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn `ls` command");
-        let mut exec = ProcessHandle::new_from_child_with_piped_io("ls", child);
+        let cmd = Command::new("ls");
+        let mut exec = ProcessHandle::spawn("ls", cmd).expect("Failed to spawn `ls` command");
         let (status, stdout, stderr) = exec.wait_with_output().await.unwrap();
         println!("{:?}", status);
         println!("{:?}", stdout);
@@ -36,12 +31,8 @@ mod test {
 
     #[tokio::test]
     async fn manually_await_with_sync_inspector() {
-        let child = Command::new("ls")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn `ls` command");
-        let mut exec = ProcessHandle::new_from_child_with_piped_io("ls", child);
+        let cmd = Command::new("ls");
+        let mut exec = ProcessHandle::spawn("ls", cmd).expect("Failed to spawn `ls` command");
 
         #[automock]
         trait FunctionCaller {
@@ -109,12 +100,8 @@ mod test {
 
     #[tokio::test]
     async fn manually_await_with_collectors() {
-        let child = Command::new("ls")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn `ls` command");
-        let mut exec = ProcessHandle::new_from_child_with_piped_io("ls", child);
+        let cmd = Command::new("ls");
+        let mut exec = ProcessHandle::spawn("ls", cmd).expect("Failed to spawn `ls` command");
 
         let temp_file_out = tempfile::tempfile().unwrap();
         let temp_file_err = tempfile::tempfile().unwrap();
@@ -137,12 +124,8 @@ mod test {
 
     #[tokio::test]
     async fn manually_await_with_async_collectors() {
-        let child = Command::new("ls")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn `ls` command");
-        let mut exec = ProcessHandle::new_from_child_with_piped_io("ls", child);
+        let cmd = Command::new("ls");
+        let mut exec = ProcessHandle::spawn("ls", cmd).expect("Failed to spawn `ls` command");
 
         let temp_file_out: File = tempfile::tempfile().unwrap();
         let temp_file_err: File = tempfile::tempfile().unwrap();

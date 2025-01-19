@@ -394,17 +394,12 @@ pub(crate) fn extract_output_streams(
 #[cfg(test)]
 mod tests {
     use crate::ProcessHandle;
-    use std::process::Stdio;
 
     #[tokio::test]
     async fn collect_into_write() {
-        let child = tokio::process::Command::new("ls")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let cmd = tokio::process::Command::new("ls");
 
-        let mut handle = ProcessHandle::new_from_child_with_piped_io("ls", child);
+        let mut handle = ProcessHandle::spawn("ls", cmd).unwrap();
 
         let file1 = tokio::fs::File::create(
             std::env::temp_dir()
