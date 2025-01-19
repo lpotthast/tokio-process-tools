@@ -4,8 +4,8 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct TerminateOnDrop {
     pub(crate) process_handle: ProcessHandle,
-    pub(crate) graceful_termination_timeout: Option<Duration>,
-    pub(crate) forceful_termination_timeout: Option<Duration>,
+    pub(crate) interrupt_timeout: Duration,
+    pub(crate) terminate_timeout: Duration,
 }
 
 impl Drop for TerminateOnDrop {
@@ -46,10 +46,7 @@ impl Drop for TerminateOnDrop {
                 tracing::debug!(process = %self.process_handle.name, "Terminating process");
                 match self
                     .process_handle
-                    .terminate(
-                        self.graceful_termination_timeout,
-                        self.forceful_termination_timeout,
-                    )
+                    .terminate(self.interrupt_timeout, self.terminate_timeout)
                     .await
                 {
                     Ok(exit_status) => {

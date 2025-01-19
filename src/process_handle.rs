@@ -1,26 +1,24 @@
 use crate::output_stream::{extract_output_streams, OutputStream};
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{interrupt, WaitError};
+use crate::{signal, WaitError};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Child;
 
 #[derive(Debug, Error)]
 pub enum TerminationError {
-    #[error("Failed to terminate process: {0}")]
-    IoError(#[from] io::Error),
+    #[error("Failed to send signal to process: {0}")]
+    SignallingFailed(#[from] io::Error),
 
-    #[error("Failed to terminate process. Graceful termination failed with: {graceful_error}. Forceful termination failed with: {forceful_error}")]
+    #[error("Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}")]
     TerminationFailed {
-        /// The error that occurred during the graceful termination attempt.
-        graceful_error: io::Error,
-
-        /// The error that occurred during the forceful termination attempt.
-        forceful_error: io::Error,
+        not_terminated_after_sigint: io::Error,
+        not_terminated_after_sigterm: io::Error,
+        not_terminated_after_sigkill: io::Error,
     },
 }
 
@@ -64,6 +62,23 @@ pub struct ProcessHandle {
 }
 
 impl ProcessHandle {
+    pub fn spawn(
+        name: impl Into<Cow<'static, str>>,
+        mut cmd: tokio::process::Command,
+    ) -> io::Result<Self> {
+        let child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // It is much too easy to leave dangling resources here and there.
+            // This library tries to make it clear and encourage users to terminate spawned
+            // processes appropriately. If not done so anyway, this acts as a "last resort"
+            // type of solution, less graceful as the `terminate_on_drop` effect but at least
+            // capable of cleaning up.
+            .kill_on_drop(true)
+            .spawn()?;
+        Ok(Self::new_from_child_with_piped_io(name, child))
+    }
+
     pub fn new_from_child_with_piped_io(name: impl Into<Cow<'static, str>>, child: Child) -> Self {
         Self::new_from_child_with_piped_io_and_capacity(name, child, 128, 128)
     }
@@ -124,50 +139,17 @@ impl ProcessHandle {
 
     pub fn terminate_on_drop(
         self,
-        graceful_termination_timeout: Option<Duration>,
-        forceful_termination_timeout: Option<Duration>,
+        graceful_termination_timeout: Duration,
+        forceful_termination_timeout: Duration,
     ) -> TerminateOnDrop {
         TerminateOnDrop {
             process_handle: self,
-            graceful_termination_timeout,
-            forceful_termination_timeout,
+            interrupt_timeout: graceful_termination_timeout,
+            terminate_timeout: forceful_termination_timeout,
         }
     }
 
-    pub async fn terminate(
-        &mut self,
-        graceful_shutdown_timeout: Option<Duration>,
-        forceful_shutdown_timeout: Option<Duration>,
-    ) -> Result<ExitStatus, TerminationError> {
-        // Try a graceful shutdown first.
-        interrupt::send_interrupt(&self.child).await?;
-
-        // Wait for process termination.
-        match self.await_termination(graceful_shutdown_timeout).await {
-            Ok(exit_status) => Ok(exit_status),
-            Err(graceful_err) => {
-                // Log the graceful shutdown failure
-                tracing::warn!(
-                    process = %self.name,
-                    error = %graceful_err,
-                    "Graceful shutdown failed, attempting forceful termination"
-                );
-
-                // Try a forceful kill
-                match self.child.kill().await {
-                    Ok(()) => match self.await_termination(forceful_shutdown_timeout).await {
-                        Ok(exit_status) => Ok(exit_status),
-                        Err(err) => Err(TerminationError::from(err)),
-                    },
-                    Err(forceful_err) => Err(TerminationError::TerminationFailed {
-                        graceful_error: graceful_err,
-                        forceful_error: forceful_err,
-                    }),
-                }
-            }
-        }
-    }
-
+    /// Wait for this process to run to completion within `timeout` if set or unbound otherwise.
     async fn await_termination(&mut self, timeout: Option<Duration>) -> io::Result<ExitStatus> {
         match timeout {
             None => self.child.wait().await,
@@ -176,5 +158,116 @@ impl ProcessHandle {
                 Err(err) => Err(err.into()),
             },
         }
+    }
+
+    /// Manually sed a `SIGINT` on unix or equivalent on Windows to this process.
+    ///
+    /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
+    pub async fn send_interrupt_signal(&mut self) -> Result<(), io::Error> {
+        signal::send_interrupt(&self.child).await
+    }
+
+    /// Manually sed a `SIGTERM` on unix or equivalent on Windows to this process.
+    ///
+    /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
+    pub async fn send_terminate_signal(&mut self) -> Result<(), io::Error> {
+        signal::send_terminate(&self.child).await
+    }
+
+    /// Terminates this process by sending a `SIGINT`, `SIGTERM` or even a `SIGKILL` if the process
+    /// doesn't run to completion after receiving any of the first two signals.
+    ///
+    /// Recommendation: Use timeout!
+    pub async fn terminate(
+        &mut self,
+        interrupt_timeout: Duration,
+        terminate_timeout: Duration,
+    ) -> Result<ExitStatus, TerminationError> {
+        self.send_interrupt_signal()
+            .await
+            .map_err(TerminationError::SignallingFailed)?;
+
+        match self.await_termination(Some(interrupt_timeout)).await {
+            Ok(exit_status) => Ok(exit_status),
+            Err(not_terminated_after_sigint) => {
+                tracing::warn!(
+                    process = %self.name,
+                    error = %not_terminated_after_sigint,
+                    "Graceful shutdown using SIGINT (or equivalent on current platform) failed. Attempting graceful shutdown using SIGTERM signal."
+                );
+
+                self.send_terminate_signal()
+                    .await
+                    .map_err(TerminationError::SignallingFailed)?;
+
+                match self.await_termination(Some(terminate_timeout)).await {
+                    Ok(exit_status) => Ok(exit_status),
+                    Err(not_terminated_after_sigterm) => {
+                        tracing::warn!(
+                            process = %self.name,
+                            error = %not_terminated_after_sigterm,
+                            "Graceful shutdown using SIGTERM (or equivalent on current platform) failed. Attempting forceful shutdown using SIGKILL signal."
+                        );
+
+                        match self.child.kill().await {
+                            Ok(()) => {
+                                // Note: A SIGKILL should typically (somewhat) immediately lead to
+                                // termination of the process. But there are cases in which even
+                                // a SIGKILL does not / can not / will not kill a process.
+                                // Something must have been horribly gone wrong then...
+                                // But: We do not want to wait indefinitely in case this happens
+                                // and therefore wait for a fixed second after any SIGKILL event.
+                                match self.await_termination(Some(Duration::from_secs(1))).await {
+                                    Ok(exit_status) => Ok(exit_status),
+                                    Err(not_terminated_after_sigkill) => {
+                                        // Unlikely. See note above.
+                                        Err(TerminationError::TerminationFailed {
+                                            not_terminated_after_sigint,
+                                            not_terminated_after_sigterm,
+                                            not_terminated_after_sigkill,
+                                        })
+                                    }
+                                }
+                            }
+                            Err(not_terminated_after_sigkill) => {
+                                tracing::error!(
+                                    process = %self.name,
+                                    error = %not_terminated_after_sigkill,
+                                    "Forceful shutdown using SIGKILL (or equivalent on current platform) failed. Process may still be running. Manual intervention required! Did the process register a shutdown handler?"
+                                );
+
+                                Err(TerminationError::TerminationFailed {
+                                    not_terminated_after_sigint,
+                                    not_terminated_after_sigterm,
+                                    not_terminated_after_sigkill,
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Consumes this handle to provide the wrapped `tokio::process::Child` instance as well as the
+    /// stdout and stderr output streams.
+    pub fn into_inner(self) -> (Child, OutputStream, OutputStream) {
+        (self.child, self.std_out_stream, self.std_err_stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_termination() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("5");
+        let mut handle = ProcessHandle::spawn("sleep", cmd).unwrap();
+        handle
+            .terminate(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 }

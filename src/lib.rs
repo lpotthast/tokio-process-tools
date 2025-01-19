@@ -1,8 +1,8 @@
 mod collector;
 mod inspector;
-mod interrupt;
 mod output_stream;
 mod process_handle;
+mod signal;
 mod terminate_on_drop;
 
 pub use collector::{Collector, CollectorError, Sink};
