@@ -16,16 +16,9 @@ library.
 
 ```rust
 async fn start_server() -> tokio_process_tools::TerminateOnDrop {
-    let child = tokio::process::Command::new("some-long-running-process")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let cmd = tokio::process::Command::new("some-long-running-process");
 
-    let handle = tokio_process_tools::ProcessHandle::new_from_child_with_piped_io(
-        "my-process-handle",
-        child,
-    );
+    let handle = tokio_process_tools::ProcessHandle::spawn("my-process-handle", cmd).unwrap();
 
     let _out_inspector = handle.stdout().inspect(|stdout_line| {
         tracing::debug!(stdout_line, "some-long-running-process wrote");
@@ -40,8 +33,8 @@ async fn start_server() -> tokio_process_tools::TerminateOnDrop {
         .await;
 
     handle.terminate_on_drop(
-        Some(std::time::Duration::from_secs(10)),
-        Some(std::time::Duration::from_secs(10)),
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(8),
     )
 }
 ```
