@@ -34,12 +34,14 @@ pub struct Collector<T: Sink> {
 impl<T: Sink> Collector<T> {
     pub async fn abort(mut self) -> Result<T, CollectorError> {
         if let Some(task_termination_sender) = self.task_termination_sender.take() {
-            // Safety: This `expect` call SHOULD neve fail. The receiver lives in the tokio task,
-            // and is only dropped after receiving the termination signal.
+            // Safety: In normal (non-panic-) scenarios, this call SHOULD never fail.
+            // The receiver lives in the tokio task, and is only dropped after once receiving
+            // the termination signal.
             // The task is only awaited-and-dropped after THIS send and only ONCE, gated by taking
             // it out the `Option`, which can only be done once.
+            // It might fail when a panic occurs.
             if let Err(_err) = task_termination_sender.send(()) {
-                tracing::error!(
+                tracing::trace!(
                     "Unexpected failure when sending termination signal to collector task."
                 );
             };
@@ -54,8 +56,14 @@ impl<T: Sink> Collector<T> {
 impl<T: Sink> Drop for Collector<T> {
     fn drop(&mut self) {
         if let Some(task_termination_sender) = self.task_termination_sender.take() {
+            // Safety: In normal (non-panic-) scenarios, this call SHOULD never fail.
+            // The receiver lives in the tokio task, and is only dropped after once receiving
+            // the termination signal.
+            // The task is only awaited-and-dropped after THIS send and only ONCE, gated by taking
+            // it out the `Option`, which can only be done once.
+            // It might fail when a panic occurs.
             if let Err(_err) = task_termination_sender.send(()) {
-                tracing::error!(
+                tracing::trace!(
                     "Unexpected failure when sending termination signal to collector task."
                 );
             }

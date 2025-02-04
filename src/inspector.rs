@@ -22,12 +22,14 @@ pub struct Inspector {
 impl Inspector {
     pub async fn abort(mut self) -> Result<(), InspectorError> {
         if let Some(task_termination_sender) = self.task_termination_sender.take() {
-            // Safety: This `expect` call SHOULD never fail. The receiver lives in the tokio task,
-            // and is only dropped after receiving the termination signal.
+            // Safety: In normal (non-panic-) scenarios, this call SHOULD never fail.
+            // The receiver lives in the tokio task, and is only dropped after once receiving
+            // the termination signal.
             // The task is only awaited-and-dropped after THIS send and only ONCE, gated by taking
             // it out the `Option`, which can only be done once.
-            if let Err(_err) = task_termination_sender.send(()) {
-                tracing::error!(
+            // It might fail when a panic occurs.
+            if let Err(()) = task_termination_sender.send(()) {
+                tracing::trace!(
                     "Unexpected failure when sending termination signal to inspector task."
                 );
             };
@@ -42,8 +44,14 @@ impl Inspector {
 impl Drop for Inspector {
     fn drop(&mut self) {
         if let Some(task_termination_sender) = self.task_termination_sender.take() {
-            if let Err(_err) = task_termination_sender.send(()) {
-                tracing::error!(
+            // Safety: In normal (non-panic-) scenarios, this call SHOULD never fail.
+            // The receiver lives in the tokio task, and is only dropped after once receiving
+            // the termination signal.
+            // The task is only awaited-and-dropped after THIS send and only ONCE, gated by taking
+            // it out the `Option`, which can only be done once.
+            // It might fail when a panic occurs.
+            if let Err(()) = task_termination_sender.send(()) {
+                tracing::trace!(
                     "Unexpected failure when sending termination signal to inspector task."
                 );
             }

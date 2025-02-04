@@ -5,7 +5,6 @@ use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -107,18 +106,11 @@ impl OutputStream {
         }
     }
 
-    // NOTE: We only use Pin<Box> here to force usage of Higher-Rank Trait Bounds (HRTBs).
-    // The returned futures will most-likely capture the `&mut T`and are therefore poised
-    // by its lifetime. Without the trait-object usage, this would not work.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_async<F>(&self, f: F) -> Inspector
+    pub fn inspect_async<F, Fut>(&self, f: F) -> Inspector
     where
-        F: Fn(
-                String,
-            )
-                -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send>>
-            + Send
-            + 'static,
+        F: Fn(String) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), Box<dyn Error>>> + Send,
     {
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -129,7 +121,8 @@ impl OutputStream {
                     out = out_receiver.recv() => {
                         match out {
                             Ok(Some(line)) => {
-                                let result = f(line).await;
+                                let fut = f(line);
+                                let result = fut.await;
                                 match result {
                                     Ok(()) => { /* do nothing */ }
                                     Err(err) => {
@@ -225,7 +218,8 @@ impl OutputStream {
                             Ok(Some(line)) => {
                                 let result = {
                                     let mut write_guard = target.write().await;
-                                    collect(line, &mut *write_guard).await
+                                    let fut = collect(line, &mut *write_guard);
+                                    fut.await
                                 };
                                 match result {
                                     Ok(()) => { /* do nothing */ }
@@ -393,9 +387,72 @@ pub(crate) fn extract_output_streams(
 
 #[cfg(test)]
 mod tests {
-    use crate::ProcessHandle;
+    use crate::{OutputStream, OutputType, ProcessHandle};
+    use std::time::Duration;
+    use tokio::time::sleep;
+    use tracing_test::traced_test;
 
     #[tokio::test]
+    #[traced_test]
+    async fn backpressure() {
+        let (sender, _) = tokio::sync::broadcast::channel::<Option<String>>(2);
+
+        let sender_clone = sender.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                sender_clone.send(Some("1".to_string())).unwrap();
+                sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        let os = OutputStream {
+            ty: OutputType::StdOut,
+            line_follower_task: task,
+            sender,
+        };
+
+        let consumer = os.inspect_async(|line| async move {
+            // Mimic a slow consumer.
+            sleep(Duration::from_millis(100)).await;
+            drop(line);
+            Ok(())
+        });
+
+        sleep(Duration::from_millis(500)).await;
+        consumer.abort().await.unwrap();
+        drop(os);
+
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| {
+                    line.contains(
+                        "Inspector failed to receive output line error=channel lagged by 1",
+                    )
+                })
+                .count()
+            {
+                1 => {}
+                n => return Err(format!("Expected one matching log, but found {}", n)),
+            };
+            match lines
+                .iter()
+                .filter(|line| {
+                    line.contains(
+                        "Inspector failed to receive output line error=channel lagged by 3",
+                    )
+                })
+                .count()
+            {
+                n @ (0 | 1 | 2) => return Err(format!("Expected 3 or more logs, but found {}", n)),
+                _ => {}
+            };
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn collect_into_write() {
         let cmd = tokio::process::Command::new("ls");
 
