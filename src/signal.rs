@@ -5,7 +5,7 @@
 /// - on `cfg(unix)`: Sends a `SIGINT` to the process.
 /// - on `cfg(windows)`: Sends a `CTRL_C_EVENT` to the process.
 /// - raises a panic on any other platform!
-pub(crate) async fn send_interrupt(child: &tokio::process::Child) -> std::io::Result<()> {
+pub(crate) fn send_interrupt(child: &tokio::process::Child) -> std::io::Result<()> {
     let Some(pid) = child.id() else {
         // Returns `None` if child was already "polled to completion".
         return Ok(());
@@ -45,7 +45,7 @@ pub(crate) async fn send_interrupt(child: &tokio::process::Child) -> std::io::Re
 /// - on `cfg(unix)`: Sends a `SIGTERM` to the process.
 /// - on `cfg(windows)`: Sends a `CTRL_BREAK_EVENT` to the process.
 /// - raises a panic on any other platform!
-pub(crate) async fn send_terminate(child: &tokio::process::Child) -> std::io::Result<()> {
+pub(crate) fn send_terminate(child: &tokio::process::Child) -> std::io::Result<()> {
     let Some(pid) = child.id() else {
         // Returns `None` if child was already "polled to completion".
         return Ok(());

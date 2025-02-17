@@ -1,4 +1,5 @@
 use crate::output_stream::{extract_output_streams, OutputStream};
+use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
 use crate::{signal, WaitError};
 use std::borrow::Cow;
@@ -14,7 +15,8 @@ pub enum TerminationError {
     #[error("Failed to send signal to process: {0}")]
     SignallingFailed(#[from] io::Error),
 
-    #[error("Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}")]
+    #[error("Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}"
+    )]
     TerminationFailed {
         not_terminated_after_sigint: io::Error,
         not_terminated_after_sigterm: io::Error,
@@ -59,6 +61,7 @@ pub struct ProcessHandle {
     child: Child,
     std_out_stream: OutputStream,
     std_err_stream: OutputStream,
+    panic_on_drop: Option<PanicOnDrop>,
 }
 
 impl ProcessHandle {
@@ -132,12 +135,15 @@ impl ProcessHandle {
     ) -> Self {
         let (child, std_out_stream, std_err_stream) =
             extract_output_streams(child, stdout_channel_capacity, stderr_channel_capacity);
-        Self {
+        let mut this = Self {
             name: name.into(),
             child,
             std_out_stream,
             std_err_stream,
-        }
+            panic_on_drop: None,
+        };
+        this.must_be_terminated();
+        this
     }
 
     pub fn id(&self) -> Option<u32> {
@@ -161,8 +167,18 @@ impl ProcessHandle {
         &self.std_err_stream
     }
 
+    /// NOTE: Successfully awaiting the completion of the process will unset the
+    /// "must be terminated" setting, as a successfully awaited process is already terminated.
+    /// Dropping this `ProcessHandle` after calling `wait` should never lead to a
+    /// "must be terminated" panic being raised.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait().await
+        match self.child.wait().await {
+            Ok(status) => {
+                self.must_not_be_terminated();
+                Ok(status)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn wait_with_output(
@@ -171,11 +187,23 @@ impl ProcessHandle {
         let out_collector = self.std_out_stream.collect_into_vec();
         let err_collector = self.std_err_stream.collect_into_vec();
 
-        let status = self.child.wait().await?;
+        let status = self.wait().await?;
         let std_out = out_collector.abort().await?;
         let std_err = err_collector.abort().await?;
 
         Ok((status, std_out, std_err))
+    }
+
+    pub fn must_be_terminated(&mut self) {
+        self.panic_on_drop = Some(PanicOnDrop {
+            resource_name: "ProcessHandle".into(),
+            details: "Call `terminate()` before the type is dropped!".into(),
+            armed: true,
+        });
+    }
+
+    pub fn must_not_be_terminated(&mut self) {
+        self.panic_on_drop.take().map(|mut it| it.defuse());
     }
 
     pub fn terminate_on_drop(
@@ -193,8 +221,8 @@ impl ProcessHandle {
     /// Wait for this process to run to completion within `timeout` if set or unbound otherwise.
     async fn await_termination(&mut self, timeout: Option<Duration>) -> io::Result<ExitStatus> {
         match timeout {
-            None => self.child.wait().await,
-            Some(timeout) => match tokio::time::timeout(timeout, self.child.wait()).await {
+            None => self.wait().await,
+            Some(timeout) => match tokio::time::timeout(timeout, self.wait()).await {
                 Ok(exit_status) => exit_status,
                 Err(err) => Err(err.into()),
             },
@@ -204,28 +232,29 @@ impl ProcessHandle {
     /// Manually sed a `SIGINT` on unix or equivalent on Windows to this process.
     ///
     /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
-    pub async fn send_interrupt_signal(&mut self) -> Result<(), io::Error> {
-        signal::send_interrupt(&self.child).await
+    pub fn send_interrupt_signal(&mut self) -> Result<(), io::Error> {
+        signal::send_interrupt(&self.child)
     }
 
     /// Manually sed a `SIGTERM` on unix or equivalent on Windows to this process.
     ///
     /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
-    pub async fn send_terminate_signal(&mut self) -> Result<(), io::Error> {
-        signal::send_terminate(&self.child).await
+    pub fn send_terminate_signal(&mut self) -> Result<(), io::Error> {
+        signal::send_terminate(&self.child)
     }
 
     /// Terminates this process by sending a `SIGINT`, `SIGTERM` or even a `SIGKILL` if the process
     /// doesn't run to completion after receiving any of the first two signals.
-    ///
-    /// Recommendation: Use timeout!
     pub async fn terminate(
         &mut self,
         interrupt_timeout: Duration,
         terminate_timeout: Duration,
     ) -> Result<ExitStatus, TerminationError> {
+        // Whether or not this function will ultimately succeed, we tried to terminate the process.
+        // Dropping this handle should not create any on-drop error anymore.
+        self.must_not_be_terminated();
+
         self.send_interrupt_signal()
-            .await
             .map_err(TerminationError::SignallingFailed)?;
 
         match self.await_termination(Some(interrupt_timeout)).await {
@@ -238,7 +267,6 @@ impl ProcessHandle {
                 );
 
                 self.send_terminate_signal()
-                    .await
                     .map_err(TerminationError::SignallingFailed)?;
 
                 match self.await_termination(Some(terminate_timeout)).await {
@@ -250,18 +278,20 @@ impl ProcessHandle {
                             "Graceful shutdown using SIGTERM (or equivalent on current platform) failed. Attempting forceful shutdown using SIGKILL signal."
                         );
 
-                        match self.child.kill().await {
+                        match self.kill().await {
                             Ok(()) => {
                                 // Note: A SIGKILL should typically (somewhat) immediately lead to
                                 // termination of the process. But there are cases in which even
                                 // a SIGKILL does not / can not / will not kill a process.
-                                // Something must have been horribly gone wrong then...
+                                // Something must have gone horribly wrong then...
                                 // But: We do not want to wait indefinitely in case this happens
-                                // and therefore wait for a fixed second after any SIGKILL event.
-                                match self.await_termination(Some(Duration::from_secs(1))).await {
+                                // and therefore wait (at max) for a fixed three seconds after any
+                                // SIGKILL event.
+                                match self.await_termination(Some(Duration::from_secs(3))).await {
                                     Ok(exit_status) => Ok(exit_status),
                                     Err(not_terminated_after_sigkill) => {
                                         // Unlikely. See note above.
+                                        tracing::error!("Process, having custom name '{}', did not terminate after receiving a SIGINT, SIGTERM and SIGKILL event (or equivalent on the current platform). Something must have gone horribly wrong... Process may still be running. Manual intervention and investigation required!", self.name);
                                         Err(TerminationError::TerminationFailed {
                                             not_terminated_after_sigint,
                                             not_terminated_after_sigterm,
@@ -274,7 +304,7 @@ impl ProcessHandle {
                                 tracing::error!(
                                     process = %self.name,
                                     error = %not_terminated_after_sigkill,
-                                    "Forceful shutdown using SIGKILL (or equivalent on current platform) failed. Process may still be running. Manual intervention required! Did the process register a shutdown handler?"
+                                    "Forceful shutdown using SIGKILL (or equivalent on current platform) failed. Process may still be running. Manual intervention required!"
                                 );
 
                                 Err(TerminationError::TerminationFailed {
@@ -288,6 +318,10 @@ impl ProcessHandle {
                 }
             }
         }
+    }
+
+    pub async fn kill(&mut self) -> io::Result<()> {
+        self.child.kill().await
     }
 
     /// Consumes this handle to provide the wrapped `tokio::process::Child` instance as well as the
