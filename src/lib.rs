@@ -1,6 +1,7 @@
 mod collector;
 mod inspector;
 mod output_stream;
+mod panic_on_drop;
 mod process_handle;
 mod signal;
 mod terminate_on_drop;
@@ -13,26 +14,77 @@ pub use terminate_on_drop::TerminateOnDrop;
 
 #[cfg(test)]
 mod test {
-    use crate::ProcessHandle;
+    use crate::{IsRunning, ProcessHandle};
+    use assertr::prelude::*;
     use mockall::*;
     use std::fs::File;
     use std::io::Write;
+    use std::time::Duration;
     use tokio::process::Command;
 
     #[tokio::test]
     async fn test() {
         let cmd = Command::new("ls");
-        let mut exec = ProcessHandle::spawn("ls", cmd).expect("Failed to spawn `ls` command");
-        let (status, stdout, stderr) = exec.wait_with_output().await.unwrap();
+        let mut process = ProcessHandle::spawn("ls", cmd).expect("Failed to spawn `ls` command");
+        let (status, stdout, stderr) = process.wait_with_output().await.unwrap();
         println!("{:?}", status);
         println!("{:?}", stdout);
         println!("{:?}", stderr);
     }
 
     #[tokio::test]
+    async fn running_to_completion() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("1");
+        let mut process =
+            ProcessHandle::spawn("sleep", cmd).expect("Failed to spawn `sleep` command");
+
+        process.wait().await.unwrap();
+
+        match process.is_running() {
+            IsRunning::Running => {
+                assert_that(process).fail("Process should not be running anymore");
+            }
+            IsRunning::NotRunning(exit_status) => {
+                assert_that(exit_status.code()).is_some().is_equal_to(0);
+                assert_that(exit_status.success()).is_true();
+            }
+            IsRunning::Uncertain(_) => {
+                assert_that(process).fail("Process state should not be uncertain");
+            }
+        };
+    }
+
+    #[tokio::test]
+    async fn manual_termination() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("1000");
+        let mut process =
+            ProcessHandle::spawn("sleep", cmd).expect("Failed to spawn `sleep` command");
+        process
+            .terminate(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        match process.is_running() {
+            IsRunning::Running => {
+                assert_that(process).fail("Process should not be running anymore");
+            }
+            IsRunning::NotRunning(exit_status) => {
+                // Terminating a process with a signal results in no code being emitted (on linux).
+                assert_that(exit_status.code()).is_none();
+                assert_that(exit_status.success()).is_false();
+            }
+            IsRunning::Uncertain(_) => {
+                assert_that(process).fail("Process state should not be uncertain");
+            }
+        };
+    }
+
+    #[tokio::test]
     async fn manually_await_with_sync_inspector() {
         let cmd = Command::new("ls");
-        let mut exec = ProcessHandle::spawn("ls", cmd).expect("Failed to spawn `ls` command");
+        let mut process = ProcessHandle::spawn("ls", cmd).expect("Failed to spawn `ls` command");
 
         #[automock]
         trait FunctionCaller {
@@ -84,14 +136,14 @@ mod test {
             err_mock.call_function(input);
         };
 
-        let out_inspector = exec.stdout().inspect(move |line| {
+        let out_inspector = process.stdout().inspect(move |line| {
             out_callback(line);
         });
-        let err_inspector = exec.stderr().inspect(move |line| {
+        let err_inspector = process.stderr().inspect(move |line| {
             err_callback(line);
         });
 
-        let status = exec.wait().await.unwrap();
+        let status = process.wait().await.unwrap();
         let () = out_inspector.abort().await.unwrap();
         let () = err_inspector.abort().await.unwrap();
 

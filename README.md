@@ -1,5 +1,7 @@
 # tokio-process-tools
 
+**NOTE: The `main` branch contains changes not yet published on crates.io.**
+
 A library designed to assist with interacting and managing processes spawned via the `tokio` runtime.
 
 ## Features

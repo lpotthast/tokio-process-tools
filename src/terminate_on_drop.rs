@@ -1,11 +1,21 @@
 use crate::process_handle::ProcessHandle;
+use std::ops::Deref;
 use std::time::Duration;
 
+/// NOTE: Only use this type when your code is running in a multithreaded tokio runtime!
 #[derive(Debug)]
 pub struct TerminateOnDrop {
     pub(crate) process_handle: ProcessHandle,
     pub(crate) interrupt_timeout: Duration,
     pub(crate) terminate_timeout: Duration,
+}
+
+impl Deref for TerminateOnDrop {
+    type Target = ProcessHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.process_handle
+    }
 }
 
 impl Drop for TerminateOnDrop {
