@@ -194,6 +194,23 @@ impl ProcessHandle {
         Ok((status, std_out, std_err))
     }
 
+    /// Sets a panic-on-drop mechanism for this `ProcessHandle`.
+    ///
+    /// This method enables a safeguard that ensures that the process represented by this
+    /// `ProcessHandle` is properly terminated or awaited before being dropped.
+    /// If `must_be_terminated` is set and the `ProcessHandle` is
+    /// dropped without invoking `terminate()` or `wait()`, an intentional panic will occur to
+    /// prevent silent failure-states, ensuring that system resources are handled correctly.
+    ///
+    /// You typically do not need to call this, as every ProcessHandle is marked by default.
+    /// Call `must_not_be_terminated` to clear this safeguard to explicitly allow dropping the
+    /// process without terminating it.
+    ///
+    /// # Panic
+    ///
+    /// If the `ProcessHandle` is dropped without being awaited or terminated
+    /// after calling this method, a panic will occur with a descriptive message
+    /// to inform about the incorrect usage.
     pub fn must_be_terminated(&mut self) {
         self.panic_on_drop = Some(PanicOnDrop {
             resource_name: "ProcessHandle".into(),
