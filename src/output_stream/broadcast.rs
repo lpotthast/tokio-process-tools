@@ -1,45 +1,18 @@
-use crate::CollectorError;
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
+use crate::output_stream::{process_lines_in_chunk, process_lines_in_chunk_async, Next};
+use crate::{OutputStream, OutputType};
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
-use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::RwLock;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::RwLock;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::error::Elapsed;
-
-/// Represents the type of output stream (stdout or stderr)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputType {
-    StdOut,
-    StdErr,
-}
-
-/// Control flag to indicate whether processing should continue or break.
-///
-/// Returning `Break` from an `Inspector` will let that inspector stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Next {
-    Continue,
-    Break,
-}
-
-/// Errors that can occur when waiting for process output.
-#[derive(Debug, Error)]
-pub enum WaitError {
-    #[error("A general io error occurred")]
-    IoError(#[from] io::Error),
-
-    #[error("Collector failed")]
-    CollectorFailed(#[from] CollectorError), // TODO: refactor?
-}
 
 pub struct WaitFor {
     task: AbortHandle,
@@ -51,21 +24,27 @@ impl Drop for WaitFor {
     }
 }
 
-/// Represents an output stream from a process.
-pub struct OutputStream {
+/// The output stream from a process. Either representing stdout or stderr.
+///
+/// This is the broadcast variant, allowing for multiple simultaneous consumers with the downside
+/// of inducing memory allocations not required when only one consumer is listening.
+/// For that case, prefer using the `output_stream::single_subscriber::SingleOutputSteam`.
+pub struct BroadcastOutputStream {
     ty: OutputType,
+    // TODO: Why are we only storing one collector?
     output_collector: JoinHandle<()>,
-    // TODO: Can we use a reusable buffer here?
     sender: tokio::sync::broadcast::Sender<Option<Vec<u8>>>,
 }
 
-impl Drop for OutputStream {
+impl OutputStream for BroadcastOutputStream {}
+
+impl Drop for BroadcastOutputStream {
     fn drop(&mut self) {
         self.output_collector.abort();
     }
 }
 
-impl Debug for OutputStream {
+impl Debug for BroadcastOutputStream {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutputStream")
             .field("ty", &self.ty)
@@ -75,107 +54,6 @@ impl Debug for OutputStream {
             )
             .finish()
     }
-}
-
-/// Processes a byte chunk, handling line breaks and applying a callback function to complete lines.
-///
-/// This function takes a byte slice and appends it to the current line buffer. When it encounters
-/// newline characters, it calls the callback function with the completed line and continues
-/// processing the remainder of the chunk.
-///
-/// # Parameters
-/// * `chunk` - Byte slice to process
-/// * `line_buffer` - Current accumulated line content
-/// * `process_line` - Callback function to apply to completed lines
-///
-/// # Returns
-/// The updated line buffer with any remaining content after the last newline
-fn process_lines_in_chunk(
-    chunk: &[u8],
-    line_buffer: &mut String,
-    process_line: &mut impl FnMut(String) -> Next,
-) -> Next {
-    let mut current_chunk = chunk;
-    let mut next = Next::Continue;
-
-    while !current_chunk.is_empty() {
-        match current_chunk.iter().position(|b| *b == b'\n') {
-            None => {
-                // No more line breaks - append remaining chunk and exit loop.
-                line_buffer.push_str(String::from_utf8_lossy(current_chunk).as_ref());
-                break;
-            }
-            Some(pos) => {
-                // Found a line break at `pos` - process the line and continue.
-                let (until_line_break, rest) = current_chunk.split_at(pos);
-                line_buffer.push_str(String::from_utf8_lossy(until_line_break).as_ref());
-
-                // Process the completed line.
-                next = process_line(line_buffer.clone());
-
-                // Reset line buffer and continue with rest of chunk (skip the newline).
-                // Ensure we don't go out of bounds when skipping the newline character.
-                line_buffer.clear();
-                line_buffer.shrink_to(2048);
-                current_chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
-
-                if next == Next::Break {
-                    break;
-                }
-            }
-        }
-    }
-
-    next
-}
-
-async fn process_lines_in_chunk_async<
-    Fut: Future<Output = Result<Next, Box<dyn Error + Send + Sync>>> + Send,
->(
-    chunk: &[u8],
-    line_buffer: &mut String,
-    process_line: &mut impl FnMut(String) -> Fut,
-) -> Next {
-    let mut current_chunk = chunk;
-    let mut next = Next::Continue;
-
-    while !current_chunk.is_empty() {
-        match current_chunk.iter().position(|b| *b == b'\n') {
-            None => {
-                // No more line breaks - append remaining chunk and exit loop.
-                line_buffer.push_str(String::from_utf8_lossy(current_chunk).as_ref());
-                break;
-            }
-            Some(pos) => {
-                // Found a line break at `pos` - process the line and continue.
-                let (until_line_break, rest) = current_chunk.split_at(pos);
-                line_buffer.push_str(String::from_utf8_lossy(until_line_break).as_ref());
-
-                // Process the completed line.
-                let fut = process_line(line_buffer.clone());
-                let result = fut.await;
-                match result {
-                    Ok(ok) => next = ok,
-                    Err(err) => {
-                        // TODO: Should this break the inspector?
-                        tracing::warn!(?err, "Inspection failed")
-                    }
-                }
-
-                // Reset line buffer and continue with rest of chunk (skip the newline).
-                // Ensure we don't go out of bounds when skipping the newline character.
-                line_buffer.clear();
-                line_buffer.shrink_to(2048);
-                current_chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
-
-                if next == Next::Break {
-                    break;
-                }
-            }
-        }
-    }
-
-    next
 }
 
 /// Handles subscription output with a custom handler
@@ -213,7 +91,7 @@ async fn handle_subscription<F>(
     }
 }
 
-impl OutputStream {
+impl BroadcastOutputStream {
     pub fn ty(&self) -> OutputType {
         self.ty
     }
@@ -652,7 +530,7 @@ pub(crate) fn extract_output_streams(
     mut child: Child,
     stdout_channel_capacity: usize,
     stderr_channel_capacity: usize,
-) -> (Child, OutputStream, OutputStream) {
+) -> (Child, BroadcastOutputStream, BroadcastOutputStream) {
     let stdout = child
         .stdout
         .take()
@@ -662,13 +540,13 @@ pub(crate) fn extract_output_streams(
         .take()
         .expect("Child process stderr wasn't captured");
 
-    fn follow_lines_with_background_task<B: AsyncRead + Unpin + Send + 'static>(
+    fn read_chunked<B: AsyncRead + Unpin + Send + 'static, const BUFFER_SIZE: usize>(
         mut reader: BufReader<B>,
         sender: tokio::sync::broadcast::Sender<Option<Vec<u8>>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let mut buf = [0; 16 * 1024]; // 16kb, TODO: make configurable?
+                let mut buf = [0; BUFFER_SIZE]; // 16kb
                 match reader.read(&mut buf).await {
                     Ok(bytes_read) => {
                         let is_eof = bytes_read == 0;
@@ -683,11 +561,11 @@ pub(crate) fn extract_output_streams(
                                     Err(err) => {
                                         // All receivers already dropped.
                                         // We intentionally ignore these errors.
-                                        // If they occur, the user wasn't interested in seeing this message.
+                                        // If they occur, the user wasn't interested in seeing this chunk.
                                         // We won't store it (history) to later feed it back to a new subscriber.
                                         tracing::debug!(
                                             error = %err,
-                                            "No active receivers for output line, dropping it"
+                                            "No active receivers for the output chunk, dropping it"
                                         );
                                     }
                                 }
@@ -701,26 +579,29 @@ pub(crate) fn extract_output_streams(
     }
 
     // Intentionally dropping the initial subscribers.
-    // This will potentially lead to the (ignored) errors in follow_lines_with_background_task.
+    // This will potentially lead to (ignored) errors in read_chunked.
     let (tx_stdout, _rx_stdout) =
         tokio::sync::broadcast::channel::<Option<Vec<u8>>>(stdout_channel_capacity);
     let (tx_stderr, _rx_stderr) =
         tokio::sync::broadcast::channel::<Option<Vec<u8>>>(stderr_channel_capacity);
 
-    let stdout_buf_reader = BufReader::with_capacity(128 * 1024, stdout); // 128KB input buffer
-    let stderr_buf_reader = BufReader::with_capacity(128 * 1024, stderr); // 128KB input buffer
+    const INPUT_BUFFER_SIZE: usize = 32 * 1024; // 32kb
+    const CHUNK_BUFFER_SIZE: usize = 16 * 1024; // 16kb
 
-    let stdout_jh = follow_lines_with_background_task(stdout_buf_reader, tx_stdout.clone());
-    let stderr_jh = follow_lines_with_background_task(stderr_buf_reader, tx_stderr.clone());
+    let stdout_buf_reader = BufReader::with_capacity(INPUT_BUFFER_SIZE, stdout); // 32kb input buffer
+    let stderr_buf_reader = BufReader::with_capacity(INPUT_BUFFER_SIZE, stderr); // 32kb input buffer
+
+    let stdout_jh = read_chunked::<_, CHUNK_BUFFER_SIZE>(stdout_buf_reader, tx_stdout.clone());
+    let stderr_jh = read_chunked::<_, CHUNK_BUFFER_SIZE>(stderr_buf_reader, tx_stderr.clone());
 
     (
         child,
-        OutputStream {
+        BroadcastOutputStream {
             ty: OutputType::StdOut,
             output_collector: stdout_jh,
             sender: tx_stdout,
         },
-        OutputStream {
+        BroadcastOutputStream {
             ty: OutputType::StdErr,
             output_collector: stderr_jh,
             sender: tx_stderr,
@@ -730,108 +611,13 @@ pub(crate) fn extract_output_streams(
 
 #[cfg(test)]
 mod tests {
-    use crate::output_stream::{Next, process_lines_in_chunk};
-    use crate::{OutputStream, OutputType, ProcessHandle};
+    use crate::output_stream::broadcast::BroadcastOutputStream;
+    use crate::output_stream::{process_lines_in_chunk, Next};
+    use crate::{OutputType, ProcessHandle};
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::time::sleep;
     use tracing_test::traced_test;
-
-    #[test]
-    fn test_process_lines_in_chunk() {
-        // Helper function to reduce duplication in test cases
-        fn run_test_case(
-            test_name: &str,
-            chunk: &[u8],
-            initial_line_buffer: &str,
-            expected_result: &str,
-            expected_lines: &[&str],
-        ) {
-            let mut line_buffer = String::from(initial_line_buffer);
-            let mut collected_lines: Vec<String> = Vec::new();
-
-            let _next = process_lines_in_chunk(chunk, &mut line_buffer, &mut |line: String| {
-                collected_lines.push(line);
-                Next::Continue
-            });
-
-            assert_that(line_buffer)
-                .with_detail_message(format!("Test case: {test_name}"))
-                .is_equal_to(expected_result);
-
-            let expected_lines: Vec<String> =
-                expected_lines.iter().map(|s| s.to_string()).collect();
-
-            assert_that(collected_lines)
-                .with_detail_message(format!("Test case: {test_name}"))
-                .is_equal_to(expected_lines);
-        }
-
-        // Test case 1: Empty chunk
-        run_test_case(
-            "Empty chunk",
-            b"",
-            "existing line: ",
-            "existing line: ",
-            &[],
-        );
-
-        // Test case 2: Chunk with no newlines
-        run_test_case(
-            "Chunk with no newlines",
-            b"no newlines here",
-            "existing line: ",
-            "existing line: no newlines here",
-            &[],
-        );
-
-        // Test case 3: Single complete line
-        run_test_case("Single complete line", b"one line\n", "", "", &["one line"]);
-
-        // Test case 4: Multiple complete lines
-        run_test_case(
-            "Multiple complete lines",
-            b"first line\nsecond line\nthird line\n",
-            "",
-            "",
-            &["first line", "second line", "third line"],
-        );
-
-        // Test case 5: Partial line at the end
-        run_test_case(
-            "Partial line at the end",
-            b"complete line\npartial",
-            "",
-            "partial",
-            &["complete line"],
-        );
-
-        // Test case 6: Initial line with multiple newlines
-        run_test_case(
-            "Initial line with multiple newlines",
-            b"continuation\nmore lines\n",
-            "initial part of line: ",
-            "",
-            &["initial part of line: continuation", "more lines"],
-        );
-
-        // Test case 7: Non-UTF8 data
-        {
-            // This test case needs special handling due to its assertions
-            let chunk = b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n";
-            let mut line_buffer = String::from("");
-            let mut collected_lines = Vec::new();
-
-            let _next = process_lines_in_chunk(chunk, &mut line_buffer, &mut |line: String| {
-                collected_lines.push(line);
-                Next::Continue
-            });
-
-            assert_that(line_buffer).is_equal_to("");
-            assert_that(collected_lines[0].as_str()).contains("valid utf8");
-            assert_that(collected_lines[0].as_str()).contains("invalid utf8");
-        }
-    }
 
     #[tokio::test]
     #[traced_test]
@@ -851,7 +637,7 @@ mod tests {
             }
         });
 
-        let os = OutputStream {
+        let os = BroadcastOutputStream {
             ty: OutputType::StdOut,
             output_collector: task,
             sender,

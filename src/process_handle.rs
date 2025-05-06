@@ -1,7 +1,7 @@
-use crate::output_stream::{OutputStream, extract_output_streams};
+use crate::output_stream::broadcast::BroadcastOutputStream;
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{WaitError, signal};
+use crate::{output_stream, signal, CollectorError, OutputStream};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
@@ -56,16 +56,88 @@ impl From<IsRunning> for bool {
     }
 }
 
+/// Errors that can occur when waiting for process output.
+#[derive(Debug, Error)]
+pub enum WaitError {
+    #[error("A general io error occurred")]
+    IoError(#[from] io::Error),
+
+    #[error("Collector failed")]
+    CollectorFailed(#[from] CollectorError), // TODO: refactor?
+}
+
 #[derive(Debug)]
-pub struct ProcessHandle {
+pub struct ProcessHandle<O: OutputStream> {
     pub(crate) name: Cow<'static, str>,
     child: Child,
-    std_out_stream: OutputStream,
-    std_err_stream: OutputStream,
+    std_out_stream: O,
+    std_err_stream: O,
     panic_on_drop: Option<PanicOnDrop>,
 }
 
-impl ProcessHandle {
+impl ProcessHandle<BroadcastOutputStream> {
+    pub fn spawn(
+        name: impl Into<Cow<'static, str>>,
+        cmd: tokio::process::Command,
+    ) -> io::Result<ProcessHandle<BroadcastOutputStream>> {
+        Self::spawn_with_capacity(name, cmd, 128, 128)
+    }
+
+    pub fn spawn_with_capacity(
+        name: impl Into<Cow<'static, str>>,
+        mut cmd: tokio::process::Command,
+        stdout_channel_capacity: usize,
+        stderr_channel_capacity: usize,
+    ) -> io::Result<ProcessHandle<BroadcastOutputStream>> {
+        Self::prepare_command(&mut cmd).spawn().map(|child| {
+            Self::new_from_child_with_piped_io_and_capacity(
+                name,
+                child,
+                stdout_channel_capacity,
+                stderr_channel_capacity,
+            )
+        })
+    }
+
+    fn new_from_child_with_piped_io_and_capacity(
+        name: impl Into<Cow<'static, str>>,
+        child: Child,
+        stdout_channel_capacity: usize,
+        stderr_channel_capacity: usize,
+    ) -> ProcessHandle<BroadcastOutputStream> {
+        let (child, std_out_stream, std_err_stream) =
+            output_stream::broadcast::extract_output_streams(
+                child,
+                stdout_channel_capacity,
+                stderr_channel_capacity,
+            );
+        let mut this = ProcessHandle {
+            name: name.into(),
+            child,
+            std_out_stream,
+            std_err_stream,
+            panic_on_drop: None,
+        };
+        this.must_be_terminated();
+        this
+    }
+
+    pub async fn wait_with_output(
+        &mut self,
+    ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
+        // TODO: Configurable line collection
+        let out_collector = self.std_out_stream.collect_lines_into_vec();
+        let err_collector = self.std_err_stream.collect_lines_into_vec();
+
+        let status = self.wait().await?;
+        let std_out = out_collector.abort().await?;
+        let std_err = err_collector.abort().await?;
+
+        Ok((status, std_out, std_err))
+    }
+}
+
+impl<O: OutputStream> ProcessHandle<O> {
     /// On Windows, you can only send `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` to process groups,
     /// which works more like `killpg`. Sending to the current process ID will likely trigger
     /// undefined behavior of sending the event to every process that's attached to the console,
@@ -105,48 +177,6 @@ impl ProcessHandle {
             .kill_on_drop(true)
     }
 
-    pub fn spawn(
-        name: impl Into<Cow<'static, str>>,
-        cmd: tokio::process::Command,
-    ) -> io::Result<Self> {
-        Self::spawn_with_capacity(name, cmd, 128, 128)
-    }
-
-    pub fn spawn_with_capacity(
-        name: impl Into<Cow<'static, str>>,
-        mut cmd: tokio::process::Command,
-        stdout_channel_capacity: usize,
-        stderr_channel_capacity: usize,
-    ) -> io::Result<Self> {
-        Self::prepare_command(&mut cmd).spawn().map(|child| {
-            Self::new_from_child_with_piped_io_and_capacity(
-                name,
-                child,
-                stdout_channel_capacity,
-                stderr_channel_capacity,
-            )
-        })
-    }
-
-    fn new_from_child_with_piped_io_and_capacity(
-        name: impl Into<Cow<'static, str>>,
-        child: Child,
-        stdout_channel_capacity: usize,
-        stderr_channel_capacity: usize,
-    ) -> Self {
-        let (child, std_out_stream, std_err_stream) =
-            extract_output_streams(child, stdout_channel_capacity, stderr_channel_capacity);
-        let mut this = Self {
-            name: name.into(),
-            child,
-            std_out_stream,
-            std_err_stream,
-            panic_on_drop: None,
-        };
-        this.must_be_terminated();
-        this
-    }
-
     pub fn id(&self) -> Option<u32> {
         self.child.id()
     }
@@ -160,11 +190,11 @@ impl ProcessHandle {
         }
     }
 
-    pub fn stdout(&self) -> &OutputStream {
+    pub fn stdout(&self) -> &O {
         &self.std_out_stream
     }
 
-    pub fn stderr(&self) -> &OutputStream {
+    pub fn stderr(&self) -> &O {
         &self.std_err_stream
     }
 
@@ -180,19 +210,6 @@ impl ProcessHandle {
             }
             Err(err) => Err(err),
         }
-    }
-
-    pub async fn wait_with_output(
-        &mut self,
-    ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
-        let out_collector = self.std_out_stream.collect_lines_into_vec();
-        let err_collector = self.std_err_stream.collect_lines_into_vec();
-
-        let status = self.wait().await?;
-        let std_out = out_collector.abort().await?;
-        let std_err = err_collector.abort().await?;
-
-        Ok((status, std_out, std_err))
     }
 
     /// Sets a panic-on-drop mechanism for this `ProcessHandle`.
@@ -226,11 +243,16 @@ impl ProcessHandle {
         }
     }
 
+    /// **SAFETY: This only works when your code is running in a multithreaded tokio runtime!**
+    ///
+    /// Prefer manual termination of the process or awaiting it and relying on the (automatically
+    /// configured) `must_be_terminated` logic, raising a panic when a process was neither awaited
+    /// nor terminated before being dropped.
     pub fn terminate_on_drop(
         self,
         graceful_termination_timeout: Duration,
         forceful_termination_timeout: Duration,
-    ) -> TerminateOnDrop {
+    ) -> TerminateOnDrop<O> {
         TerminateOnDrop {
             process_handle: self,
             interrupt_timeout: graceful_termination_timeout,
@@ -349,7 +371,7 @@ impl ProcessHandle {
 
     /// Consumes this handle to provide the wrapped `tokio::process::Child` instance as well as the
     /// stdout and stderr output streams.
-    pub fn into_inner(self) -> (Child, OutputStream, OutputStream) {
+    pub fn into_inner(self) -> (Child, O, O) {
         (self.child, self.std_out_stream, self.std_err_stream)
     }
 }

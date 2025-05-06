@@ -8,7 +8,7 @@ mod terminate_on_drop;
 
 pub use collector::{Collector, CollectorError, Sink};
 pub use inspector::{Inspector, InspectorError};
-pub use output_stream::{OutputStream, OutputType, WaitError, WaitFor};
+pub use output_stream::{OutputStream, OutputType};
 pub use process_handle::{IsRunning, ProcessHandle, TerminationError};
 pub use terminate_on_drop::TerminateOnDrop;
 
