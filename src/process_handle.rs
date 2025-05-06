@@ -1,7 +1,7 @@
-use crate::output_stream::{extract_output_streams, OutputStream};
+use crate::output_stream::{OutputStream, extract_output_streams};
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{signal, WaitError};
+use crate::{WaitError, signal};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
@@ -15,7 +15,8 @@ pub enum TerminationError {
     #[error("Failed to send signal to process: {0}")]
     SignallingFailed(#[from] io::Error),
 
-    #[error("Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}"
+    #[error(
+        "Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}"
     )]
     TerminationFailed {
         not_terminated_after_sigint: io::Error,
@@ -220,7 +221,9 @@ impl ProcessHandle {
     }
 
     pub fn must_not_be_terminated(&mut self) {
-        self.panic_on_drop.take().map(|mut it| it.defuse());
+        if let Some(mut it) = self.panic_on_drop.take() {
+            it.defuse()
+        }
     }
 
     pub fn terminate_on_drop(
@@ -308,7 +311,10 @@ impl ProcessHandle {
                                     Ok(exit_status) => Ok(exit_status),
                                     Err(not_terminated_after_sigkill) => {
                                         // Unlikely. See note above.
-                                        tracing::error!("Process, having custom name '{}', did not terminate after receiving a SIGINT, SIGTERM and SIGKILL event (or equivalent on the current platform). Something must have gone horribly wrong... Process may still be running. Manual intervention and investigation required!", self.name);
+                                        tracing::error!(
+                                            "Process, having custom name '{}', did not terminate after receiving a SIGINT, SIGTERM and SIGKILL event (or equivalent on the current platform). Something must have gone horribly wrong... Process may still be running. Manual intervention and investigation required!",
+                                            self.name
+                                        );
                                         Err(TerminationError::TerminationFailed {
                                             not_terminated_after_sigint,
                                             not_terminated_after_sigterm,

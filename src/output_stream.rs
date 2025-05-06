@@ -1,6 +1,6 @@
+use crate::CollectorError;
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
-use crate::CollectorError;
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -10,17 +10,48 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::error::Elapsed;
 
+/// Represents the type of output stream (stdout or stderr)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputType {
     StdOut,
     StdErr,
 }
 
+/// Control flag to indicate whether processing should continue or break.
+///
+/// Returning `Break` from an `Inspector` will let that inspector stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Next {
+    Continue,
+    Break,
+}
+
+/// Errors that can occur when waiting for process output.
+#[derive(Debug, Error)]
+pub enum WaitError {
+    #[error("A general io error occurred")]
+    IoError(#[from] io::Error),
+
+    #[error("Collector failed")]
+    CollectorFailed(#[from] CollectorError), // TODO: refactor?
+}
+
+pub struct WaitFor {
+    task: AbortHandle,
+}
+
+impl Drop for WaitFor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Represents an output stream from a process.
 pub struct OutputStream {
     ty: OutputType,
     output_collector: JoinHandle<()>,
@@ -46,25 +77,6 @@ impl Debug for OutputStream {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum WaitError {
-    #[error("A general io error occurred")]
-    IoError(#[from] io::Error),
-
-    #[error("Collector failed")]
-    CollectorFailed(#[from] CollectorError),
-}
-
-pub struct WaitFor {
-    task: AbortHandle,
-}
-
-impl Drop for WaitFor {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 /// Processes a byte chunk, handling line breaks and applying a callback function to complete lines.
 ///
 /// This function takes a byte slice and appends it to the current line buffer. When it encounters
@@ -80,9 +92,9 @@ impl Drop for WaitFor {
 /// The updated line buffer with any remaining content after the last newline
 fn process_lines_in_chunk(
     chunk: &[u8],
-    mut line_buffer: String,
+    line_buffer: &mut String,
     process_line: &mut impl FnMut(String) -> Next,
-) -> (String, Next) {
+) -> Next {
     let mut current_chunk = chunk;
     let mut next = Next::Continue;
 
@@ -90,7 +102,7 @@ fn process_lines_in_chunk(
         match current_chunk.iter().position(|b| *b == b'\n') {
             None => {
                 // No more line breaks - append remaining chunk and exit loop.
-                line_buffer.push_str(String::from_utf8_lossy(&current_chunk).as_ref());
+                line_buffer.push_str(String::from_utf8_lossy(current_chunk).as_ref());
                 break;
             }
             Some(pos) => {
@@ -99,11 +111,12 @@ fn process_lines_in_chunk(
                 line_buffer.push_str(String::from_utf8_lossy(until_line_break).as_ref());
 
                 // Process the completed line.
-                next = process_line(line_buffer);
+                next = process_line(line_buffer.clone());
 
                 // Reset line buffer and continue with rest of chunk (skip the newline).
                 // Ensure we don't go out of bounds when skipping the newline character.
-                line_buffer = String::new();
+                line_buffer.clear();
+                line_buffer.shrink_to(2048);
                 current_chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
 
                 if next == Next::Break {
@@ -113,16 +126,16 @@ fn process_lines_in_chunk(
         }
     }
 
-    (line_buffer, next)
+    next
 }
 
 async fn process_lines_in_chunk_async<
     Fut: Future<Output = Result<Next, Box<dyn Error + Send + Sync>>> + Send,
 >(
     chunk: &[u8],
-    mut line_buffer: String,
+    line_buffer: &mut String,
     process_line: &mut impl FnMut(String) -> Fut,
-) -> (String, Next) {
+) -> Next {
     let mut current_chunk = chunk;
     let mut next = Next::Continue;
 
@@ -130,7 +143,7 @@ async fn process_lines_in_chunk_async<
         match current_chunk.iter().position(|b| *b == b'\n') {
             None => {
                 // No more line breaks - append remaining chunk and exit loop.
-                line_buffer.push_str(String::from_utf8_lossy(&current_chunk).as_ref());
+                line_buffer.push_str(String::from_utf8_lossy(current_chunk).as_ref());
                 break;
             }
             Some(pos) => {
@@ -139,7 +152,7 @@ async fn process_lines_in_chunk_async<
                 line_buffer.push_str(String::from_utf8_lossy(until_line_break).as_ref());
 
                 // Process the completed line.
-                let fut = process_line(line_buffer);
+                let fut = process_line(line_buffer.clone());
                 let result = fut.await;
                 match result {
                     Ok(ok) => next = ok,
@@ -151,7 +164,8 @@ async fn process_lines_in_chunk_async<
 
                 // Reset line buffer and continue with rest of chunk (skip the newline).
                 // Ensure we don't go out of bounds when skipping the newline character.
-                line_buffer = String::new();
+                line_buffer.clear();
+                line_buffer.shrink_to(2048);
                 current_chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
 
                 if next == Next::Break {
@@ -161,13 +175,42 @@ async fn process_lines_in_chunk_async<
         }
     }
 
-    (line_buffer, next)
+    next
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Next {
-    Continue,
-    Break,
+/// Handles subscription output with a custom handler
+async fn handle_subscription<F>(
+    mut chunk_receiver: tokio::sync::broadcast::Receiver<Option<Vec<u8>>>,
+    mut term_sig_rx: tokio::sync::oneshot::Receiver<()>,
+    mut handler: F,
+) where
+    F: FnMut(Option<Vec<u8>>) -> Next,
+{
+    loop {
+        tokio::select! {
+            out = chunk_receiver.recv() => {
+                match out {
+                    Ok(maybe_chunk) => {
+                        match handler(maybe_chunk) {
+                            Next::Continue => continue,
+                            Next::Break => break,
+                        }
+                    }
+                    Err(RecvError::Closed) => {
+                        // All senders have been dropped.
+                        tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
+                        break;
+                    }
+                    Err(RecvError::Lagged(lagged)) => {
+                        tracing::warn!(lagged, "Inspector is lagging behind");
+                    }
+                }
+            }
+            _msg = &mut term_sig_rx => {
+                break;
+            }
+        }
+    }
 }
 
 impl OutputStream {
@@ -188,39 +231,19 @@ impl OutputStream {
     /// For more control, use `inspect_chunks` instead.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_chunks(&self, f: impl Fn(Vec<u8>) -> Next + Send + 'static) -> Inspector {
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let mut receiver = self.subscribe();
+        let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+        let receiver = self.subscribe();
         let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    out = receiver.recv() => {
-                        match out {
-                            Ok(Some(chunk)) => {
-                                match f(chunk) {
-                                    Next::Continue => {}
-                                    Next::Break => { break; }
-                                };
-                            }
-                            Ok(None) => {
-                                // EOF reached.
-                                break;
-                            }
-                            Err(RecvError::Closed) => {
-                                // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
-                                break;
-                            }
-                            Err(RecvError::Lagged(lagged)) => {
-                                tracing::warn!(lagged, "Inspector is lagging behind");
-                            }
-                        }
-                    }
-                    _msg = &mut term_sig_rx => {
-                        break;
+            handle_subscription(receiver, term_sig_rx, move |maybe_chunk| {
+                match maybe_chunk {
+                    Some(chunk) => f(chunk),
+                    None => {
+                        // EOF reached.
+                        Next::Break
                     }
                 }
-            }
+            })
+            .await;
         });
         Inspector {
             task: Some(task),
@@ -230,44 +253,24 @@ impl OutputStream {
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines(&self, mut f: impl FnMut(String) -> Next + Send + 'static) -> Inspector {
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let mut receiver = self.subscribe();
+        let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+        let receiver = self.subscribe();
         let task = tokio::spawn(async move {
             let mut line_buffer = String::new();
-
-            loop {
-                tokio::select! {
-                    out = receiver.recv() => {
-                        match out {
-                            Ok(Some(chunk)) => {
-                                let next;
-                                (line_buffer, next) = process_lines_in_chunk(&chunk, line_buffer, &mut f);
-                                if next == Next::Break {
-                                    break;
-                                }
-                            }
-                            Ok(None) => {
-                                if !line_buffer.is_empty() {
-                                    f(line_buffer);
-                                    line_buffer = String::new();
-                                }
-                            }
-                            Err(RecvError::Closed) => {
-                                // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
-                                break;
-                            }
-                            Err(RecvError::Lagged(lagged)) => {
-                                tracing::warn!(lagged, "Inspector is lagging behind");
-                            }
+            handle_subscription(
+                receiver,
+                term_sig_rx,
+                move |maybe_chunk| match maybe_chunk {
+                    Some(chunk) => process_lines_in_chunk(&chunk, &mut line_buffer, &mut f),
+                    None => {
+                        if !line_buffer.is_empty() {
+                            f(line_buffer.clone());
                         }
+                        Next::Break
                     }
-                    _msg = &mut term_sig_rx => {
-                        break;
-                    }
-                }
-            }
+                },
+            )
+            .await;
         });
         Inspector {
             task: Some(task),
@@ -279,7 +282,7 @@ impl OutputStream {
     pub fn inspect_lines_async<F, Fut>(&self, mut f: F) -> Inspector
     where
         F: Fn(String) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<Next, Box<dyn Error + Send + Sync>>> + Send,
+        Fut: Future<Output = Result<Next, Box<dyn Error + Send + Sync>>> + Send + Sync,
     {
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -292,8 +295,7 @@ impl OutputStream {
                         match out {
                             Ok(Some(chunk)) => {
                                 tracing::info!("Received chunk: {}", String::from_utf8_lossy(&chunk));
-                                let next;
-                                (line_buffer, next) = process_lines_in_chunk_async(&chunk, line_buffer, &mut f).await;
+                                let next = process_lines_in_chunk_async(&chunk, &mut line_buffer, &mut f).await;
                                 if next == Next::Break {
                                     break;
                                 }
@@ -394,9 +396,8 @@ impl OutputStream {
                     out = out_receiver.recv() => {
                         match out {
                             Ok(Some(chunk)) => {
-                                let next;
                                 let mut write_guard = target.write().await;
-                                (line_buffer, next) = process_lines_in_chunk(&chunk, line_buffer, &mut |line| {
+                                let next = process_lines_in_chunk(&chunk, &mut line_buffer, &mut |line| {
                                     collect(line, &mut (*write_guard))
                                 });
                                 if next == Next::Break {
@@ -502,7 +503,7 @@ impl OutputStream {
         S: Sink,
         F: Fn(String, &mut S) -> AsyncCollectFn<'_> + Send + Sync + 'static,
     {
-        let target = Arc::new(RwLock::new(into));
+        let sink = Arc::new(RwLock::new(into));
 
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -519,48 +520,22 @@ impl OutputStream {
                     out = out_receiver.recv() => {
                         match out {
                             Ok(Some(chunk)) => {
-                                let mut current_chunk = &chunk[..];
-                                let mut next = Next::Continue;
-
-                                // Process the chunk manually to avoid closure lifetime issues
-                                while !current_chunk.is_empty() {
-                                    match current_chunk.iter().position(|b| *b == b'\n') {
-                                        None => {
-                                            // No more line breaks - append remaining chunk and exit loop
-                                            line_buffer.push_str(String::from_utf8_lossy(current_chunk).as_ref());
-                                            break;
-                                        }
-                                        Some(pos) => {
-                                            // Found a line break at `pos` - process the line
-                                            let (until_line_break, rest) = current_chunk.split_at(pos);
-                                            line_buffer.push_str(String::from_utf8_lossy(until_line_break).as_ref());
-
-                                            // Process the completed line with the collector
-                                            let line_to_process = std::mem::take(&mut line_buffer);
-                                            let collect_ref = Arc::clone(&collect_fn);
-
-                                            // Get exclusive access to the target only for this operation
-                                            let mut target_guard = target.write().await;
-                                            let result = collect_ref(line_to_process, &mut *target_guard).await;
-                                            drop(target_guard); // Explicitly release the lock
-
-                                            match result {
-                                                Ok(n) => next = n,
-                                                Err(err) => {
-                                                    tracing::warn!(?err, "Collection failed");
-                                                }
-                                            }
-
-                                            // Continue with rest of chunk (skip the newline)
-                                            current_chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
-
-                                            if next == Next::Break {
-                                                break;
+                                let next = process_lines_in_chunk_async(&chunk, &mut line_buffer, &mut |line| {
+                                    let collect_fn = collect_fn.clone();
+                                    let sink = sink.clone();
+                                    async move {
+                                        let mut sink_guard = sink.write().await;
+                                        let result = collect_fn(line.clone(), &mut *sink_guard).await;
+                                        drop(sink_guard); // Explicitly release the lock
+                                        match result {
+                                            Ok(next) => Ok(next),
+                                            Err(err) => {
+                                                tracing::warn!(?err, "Collection failed");
+                                                Ok(Next::Continue)
                                             }
                                         }
                                     }
-                                }
-
+                                }).await;
                                 if next == Next::Break {
                                     break;
                                 }
@@ -568,7 +543,7 @@ impl OutputStream {
                             Ok(None) => {
                                 // EOF reached.
                                 if !line_buffer.is_empty() {
-                                    let mut write_guard = target.write().await;
+                                    let mut write_guard = sink.write().await;
                                     let fut = collect_fn(line_buffer, &mut *write_guard);
                                     let result = fut.await;
                                     match result {
@@ -595,7 +570,7 @@ impl OutputStream {
                     }
                 }
             }
-            Arc::try_unwrap(target).expect("single owner").into_inner()
+            Arc::try_unwrap(sink).expect("single owner").into_inner()
         });
 
         Collector {
@@ -755,7 +730,7 @@ pub(crate) fn extract_output_streams(
 
 #[cfg(test)]
 mod tests {
-    use crate::output_stream::{process_lines_in_chunk, Next};
+    use crate::output_stream::{Next, process_lines_in_chunk};
     use crate::{OutputStream, OutputType, ProcessHandle};
     use assertr::prelude::*;
     use std::time::Duration;
@@ -768,20 +743,19 @@ mod tests {
         fn run_test_case(
             test_name: &str,
             chunk: &[u8],
-            initial_line: &str,
+            initial_line_buffer: &str,
             expected_result: &str,
             expected_lines: &[&str],
         ) {
-            let initial_line = String::from(initial_line);
+            let mut line_buffer = String::from(initial_line_buffer);
             let mut collected_lines: Vec<String> = Vec::new();
 
-            let (result, _next) =
-                process_lines_in_chunk(chunk, initial_line, &mut |line: String| {
-                    collected_lines.push(line);
-                    Next::Continue
-                });
+            let _next = process_lines_in_chunk(chunk, &mut line_buffer, &mut |line: String| {
+                collected_lines.push(line);
+                Next::Continue
+            });
 
-            assert_that(result)
+            assert_that(line_buffer)
                 .with_detail_message(format!("Test case: {test_name}"))
                 .is_equal_to(expected_result);
 
@@ -845,16 +819,15 @@ mod tests {
         {
             // This test case needs special handling due to its assertions
             let chunk = b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n";
-            let initial_line = String::from("");
+            let mut line_buffer = String::from("");
             let mut collected_lines = Vec::new();
 
-            let (result, _next) =
-                process_lines_in_chunk(chunk, initial_line, &mut |line: String| {
-                    collected_lines.push(line);
-                    Next::Continue
-                });
+            let _next = process_lines_in_chunk(chunk, &mut line_buffer, &mut |line: String| {
+                collected_lines.push(line);
+                Next::Continue
+            });
 
-            assert_that(result).is_equal_to("");
+            assert_that(line_buffer).is_equal_to("");
             assert_that(collected_lines[0].as_str()).contains("valid utf8");
             assert_that(collected_lines[0].as_str()).contains("invalid utf8");
         }
