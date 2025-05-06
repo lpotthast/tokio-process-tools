@@ -14,16 +14,6 @@ use tokio::sync::RwLock;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::error::Elapsed;
 
-pub struct WaitFor {
-    task: AbortHandle,
-}
-
-impl Drop for WaitFor {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 /// The output stream from a process. Either representing stdout or stderr.
 ///
 /// This is the broadcast variant, allowing for multiple simultaneous consumers with the downside
