@@ -1,3 +1,4 @@
+use crate::output_stream::Next;
 use std::error::Error;
 use std::fmt::Debug;
 use std::future::Future;
@@ -18,7 +19,7 @@ impl<T> Sink for T where T: Debug + Send + Sync + 'static {}
 
 pub type CollectError = Box<dyn Error + Send + Sync>;
 
-pub type AsyncCollectFn<'a> = Pin<Box<dyn Future<Output = Result<(), CollectError>> + Send + 'a>>;
+pub type AsyncCollectFn<'a> = Pin<Box<dyn Future<Output = Result<Next, CollectError>> + Send + 'a>>;
 
 /// A collector for output lines.
 ///

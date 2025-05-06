@@ -14,6 +14,7 @@ pub use terminate_on_drop::TerminateOnDrop;
 
 #[cfg(test)]
 mod test {
+    use crate::output_stream::Next;
     use crate::{IsRunning, ProcessHandle};
     use assertr::prelude::*;
     use mockall::*;
@@ -127,27 +128,23 @@ mod test {
             .with(predicate::eq("target".to_string()))
             .times(1)
             .return_const(());
-        let out_callback = move |input: String| {
-            out_mock.call_function(input);
-        };
 
         let err_mock = MockFunctionCaller::new();
-        let err_callback = move |input: String| {
-            err_mock.call_function(input);
-        };
 
-        let out_inspector = process.stdout().inspect(move |line| {
-            out_callback(line);
+        let out_inspector = process.stdout().inspect_lines(move |line| {
+            out_mock.call_function(line);
+            Next::Continue
         });
-        let err_inspector = process.stderr().inspect(move |line| {
-            err_callback(line);
+        let err_inspector = process.stderr().inspect_lines(move |line| {
+            err_mock.call_function(line);
+            Next::Continue
         });
 
         let status = process.wait().await.unwrap();
         let () = out_inspector.abort().await.unwrap();
         let () = err_inspector.abort().await.unwrap();
 
-        println!("{:?}", status);
+        assert_that(status.success()).is_true();
     }
 
     #[tokio::test]
@@ -158,12 +155,18 @@ mod test {
         let temp_file_out = tempfile::tempfile().unwrap();
         let temp_file_err = tempfile::tempfile().unwrap();
 
-        let out_collector = exec.stdout().collect(temp_file_out, |line, temp_file| {
-            writeln!(temp_file, "{}", line).unwrap();
-        });
-        let err_collector = exec.stderr().collect(temp_file_err, |line, temp_file| {
-            writeln!(temp_file, "{}", line).unwrap();
-        });
+        let out_collector = exec
+            .stdout()
+            .collect_lines(temp_file_out, |line, temp_file| {
+                writeln!(temp_file, "{}", line).unwrap();
+                Next::Continue
+            });
+        let err_collector = exec
+            .stderr()
+            .collect_lines(temp_file_err, |line, temp_file| {
+                writeln!(temp_file, "{}", line).unwrap();
+                Next::Continue
+            });
 
         let status = exec.wait().await.unwrap();
         let stdout = out_collector.abort().await.unwrap();
@@ -184,18 +187,18 @@ mod test {
 
         let out_collector =
             exec.stdout()
-                .collect_async(temp_file_out, |line, temp_file: &mut File| {
+                .collect_lines_async(temp_file_out, |line, temp_file: &mut File| {
                     Box::pin(async move {
                         writeln!(temp_file, "{}", line).unwrap();
-                        Ok(())
+                        Ok(Next::Continue)
                     })
                 });
         let err_collector =
             exec.stderr()
-                .collect_async(temp_file_err, |line, temp_file: &mut File| {
+                .collect_lines_async(temp_file_err, |line, temp_file: &mut File| {
                     Box::pin(async move {
                         writeln!(temp_file, "{}", line).unwrap();
-                        Ok(())
+                        Ok(Next::Continue)
                     })
                 });
 

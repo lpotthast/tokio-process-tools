@@ -20,6 +20,13 @@ pub struct Inspector {
 }
 
 impl Inspector {
+    pub async fn wait(mut self) -> Result<(), InspectorError> {
+        if let Some(task) = self.task.take() {
+            return task.await.map_err(InspectorError::TaskJoin);
+        }
+        unreachable!("The inspector task was already aborted");
+    }
+
     pub async fn abort(mut self) -> Result<(), InspectorError> {
         if let Some(task_termination_sender) = self.task_termination_sender.take() {
             // Safety: In normal (non-panic-) scenarios, this call SHOULD never fail.

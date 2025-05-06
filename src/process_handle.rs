@@ -184,8 +184,8 @@ impl ProcessHandle {
     pub async fn wait_with_output(
         &mut self,
     ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
-        let out_collector = self.std_out_stream.collect_into_vec();
-        let err_collector = self.std_err_stream.collect_into_vec();
+        let out_collector = self.std_out_stream.collect_lines_into_vec();
+        let err_collector = self.std_err_stream.collect_lines_into_vec();
 
         let status = self.wait().await?;
         let std_out = out_collector.abort().await?;
