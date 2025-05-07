@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::RwLock;
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 
 /// The output stream from a process. Either representing stdout or stderr.
