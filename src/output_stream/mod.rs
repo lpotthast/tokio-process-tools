@@ -1,16 +1,37 @@
+use std::borrow::Cow;
 use std::error::Error;
 use std::future::Future;
 
 pub mod broadcast;
 pub mod single_subscriber;
 
+/// We support the following implementations:
+///
+/// - [BroadcastOutputStream]
+/// - [crate::output_stream::broadcast::SingleOutputStream]
 pub trait OutputStream {}
 
-/// Represents the type of output stream (stdout or stderr)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputType {
+pub(crate) enum BackpressureControl {
+    /// ...
+    DropLatestIncomingIfBufferFull,
+
+    /// Will not lead to "lagging" (and dropping frames in the process).
+    /// But this lowers our speed at which we consume output and may affect the application
+    /// captured, as their pipe buffer may get full, requiring the application /
+    /// relying on the application to drop data instead of writing to stdout/stderr in order
+    /// to not block.
+    #[expect(unused)]
+    BlockUntilBufferHasSpace,
+}
+
+/// Represents the type of the stream (stdout or stderr)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamType {
     StdOut,
     StdErr,
+
+    Other(Cow<'static, str>),
 }
 
 /// Control flag to indicate whether processing should continue or break.
@@ -127,7 +148,23 @@ async fn process_lines_in_chunk_async<
 mod tests {
     use crate::output_stream::{process_lines_in_chunk, Next};
     use assertr::prelude::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+    pub(crate) async fn write_test_data(mut write: impl AsyncWrite + Unpin) {
+        write.write_all("Cargo.lock\n".as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        write.write_all("Cargo.toml\n".as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        write.write_all("README.md\n".as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        write.write_all("src\n".as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        write.write_all("target\n".as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // TODO: also test async variant
     #[test]
     fn test_process_lines_in_chunk() {
         // Helper function to reduce duplication in test cases

@@ -25,3 +25,15 @@ impl Drop for PanicOnDrop {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assertr::assert_that_type;
+    use assertr::prelude::*;
+
+    #[test]
+    fn needs_drop() {
+        assert_that_type::<PanicOnDrop>().needs_drop();
+    }
+}

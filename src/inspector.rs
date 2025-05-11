@@ -20,6 +20,10 @@ pub struct Inspector {
 }
 
 impl Inspector {
+    /// Wait for the inspector to terminate naturally.
+    ///
+    /// An inspector will be terminated after the first `Next::Break` is returned.
+    /// If the inspector implementation never returns `Next::Break`, this will hang forever!
     pub async fn wait(mut self) -> Result<(), InspectorError> {
         if let Some(task) = self.task.take() {
             return task.await.map_err(InspectorError::TaskJoin);
@@ -27,7 +31,8 @@ impl Inspector {
         unreachable!("The inspector task was already aborted");
     }
 
-    pub async fn abort(mut self) -> Result<(), InspectorError> {
+    /// Sends a cancellation event to the inspector, letting it shut down.
+    pub async fn cancel(mut self) -> Result<(), InspectorError> {
         if let Some(task_termination_sender) = self.task_termination_sender.take() {
             // Safety: In normal (non-panic-) scenarios, this call SHOULD never fail.
             // The receiver lives in the tokio task, and is only dropped after once receiving

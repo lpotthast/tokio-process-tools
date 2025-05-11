@@ -1,14 +1,13 @@
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
 use crate::output_stream::{process_lines_in_chunk, process_lines_in_chunk_async, Next};
-use crate::{OutputStream, OutputType};
+use crate::{OutputStream, StreamType};
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Child;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -20,9 +19,12 @@ use tokio::time::error::Elapsed;
 /// of inducing memory allocations not required when only one consumer is listening.
 /// For that case, prefer using the `output_stream::single_subscriber::SingleOutputSteam`.
 pub struct BroadcastOutputStream {
-    ty: OutputType,
-    // TODO: Why are we only storing one collector?
-    output_collector: JoinHandle<()>,
+    ty: StreamType,
+
+    /// The task that captured the `tokio::sync::broadcast::Sender` part and is asynchronously
+    /// awaiting new output, sending it to all registered receivers in chunks. TODO: of up to size ???
+    stream_reader: JoinHandle<()>,
+
     sender: tokio::sync::broadcast::Sender<Option<Vec<u8>>>,
 }
 
@@ -30,19 +32,91 @@ impl OutputStream for BroadcastOutputStream {}
 
 impl Drop for BroadcastOutputStream {
     fn drop(&mut self) {
-        self.output_collector.abort();
+        self.stream_reader.abort();
     }
 }
 
 impl Debug for BroadcastOutputStream {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutputStream")
+        f.debug_struct("BroadcastOutputStream")
             .field("ty", &self.ty)
+            .field("output_collector", &"non-debug < JoinHandle<()> >")
             .field(
                 "sender",
                 &"non-debug < tokio::sync::broadcast::Sender<Option<String>> >",
             )
             .finish()
+    }
+}
+
+fn read_chunked<B: AsyncRead + Unpin + Send + 'static, const BUFFER_SIZE: usize>(
+    mut reader: BufReader<B>,
+    sender: tokio::sync::broadcast::Sender<Option<Vec<u8>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let mut buf = [0; BUFFER_SIZE]; // 16kb
+            match reader.read(&mut buf).await {
+                Ok(bytes_read) => {
+                    let is_eof = bytes_read == 0;
+
+                    let to_send = match is_eof {
+                        true => None,
+                        false => Some(Vec::from(&buf[..bytes_read])),
+                    };
+
+                    match sender.send(to_send) {
+                        Ok(_received_by) => {}
+                        Err(err) => {
+                            // All receivers already dropped.
+                            // We intentionally ignore these errors.
+                            // If they occur, the user wasn't interested in seeing this chunk.
+                            // We won't store it (history) to later feed it back to a new subscriber.
+                            tracing::debug!(
+                                error = %err,
+                                "No active receivers for the output chunk, dropping it"
+                            );
+                        }
+                    }
+
+                    if is_eof {
+                        break;
+                    }
+                }
+                Err(err) => panic!("Could not read from stream: {err}"),
+            }
+        }
+    })
+}
+
+impl BroadcastOutputStream {
+    pub(crate) fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
+        stream: S,
+        ty: StreamType,
+        channel_capacity: usize,
+    ) -> BroadcastOutputStream {
+        const INPUT_BUFFER_SIZE: usize = 32 * 1024; // 32kb
+        const CHUNK_BUFFER_SIZE: usize = 16 * 1024; // 16kb
+
+        let (tx_stdout, _rx_stdout) =
+            tokio::sync::broadcast::channel::<Option<Vec<u8>>>(channel_capacity);
+
+        let buf_reader = BufReader::with_capacity(INPUT_BUFFER_SIZE, stream);
+        let output_collector = read_chunked::<_, CHUNK_BUFFER_SIZE>(buf_reader, tx_stdout.clone());
+
+        BroadcastOutputStream {
+            ty,
+            stream_reader: output_collector,
+            sender: tx_stdout,
+        }
+    }
+
+    pub fn ty(&self) -> &StreamType {
+        &self.ty
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Option<Vec<u8>>> {
+        self.sender.subscribe()
     }
 }
 
@@ -81,16 +155,8 @@ async fn handle_subscription<F>(
     }
 }
 
+// Impls for inspecting the output of the stream.
 impl BroadcastOutputStream {
-    pub fn ty(&self) -> OutputType {
-        self.ty
-    }
-
-    // TODO: Do we really want this?
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Option<Vec<u8>>> {
-        self.sender.subscribe()
-    }
-
     /// NOTE: This is a convenience function.
     /// Only use it if you trust the output of the child process.
     /// This will happily collect gigabytes of output in an allocated `String` if the captured
@@ -162,7 +228,6 @@ impl BroadcastOutputStream {
                     out = out_receiver.recv() => {
                         match out {
                             Ok(Some(chunk)) => {
-                                tracing::info!("Received chunk: {}", String::from_utf8_lossy(&chunk));
                                 let next = process_lines_in_chunk_async(&chunk, &mut line_buffer, &mut f).await;
                                 if next == Next::Break {
                                     break;
@@ -196,7 +261,10 @@ impl BroadcastOutputStream {
             task_termination_sender: Some(term_sig_tx),
         }
     }
+}
 
+// Impls for collecting the output of the stream.
+impl BroadcastOutputStream {
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks<S: Sink>(
         &self,
@@ -492,7 +560,10 @@ impl BroadcastOutputStream {
             })
         })
     }
+}
 
+// Impls for waiting for a specific line of output.
+impl BroadcastOutputStream {
     /// This function is cancel safe.
     pub async fn wait_for_line(&self, predicate: impl Fn(String) -> bool + Send + Sync + 'static) {
         let inspector = self.inspect_lines(move |line| {
@@ -516,122 +587,54 @@ impl BroadcastOutputStream {
     }
 }
 
-pub(crate) fn extract_output_streams(
-    mut child: Child,
-    stdout_channel_capacity: usize,
-    stderr_channel_capacity: usize,
-) -> (Child, BroadcastOutputStream, BroadcastOutputStream) {
-    let stdout = child
-        .stdout
-        .take()
-        .expect("Child process stdout wasn't captured");
-    let stderr = child
-        .stderr
-        .take()
-        .expect("Child process stderr wasn't captured");
-
-    fn read_chunked<B: AsyncRead + Unpin + Send + 'static, const BUFFER_SIZE: usize>(
-        mut reader: BufReader<B>,
-        sender: tokio::sync::broadcast::Sender<Option<Vec<u8>>>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            loop {
-                let mut buf = [0; BUFFER_SIZE]; // 16kb
-                match reader.read(&mut buf).await {
-                    Ok(bytes_read) => {
-                        let is_eof = bytes_read == 0;
-                        match is_eof {
-                            true => {
-                                sender.send(None).unwrap();
-                                break;
-                            }
-                            false => {
-                                match sender.send(Some(Vec::from(&buf[..bytes_read]))) {
-                                    Ok(_received_by) => {}
-                                    Err(err) => {
-                                        // All receivers already dropped.
-                                        // We intentionally ignore these errors.
-                                        // If they occur, the user wasn't interested in seeing this chunk.
-                                        // We won't store it (history) to later feed it back to a new subscriber.
-                                        tracing::debug!(
-                                            error = %err,
-                                            "No active receivers for the output chunk, dropping it"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => panic!("Could not read from stream: {err}"),
-                }
-            }
-        })
-    }
-
-    // Intentionally dropping the initial subscribers.
-    // This will potentially lead to (ignored) errors in read_chunked.
-    let (tx_stdout, _rx_stdout) =
-        tokio::sync::broadcast::channel::<Option<Vec<u8>>>(stdout_channel_capacity);
-    let (tx_stderr, _rx_stderr) =
-        tokio::sync::broadcast::channel::<Option<Vec<u8>>>(stderr_channel_capacity);
-
-    const INPUT_BUFFER_SIZE: usize = 32 * 1024; // 32kb
-    const CHUNK_BUFFER_SIZE: usize = 16 * 1024; // 16kb
-
-    let stdout_buf_reader = BufReader::with_capacity(INPUT_BUFFER_SIZE, stdout); // 32kb input buffer
-    let stderr_buf_reader = BufReader::with_capacity(INPUT_BUFFER_SIZE, stderr); // 32kb input buffer
-
-    let stdout_jh = read_chunked::<_, CHUNK_BUFFER_SIZE>(stdout_buf_reader, tx_stdout.clone());
-    let stderr_jh = read_chunked::<_, CHUNK_BUFFER_SIZE>(stderr_buf_reader, tx_stderr.clone());
-
-    (
-        child,
-        BroadcastOutputStream {
-            ty: OutputType::StdOut,
-            output_collector: stdout_jh,
-            sender: tx_stdout,
-        },
-        BroadcastOutputStream {
-            ty: OutputType::StdErr,
-            output_collector: stderr_jh,
-            sender: tx_stderr,
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use crate::output_stream::broadcast::BroadcastOutputStream;
-    use crate::output_stream::{process_lines_in_chunk, Next};
-    use crate::{OutputType, ProcessHandle};
-    use assertr::prelude::*;
+    use crate::output_stream::tests::write_test_data;
+    use crate::output_stream::Next;
+    use crate::{ProcessHandle, StreamType};
+    use mockall::*;
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
     use tokio::time::sleep;
     use tracing_test::traced_test;
 
     #[tokio::test]
-    #[traced_test]
-    async fn backpressure() {
-        let (sender, _) = tokio::sync::broadcast::channel::<Option<Vec<u8>>>(2);
+    async fn inspect_lines() {
+        let (read_half, write_half) = tokio::io::duplex(64); // Buffer size of 64 bytes
+        let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 32);
 
-        let sender_clone = sender.clone();
-        let task = tokio::spawn(async move {
-            let mut count = 1;
-            loop {
-                tracing::info!("Sending chunk {}", count);
-                sender_clone
-                    .send(Some(Vec::from(format!("{count}\n"))))
-                    .unwrap();
-                count += 1;
-                sleep(Duration::from_millis(25)).await;
-            }
+        #[automock]
+        trait LineVisitor {
+            fn visit(&self, line: String);
+        }
+
+        let mut mock = MockLineVisitor::new();
+        #[rustfmt::skip]
+        fn configure(mock: &mut MockLineVisitor) {
+            mock.expect_visit().with(predicate::eq("Cargo.lock".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("Cargo.toml".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("README.md".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("src".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("target".to_string())).times(1).return_const(());
+        }
+        configure(&mut mock);
+
+        let inspector = os.inspect_lines(move |line| {
+            mock.visit(line);
+            Next::Continue
         });
 
-        let os = BroadcastOutputStream {
-            ty: OutputType::StdOut,
-            output_collector: task,
-            sender,
-        };
+        tokio::spawn(write_test_data(write_half)).await.unwrap();
+
+        let () = inspector.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn handles_backpressure_by_dropping_newer_chunks_after_channel_buffer_filled_up() {
+        let (read_half, mut write_half) = tokio::io::duplex(64); // Buffer size of 64 bytes
+        let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 2);
 
         let consumer = os.inspect_lines_async(async |line| {
             // Mimic a slow consumer.
@@ -641,8 +644,21 @@ mod tests {
             Ok(Next::Continue)
         });
 
+        #[rustfmt::skip]
+        let producer = tokio::spawn(async move {
+            for count in 1..=20 {
+                write_half
+                    .write(format!("{count}\n").as_bytes())
+                    .await
+                    .unwrap();
+                sleep(Duration::from_millis(25)).await;
+            }
+        });
+
         sleep(Duration::from_millis(500)).await;
-        consumer.abort().await.unwrap();
+        producer.await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        consumer.cancel().await.unwrap();
         drop(os);
 
         logs_assert(|lines: &[&str]| {
@@ -659,8 +675,13 @@ mod tests {
                 .filter(|line| line.contains("Inspector is lagging behind lagged=3"))
                 .count()
             {
-                n @ (0 | 1 | 2) => return Err(format!("Expected 3 or more logs, but found {}", n)),
-                _ => {}
+                4 => {}
+                n => {
+                    return Err(format!(
+                        "Expected exactly 4 'lagging behind' logs, but found {}",
+                        n
+                    ))
+                }
             };
             Ok(())
         });
@@ -671,7 +692,7 @@ mod tests {
     async fn collect_into_write() {
         let cmd = tokio::process::Command::new("ls");
 
-        let mut handle = ProcessHandle::spawn("ls", cmd).unwrap();
+        let mut handle = ProcessHandle::<BroadcastOutputStream>::spawn("ls", cmd).unwrap();
 
         let file1 = tokio::fs::File::create(
             std::env::temp_dir()
@@ -695,7 +716,7 @@ mod tests {
             });
 
         let _exit_status = handle.wait().await.unwrap();
-        let _file = collector1.abort().await.unwrap();
-        let _file = collector2.abort().await.unwrap();
+        let _file = collector1.cancel().await.unwrap();
+        let _file = collector2.cancel().await.unwrap();
     }
 }

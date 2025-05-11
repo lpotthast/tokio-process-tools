@@ -1,7 +1,9 @@
 use crate::output_stream::broadcast::BroadcastOutputStream;
+use crate::output_stream::single_subscriber::SingleOutputStream;
+use crate::output_stream::BackpressureControl;
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{output_stream, signal, CollectorError, OutputStream};
+use crate::{signal, CollectorError, OutputStream, StreamType};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
@@ -101,16 +103,25 @@ impl ProcessHandle<BroadcastOutputStream> {
 
     fn new_from_child_with_piped_io_and_capacity(
         name: impl Into<Cow<'static, str>>,
-        child: Child,
+        mut child: Child,
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
     ) -> ProcessHandle<BroadcastOutputStream> {
-        let (child, std_out_stream, std_err_stream) =
-            output_stream::broadcast::extract_output_streams(
-                child,
-                stdout_channel_capacity,
-                stderr_channel_capacity,
-            );
+        let stdout = child
+            .stdout
+            .take()
+            .expect("Child process stdout wasn't captured");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("Child process stderr wasn't captured");
+
+        let (child, std_out_stream, std_err_stream) = (
+            child,
+            BroadcastOutputStream::from_stream(stdout, StreamType::StdOut, stdout_channel_capacity),
+            BroadcastOutputStream::from_stream(stderr, StreamType::StdErr, stderr_channel_capacity),
+        );
+
         let mut this = ProcessHandle {
             name: name.into(),
             child,
@@ -130,8 +141,89 @@ impl ProcessHandle<BroadcastOutputStream> {
         let err_collector = self.std_err_stream.collect_lines_into_vec();
 
         let status = self.wait().await?;
-        let std_out = out_collector.abort().await?;
-        let std_err = err_collector.abort().await?;
+        let std_out = out_collector.cancel().await?;
+        let std_err = err_collector.cancel().await?;
+
+        Ok((status, std_out, std_err))
+    }
+}
+
+impl ProcessHandle<SingleOutputStream> {
+    pub fn spawn(
+        name: impl Into<Cow<'static, str>>,
+        cmd: tokio::process::Command,
+    ) -> io::Result<Self> {
+        Self::spawn_with_capacity(name, cmd, 128, 128)
+    }
+
+    pub fn spawn_with_capacity(
+        name: impl Into<Cow<'static, str>>,
+        mut cmd: tokio::process::Command,
+        stdout_channel_capacity: usize,
+        stderr_channel_capacity: usize,
+    ) -> io::Result<Self> {
+        Self::prepare_command(&mut cmd).spawn().map(|child| {
+            Self::new_from_child_with_piped_io_and_capacity(
+                name,
+                child,
+                stdout_channel_capacity,
+                stderr_channel_capacity,
+            )
+        })
+    }
+
+    fn new_from_child_with_piped_io_and_capacity(
+        name: impl Into<Cow<'static, str>>,
+        mut child: Child,
+        stdout_channel_capacity: usize,
+        stderr_channel_capacity: usize,
+    ) -> Self {
+        let stdout = child
+            .stdout
+            .take()
+            .expect("Child process stdout wasn't captured");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("Child process stderr wasn't captured");
+
+        let (child, std_out_stream, std_err_stream) = (
+            child,
+            SingleOutputStream::from_stream(
+                stdout,
+                StreamType::StdOut,
+                stdout_channel_capacity,
+                BackpressureControl::DropLatestIncomingIfBufferFull,
+            ),
+            SingleOutputStream::from_stream(
+                stderr,
+                StreamType::StdErr,
+                stderr_channel_capacity,
+                BackpressureControl::DropLatestIncomingIfBufferFull,
+            ),
+        );
+
+        let mut this = ProcessHandle {
+            name: name.into(),
+            child,
+            std_out_stream,
+            std_err_stream,
+            panic_on_drop: None,
+        };
+        this.must_be_terminated();
+        this
+    }
+
+    pub async fn wait_with_output(
+        &mut self,
+    ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
+        // TODO: Configurable line collection
+        let out_collector = self.std_out_stream.collect_lines_into_vec();
+        let err_collector = self.std_err_stream.collect_lines_into_vec();
+
+        let status = self.wait().await?;
+        let std_out = out_collector.cancel().await?;
+        let std_err = err_collector.cancel().await?;
 
         Ok((status, std_out, std_err))
     }
@@ -193,9 +285,16 @@ impl<O: OutputStream> ProcessHandle<O> {
     pub fn stdout(&self) -> &O {
         &self.std_out_stream
     }
+    pub fn stdout_mut(&mut self) -> &mut O {
+        &mut self.std_out_stream
+    }
 
     pub fn stderr(&self) -> &O {
         &self.std_err_stream
+    }
+
+    pub fn stderr_mut(&mut self) -> &mut O {
+        &mut self.std_err_stream
     }
 
     /// NOTE: Successfully awaiting the completion of the process will unset the
@@ -324,7 +423,7 @@ impl<O: OutputStream> ProcessHandle<O> {
                             Ok(()) => {
                                 // Note: A SIGKILL should typically (somewhat) immediately lead to
                                 // termination of the process. But there are cases in which even
-                                // a SIGKILL does not / can not / will not kill a process.
+                                // a SIGKILL does not / cannot / will not kill a process.
                                 // Something must have gone horribly wrong then...
                                 // But: We do not want to wait indefinitely in case this happens
                                 // and therefore wait (at max) for a fixed three seconds after any
@@ -332,7 +431,7 @@ impl<O: OutputStream> ProcessHandle<O> {
                                 match self.await_termination(Some(Duration::from_secs(3))).await {
                                     Ok(exit_status) => Ok(exit_status),
                                     Err(not_terminated_after_sigkill) => {
-                                        // Unlikely. See note above.
+                                        // Unlikely. See the note above.
                                         tracing::error!(
                                             "Process, having custom name '{}', did not terminate after receiving a SIGINT, SIGTERM and SIGKILL event (or equivalent on the current platform). Something must have gone horribly wrong... Process may still be running. Manual intervention and investigation required!",
                                             self.name
@@ -379,15 +478,29 @@ impl<O: OutputStream> ProcessHandle<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assertr::prelude::*;
 
     #[tokio::test]
     async fn test_termination() {
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("5");
-        let mut handle = ProcessHandle::spawn("sleep", cmd).unwrap();
-        handle
+
+        let started_at = jiff::Zoned::now();
+        let mut handle = ProcessHandle::<BroadcastOutputStream>::spawn("sleep", cmd).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let exit_status = handle
             .terminate(Duration::from_secs(1), Duration::from_secs(1))
             .await
             .unwrap();
+        let terminated_at = jiff::Zoned::now();
+
+        // We terminate after roughly 100 ms of waiting.
+        // Let's use a 50 ms grace period on the assertion taken up by performing the termination.
+        // We can increase this if the test should turn out to be flaky.
+        let ran_for = started_at.duration_until(&terminated_at);
+        assert_that(ran_for.as_secs_f32()).is_close_to(0.1, 0.5);
+
+        // When terminated, we do not get an exit code (unix).
+        assert_that(exit_status.code()).is_none();
     }
 }
