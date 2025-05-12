@@ -1,5 +1,5 @@
 use crate::output_stream::broadcast::BroadcastOutputStream;
-use crate::output_stream::single_subscriber::SingleOutputStream;
+use crate::output_stream::single_subscriber::{FromStreamOptions, SingleOutputStream};
 use crate::output_stream::BackpressureControl;
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
@@ -192,14 +192,20 @@ impl ProcessHandle<SingleOutputStream> {
             SingleOutputStream::from_stream(
                 stdout,
                 StreamType::StdOut,
-                stdout_channel_capacity,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
+                FromStreamOptions {
+                    channel_capacity: stdout_channel_capacity,
+                    ..Default::default()
+                }
             ),
             SingleOutputStream::from_stream(
                 stderr,
                 StreamType::StdErr,
-                stderr_channel_capacity,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
+                FromStreamOptions {
+                    channel_capacity: stderr_channel_capacity,
+                    ..Default::default()
+                }
             ),
         );
 

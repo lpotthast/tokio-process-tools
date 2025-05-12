@@ -10,6 +10,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
@@ -55,65 +56,65 @@ impl Debug for SingleOutputStream {
 
 fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
     mut reader: BufReader<B>,
-    buffer_size: usize,
+    chunk_size: usize,
     sender: tokio::sync::mpsc::Sender<Option<bytes::Bytes>>,
     backpressure_control: BackpressureControl,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // NOTE: buf may grow when required! TODO
+        let mut buf = bytes::BytesMut::with_capacity(chunk_size);
+        let mut lagged: usize = 0;
         loop {
-            // NOTE: buf may grow when required! TODO
-            let mut buf = bytes::BytesMut::with_capacity(buffer_size);
-            match reader.read(&mut buf).await {
+            match reader.read_buf(&mut buf).await {
                 Ok(bytes_read) => {
                     let is_eof = bytes_read == 0;
-                    match is_eof {
-                        true => {
-                            // Blocking until the previous value was received.
-                            match backpressure_control {
-                                BackpressureControl::DropLatestIncomingIfBufferFull => {
-                                    sender.try_send(None).unwrap();
-                                }
-                                BackpressureControl::BlockUntilBufferHasSpace => {
-                                    sender.send(None).await.unwrap();
-                                }
-                            }
-                            break;
-                        }
-                        false => {
-                            let bytes = buf.split().freeze();
-                            match backpressure_control {
-                                BackpressureControl::DropLatestIncomingIfBufferFull => {
-                                    match sender.try_send(Some(bytes)) {
-                                        Ok(()) => {}
-                                        Err(err) => {
-                                            // All receivers already dropped.
-                                            // We intentionally ignore these errors.
-                                            // If they occur, the user wasn't interested in seeing this chunk.
-                                            // We won't store it (history) to later feed it back to a new subscriber.
-                                            tracing::debug!(
-                                                error = %err,
-                                                "No active receivers for the output chunk, dropping it"
-                                            );
-                                        }
+
+                    let to_send = match is_eof {
+                        true => None,
+                        false => Some(buf.split().freeze()),
+                    };
+
+                    match backpressure_control {
+                        BackpressureControl::DropLatestIncomingIfBufferFull => {
+                            match sender.try_send(to_send) {
+                                Ok(()) => {
+                                    if lagged > 0 {
+                                        tracing::debug!(lagged, "Stream reader is lagging behind");
+                                        lagged = 0;
                                     }
                                 }
-                                BackpressureControl::BlockUntilBufferHasSpace => {
-                                    match sender.send(Some(bytes)).await {
-                                        Ok(()) => {}
-                                        Err(err) => {
+                                Err(err) => {
+                                    match err {
+                                        TrySendError::Full(_data) => {
+                                            lagged += 1;
+                                        }
+                                        TrySendError::Closed(_data) => {
                                             // All receivers already dropped.
-                                            // We intentionally ignore these errors.
-                                            // If they occur, the user wasn't interested in seeing this chunk.
-                                            // We won't store it (history) to later feed it back to a new subscriber.
-                                            tracing::debug!(
-                                                error = %err,
-                                                "No active receivers for the output chunk, dropping it"
-                                            );
+                                            // We intentionally ignore this error.
+                                            // If it occurs, the user just isn't interested in
+                                            // newer chunks anymore.
+                                            break;
                                         }
                                     }
                                 }
                             }
                         }
+                        BackpressureControl::BlockUntilBufferHasSpace => {
+                            match sender.send(to_send).await {
+                                Ok(()) => {}
+                                Err(_err) => {
+                                    // All receivers already dropped.
+                                    // We intentionally ignore this error.
+                                    // If it occurs, the user just isn't interested in
+                                    // newer chunks anymore.
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if is_eof {
+                        break;
                     }
                 }
                 Err(err) => panic!("Could not read from stream: {err}"),
@@ -122,23 +123,51 @@ fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
     })
 }
 
+pub struct FromStreamOptions {
+    /// The size of the buffer used when reading from the stream in bytes.
+    ///
+    /// default: 32 * 1024 // 32 kb
+    pub read_buffer_size: usize,
+
+    /// The size of an individual chunk read from the read buffer in bytes.
+    ///
+    /// default: 16 * 1024 // 16 kb
+    pub chunk_size: usize,
+
+    /// The number of chunks held by the underlying async channel.
+    ///
+    /// When the subscriber (if present) is not fast enough to consume chunks equally fast or faster
+    /// than them getting read, this acts as a buffer to hold not-yet processed messages.
+    /// The bigger, the better, in terms of system resilience to write-spikes.
+    /// Multiply with `chunk_size` to obtain the amount of system resources this will consume at
+    /// max.
+    pub channel_capacity: usize,
+}
+
+impl Default for FromStreamOptions {
+    fn default() -> Self {
+        Self {
+            read_buffer_size: 32 * 1024, // 32 kb
+            chunk_size: 16 * 1024,       // 16 kb
+            channel_capacity: 128,       // => 16 kb * 128 = 2 mb (max memory usage consumption)
+        }
+    }
+}
+
 impl SingleOutputStream {
-    pub(crate) fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
+    pub fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
         stream: S,
         ty: StreamType,
-        channel_capacity: usize,
         backpressure_control: BackpressureControl,
+        options: FromStreamOptions,
     ) -> SingleOutputStream {
-        const INPUT_BUFFER_SIZE: usize = 32 * 1024; // 32kb
-        const CHUNK_BUFFER_SIZE: usize = 16 * 1024; // 16kb
-
         let (tx_stdout, rx_stdout) =
-            tokio::sync::mpsc::channel::<Option<bytes::Bytes>>(channel_capacity);
+            tokio::sync::mpsc::channel::<Option<bytes::Bytes>>(options.channel_capacity);
 
-        let buf_reader = BufReader::with_capacity(INPUT_BUFFER_SIZE, stream);
+        let buf_reader = BufReader::with_capacity(options.read_buffer_size, stream);
         let output_collector = read_chunked(
             buf_reader,
-            CHUNK_BUFFER_SIZE,
+            options.chunk_size,
             tx_stdout,
             backpressure_control,
         );
@@ -621,7 +650,7 @@ impl SingleOutputStream {
 #[cfg(test)]
 mod tests {
     use crate::output_stream::broadcast::BroadcastOutputStream;
-    use crate::output_stream::single_subscriber::SingleOutputStream;
+    use crate::output_stream::single_subscriber::{FromStreamOptions, SingleOutputStream};
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, Next};
     use crate::StreamType;
@@ -635,44 +664,45 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn backpressure() {
-        let (read_half, mut write_half) = tokio::io::duplex(64); // Buffer size of 64 bytes
+    async fn handles_backpressure_by_dropping_newer_chunks_after_channel_buffer_filled_up() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
         let mut os = SingleOutputStream::from_stream(
             read_half,
             StreamType::StdOut,
-            32,
             BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions {
+                channel_capacity: 2,
+                ..Default::default()
+            },
         );
-        let task = tokio::spawn(async move {
-            let mut count = 1;
-            loop {
-                tracing::info!("Sending chunk {}", count);
+
+        let consumer = os.inspect_lines_async(async |_line| {
+            // Mimic a slow consumer.
+            sleep(Duration::from_millis(110)).await;
+            Ok(Next::Continue)
+        });
+
+        #[rustfmt::skip]
+        let producer = tokio::spawn(async move {
+            for count in 1..=20 {
                 write_half
-                    .write_all(format!("{count}\n").as_bytes())
+                    .write(format!("{count}\n").as_bytes())
                     .await
                     .unwrap();
-                count += 1;
                 sleep(Duration::from_millis(25)).await;
             }
         });
 
-        let consumer = os.inspect_lines_async(async |line| {
-            // Mimic a slow consumer.
-            tracing::info!("Processing line: {line}");
-            sleep(Duration::from_millis(100)).await;
-            drop(line);
-            Ok(Next::Continue)
-        });
-
         sleep(Duration::from_millis(500)).await;
+        producer.await.unwrap();
+        sleep(Duration::from_millis(100)).await;
         consumer.cancel().await.unwrap();
-        task.abort();
         drop(os);
 
         logs_assert(|lines: &[&str]| {
             match lines
                 .iter()
-                .filter(|line| line.contains("Inspector is lagging behind lagged=1"))
+                .filter(|line| line.contains("Stream reader is lagging behind lagged=2"))
                 .count()
             {
                 1 => {}
@@ -680,11 +710,11 @@ mod tests {
             };
             match lines
                 .iter()
-                .filter(|line| line.contains("Inspector is lagging behind lagged=3"))
+                .filter(|line| line.contains("Stream reader is lagging behind lagged=3"))
                 .count()
             {
-                n @ (0 | 1 | 2) => return Err(format!("Expected 3 or more logs, but found {}", n)),
-                _ => {}
+                3 => {}
+                n => return Err(format!("Expected exactly 3 or logs, but found {}", n)),
             };
             Ok(())
         });
@@ -692,8 +722,16 @@ mod tests {
 
     #[tokio::test]
     async fn collect_lines_to_file() {
-        let (read_half, write_half) = tokio::io::duplex(64); // Buffer size of 64 bytes
-        let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 32);
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let mut os = SingleOutputStream::from_stream(
+            read_half,
+            StreamType::StdOut,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions {
+                channel_capacity: 32,
+                ..Default::default()
+            },
+        );
 
         let temp_file = tempfile::tempfile().unwrap();
         let collector = os.collect_lines(temp_file, |line, temp_file| {
@@ -713,7 +751,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_lines_async_to_file() {
-        let (read_half, write_half) = tokio::io::duplex(64); // Buffer size of 64 bytes
+        let (read_half, write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 32);
 
         let temp_file = tempfile::tempfile().unwrap();
@@ -737,7 +775,7 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn collect_chunks_into_write_mapped() {
-        let (read_half, write_half) = tokio::io::duplex(64); // Buffer size of 64 bytes
+        let (read_half, write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 32);
 
         let temp_file = tokio::fs::File::options()

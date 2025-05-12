@@ -12,7 +12,7 @@ pub mod single_subscriber;
 pub trait OutputStream {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackpressureControl {
+pub enum BackpressureControl {
     /// ...
     DropLatestIncomingIfBufferFull,
 
@@ -21,7 +21,6 @@ pub(crate) enum BackpressureControl {
     /// captured, as their pipe buffer may get full, requiring the application /
     /// relying on the application to drop data instead of writing to stdout/stderr in order
     /// to not block.
-    #[expect(unused)]
     BlockUntilBufferHasSpace,
 }
 

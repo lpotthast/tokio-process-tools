@@ -236,8 +236,8 @@ impl BroadcastOutputStream {
                             Ok(None) => {
                                 if !line_buffer.is_empty() {
                                     f(line_buffer);
-                                    line_buffer = String::new();
                                 }
+                                break;
                             }
                             Err(RecvError::Closed) => {
                                 // All senders have been dropped.
@@ -592,16 +592,19 @@ mod tests {
     use crate::output_stream::broadcast::BroadcastOutputStream;
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::Next;
-    use crate::{ProcessHandle, StreamType};
+    use crate::StreamType;
+    use assertr::assert_that;
+    use assertr::prelude::PartialEqAssertions;
     use mockall::*;
+    use std::io::SeekFrom;
     use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     use tokio::time::sleep;
     use tracing_test::traced_test;
 
     #[tokio::test]
     async fn inspect_lines() {
-        let (read_half, write_half) = tokio::io::duplex(64); // Buffer size of 64 bytes
+        let (read_half, write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 32);
 
         #[automock]
@@ -630,17 +633,17 @@ mod tests {
         let () = inspector.cancel().await.unwrap();
     }
 
+    // TODO: Test that inspector/collector receivers terminate when data-sender is dropped!
+
     #[tokio::test]
     #[traced_test]
     async fn handles_backpressure_by_dropping_newer_chunks_after_channel_buffer_filled_up() {
-        let (read_half, mut write_half) = tokio::io::duplex(64); // Buffer size of 64 bytes
+        let (read_half, mut write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 2);
 
-        let consumer = os.inspect_lines_async(async |line| {
+        let consumer = os.inspect_lines_async(async |_line| {
             // Mimic a slow consumer.
-            tracing::info!("Processing line: {line}");
-            sleep(Duration::from_millis(100)).await;
-            drop(line);
+            sleep(Duration::from_millis(110)).await;
             Ok(Next::Continue)
         });
 
@@ -653,22 +656,22 @@ mod tests {
                     .unwrap();
                 sleep(Duration::from_millis(25)).await;
             }
+            write_half.flush().await.unwrap();
+            drop(write_half);
         });
 
-        sleep(Duration::from_millis(500)).await;
         producer.await.unwrap();
-        sleep(Duration::from_millis(100)).await;
-        consumer.cancel().await.unwrap();
+        consumer.wait().await.unwrap();
         drop(os);
 
         logs_assert(|lines: &[&str]| {
             match lines
                 .iter()
-                .filter(|line| line.contains("Inspector is lagging behind lagged=1"))
+                .filter(|line| line.contains("Inspector is lagging behind lagged=2"))
                 .count()
             {
                 1 => {}
-                n => return Err(format!("Expected one matching log, but found {}", n)),
+                n => return Err(format!("Expected two matching logs, but found {}", n)),
             };
             match lines
                 .iter()
@@ -689,34 +692,49 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn collect_into_write() {
-        let cmd = tokio::process::Command::new("ls");
+    async fn collect_chunks_into_write_in_parallel() {
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 2);
 
-        let mut handle = ProcessHandle::<BroadcastOutputStream>::spawn("ls", cmd).unwrap();
+        let file1 = tokio::fs::File::options()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(
+                std::env::temp_dir()
+                    .join("tokio_process_tools_test_broadcast_stream_collect_chunks_into_write_in_parallel_1.txt"),
+            )
+            .await
+            .unwrap();
+        let file2 = tokio::fs::File::options()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(
+                std::env::temp_dir()
+                    .join("tokio_process_tools_test_broadcast_stream_collect_chunks_into_write_in_parallel_2.txt"),
+            )
+            .await
+            .unwrap();
 
-        let file1 = tokio::fs::File::create(
-            std::env::temp_dir()
-                .join("tokio_process_tools_test_write_with_predefined_collector_1.txt"),
-        )
-        .await
-        .unwrap();
-        let file2 = tokio::fs::File::create(
-            std::env::temp_dir()
-                .join("tokio_process_tools_test_write_with_predefined_collector_2.txt"),
-        )
-        .await
-        .unwrap();
+        let collector1 = os.collect_chunks_into_write(file1);
+        let collector2 = os.collect_chunks_into_write_mapped(file2, |chunk| {
+            format!("ok-{}", String::from_utf8_lossy(&chunk))
+        });
 
-        let collector1 = handle.stdout().collect_chunks_into_write(file1);
+        tokio::spawn(write_test_data(write_half)).await.unwrap();
 
-        let collector2 = handle
-            .stdout()
-            .collect_chunks_into_write_mapped(file2, |chunk| {
-                format!("ok-{}", String::from_utf8_lossy(&chunk))
-            });
+        let mut temp_file1 = collector1.cancel().await.unwrap();
+        temp_file1.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut contents = String::new();
+        temp_file1.read_to_string(&mut contents).await.unwrap();
+        assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
 
-        let _exit_status = handle.wait().await.unwrap();
-        let _file = collector1.cancel().await.unwrap();
-        let _file = collector2.cancel().await.unwrap();
+        let mut temp_file2 = collector2.cancel().await.unwrap();
+        temp_file2.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut contents = String::new();
+        temp_file2.read_to_string(&mut contents).await.unwrap();
+        assert_that(contents)
+            .is_equal_to("ok-Cargo.lock\nok-Cargo.toml\nok-README.md\nok-src\nok-target\n");
     }
 }
