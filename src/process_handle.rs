@@ -303,20 +303,6 @@ impl<O: OutputStream> ProcessHandle<O> {
         &mut self.std_err_stream
     }
 
-    /// NOTE: Successfully awaiting the completion of the process will unset the
-    /// "must be terminated" setting, as a successfully awaited process is already terminated.
-    /// Dropping this `ProcessHandle` after calling `wait` should never lead to a
-    /// "must be terminated" panic being raised.
-    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        match self.child.wait().await {
-            Ok(status) => {
-                self.must_not_be_terminated();
-                Ok(status)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
     /// Sets a panic-on-drop mechanism for this `ProcessHandle`.
     ///
     /// This method enables a safeguard that ensures that the process represented by this
@@ -365,17 +351,6 @@ impl<O: OutputStream> ProcessHandle<O> {
         }
     }
 
-    /// Wait for this process to run to completion within `timeout` if set or unbound otherwise.
-    async fn await_termination(&mut self, timeout: Option<Duration>) -> io::Result<ExitStatus> {
-        match timeout {
-            None => self.wait().await,
-            Some(timeout) => match tokio::time::timeout(timeout, self.wait()).await {
-                Ok(exit_status) => exit_status,
-                Err(err) => Err(err.into()),
-            },
-        }
-    }
-
     /// Manually sed a `SIGINT` on unix or equivalent on Windows to this process.
     ///
     /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
@@ -404,7 +379,7 @@ impl<O: OutputStream> ProcessHandle<O> {
         self.send_interrupt_signal()
             .map_err(TerminationError::SignallingFailed)?;
 
-        match self.await_termination(Some(interrupt_timeout)).await {
+        match self.wait_for_completion(Some(interrupt_timeout)).await {
             Ok(exit_status) => Ok(exit_status),
             Err(not_terminated_after_sigint) => {
                 tracing::warn!(
@@ -416,7 +391,7 @@ impl<O: OutputStream> ProcessHandle<O> {
                 self.send_terminate_signal()
                     .map_err(TerminationError::SignallingFailed)?;
 
-                match self.await_termination(Some(terminate_timeout)).await {
+                match self.wait_for_completion(Some(terminate_timeout)).await {
                     Ok(exit_status) => Ok(exit_status),
                     Err(not_terminated_after_sigterm) => {
                         tracing::warn!(
@@ -434,7 +409,7 @@ impl<O: OutputStream> ProcessHandle<O> {
                                 // But: We do not want to wait indefinitely in case this happens
                                 // and therefore wait (at max) for a fixed three seconds after any
                                 // SIGKILL event.
-                                match self.await_termination(Some(Duration::from_secs(3))).await {
+                                match self.wait_for_completion(Some(Duration::from_secs(3))).await {
                                     Ok(exit_status) => Ok(exit_status),
                                     Err(not_terminated_after_sigkill) => {
                                         // Unlikely. See the note above.
@@ -472,6 +447,46 @@ impl<O: OutputStream> ProcessHandle<O> {
 
     pub async fn kill(&mut self) -> io::Result<()> {
         self.child.kill().await
+    }
+
+    /// Successfully awaiting the completion of the process will unset the
+    /// "must be terminated" setting, as a successfully awaited process is already terminated.
+    /// Dropping this `ProcessHandle` after calling `wait` should never lead to a
+    /// "must be terminated" panic being raised.
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        match self.child.wait().await {
+            Ok(status) => {
+                self.must_not_be_terminated();
+                Ok(status)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Wait for this process to run to completion. Within `timeout`, if set, or unbound otherwise.
+    pub async fn wait_for_completion(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> io::Result<ExitStatus> {
+        match timeout {
+            None => self.wait().await,
+            Some(timeout) => match tokio::time::timeout(timeout, self.wait()).await {
+                Ok(exit_status) => exit_status,
+                Err(err) => Err(err.into()),
+            },
+        }
+    }
+
+    pub async fn wait_for_completion_or_terminate(
+        &mut self,
+        wait_timeout: Duration,
+        interrupt_timeout: Duration,
+        terminate_timeout: Duration,
+    ) -> Result<ExitStatus, TerminationError> {
+        match self.wait_for_completion(Some(wait_timeout)).await {
+            Ok(exit_status) => Ok(exit_status),
+            Err(_err) => self.terminate(interrupt_timeout, terminate_timeout).await,
+        }
     }
 
     /// Consumes this handle to provide the wrapped `tokio::process::Child` instance as well as the

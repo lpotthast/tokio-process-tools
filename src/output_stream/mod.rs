@@ -52,7 +52,7 @@ pub enum Next {
 /// # Members
 /// * `chunk` - New slice of bytes to process.
 /// * `line_buffer` - Buffer for reading one line.
-///                   May hold previously seen, not-yet-closed, line-data.
+///   May hold previously seen, not-yet-closed, line-data.
 pub(crate) struct LineReader<'c, 'b> {
     chunk: &'c [u8],
     line_buffer: &'b mut String,

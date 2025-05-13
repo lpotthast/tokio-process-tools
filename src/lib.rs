@@ -56,7 +56,7 @@ mod test {
             }
         };
 
-        let _exit_status = process.wait().await.unwrap();
+        let _exit_status = process.wait_for_completion(None).await.unwrap();
 
         match process.is_running() {
             RunningState::Running => {

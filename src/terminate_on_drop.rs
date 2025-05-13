@@ -19,11 +19,13 @@ use std::time::Duration;
 ///
 /// Instead of relying on automatic termination, prefer these safer approaches:
 /// 1. Manual process termination using [`ProcessHandle::terminate`]
-/// 2. Awaiting the process completion using [`ProcessHandle::wait`]
+/// 2. Awaiting process completion using [`ProcessHandle::wait_for_completion`]
+/// 3. Awaiting process completion or performing an explicit termination using
+///    [`ProcessHandle::wait_for_completion_or_terminate`]
 ///
 /// # Implementation Details
 ///
-/// The drop implementation try to terminate the process if it was neither awaited nor
+/// The drop implementation tries to terminate the process if it was neither awaited nor
 /// terminated before being dropped. If termination fails, a panic is raised.
 #[derive(Debug)]
 pub struct TerminateOnDrop<O: OutputStream> {
