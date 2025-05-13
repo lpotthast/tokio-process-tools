@@ -11,8 +11,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 
@@ -301,10 +301,10 @@ impl BroadcastOutputStream {
 
 #[cfg(test)]
 mod tests {
+    use crate::StreamType;
+    use crate::output_stream::Next;
     use crate::output_stream::broadcast::BroadcastOutputStream;
     use crate::output_stream::tests::write_test_data;
-    use crate::output_stream::Next;
-    use crate::StreamType;
     use assertr::assert_that;
     use assertr::prelude::PartialEqAssertions;
     use mockall::*;
