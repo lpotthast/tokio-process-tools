@@ -3,16 +3,16 @@ macro_rules! impl_inspect_chunks {
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         Inspector {
             task: Some(tokio::spawn(async move {
-                $handler!($receiver, term_sig_rx, |maybe_chunk| {
+                $handler!('outer, $receiver, term_sig_rx, |maybe_chunk| {
                     match maybe_chunk {
                         Some(chunk) => {
                             if let Next::Break = $f(chunk) {
-                                break;
+                                break 'outer;
                             }
                         }
                         None => {
                             // EOF reached.
-                            break;
+                            break 'outer;
                         }
                     }
                 });
@@ -29,7 +29,7 @@ macro_rules! impl_inspect_lines {
         Inspector {
             task: Some(tokio::spawn(async move {
                 let mut line_buffer = String::new();
-                $handler!($receiver, term_sig_rx, |maybe_chunk| {
+                $handler!('outer, $receiver, term_sig_rx, |maybe_chunk| {
                     match maybe_chunk {
                         Some(chunk) => {
                             let lr = LineReader {
@@ -39,7 +39,7 @@ macro_rules! impl_inspect_lines {
                             for line in lr {
                                 let next = $f(line);
                                 if next == Next::Break {
-                                    break;
+                                    break 'outer;
                                 }
                             }
                         }
@@ -47,7 +47,7 @@ macro_rules! impl_inspect_lines {
                             if !line_buffer.is_empty() {
                                 $f(line_buffer);
                             }
-                            break;
+                            break 'outer;
                         }
                     }
                 });
@@ -64,7 +64,7 @@ macro_rules! impl_inspect_lines_async {
         Inspector {
             task: Some(tokio::spawn(async move {
                 let mut line_buffer = String::new();
-                $handler!($receiver, term_sig_rx, |maybe_chunk| {
+                $handler!('outer, $receiver, term_sig_rx, |maybe_chunk| {
                     match maybe_chunk {
                         Some(chunk) => {
                             let lr = LineReader {
@@ -74,7 +74,7 @@ macro_rules! impl_inspect_lines_async {
                             for line in lr {
                                 match $f(line).await {
                                     Next::Continue => {}
-                                    Next::Break => break,
+                                    Next::Break => break 'outer,
                                 }
                             }
                         }
@@ -82,7 +82,7 @@ macro_rules! impl_inspect_lines_async {
                             if !line_buffer.is_empty() {
                                 $f(line_buffer);
                             }
-                            break;
+                            break 'outer;
                         }
                     }
                 });
@@ -98,7 +98,7 @@ macro_rules! impl_collect_chunks {
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         Collector {
             task: Some(tokio::spawn(async move {
-                $handler!($receiver, term_sig_rx, |maybe_chunk| {
+                $handler!('outer, $receiver, term_sig_rx, |maybe_chunk| {
                     match maybe_chunk {
                         Some(chunk) => {
                             let mut write_guard = $sink.write().await;
@@ -106,7 +106,7 @@ macro_rules! impl_collect_chunks {
                         }
                         None => {
                             // EOF reached.
-                            break;
+                            break 'outer;
                         }
                     }
                 });
@@ -124,7 +124,7 @@ macro_rules! impl_collect_lines {
         Collector {
             task: Some(tokio::spawn(async move {
                 let mut line_buffer = String::new();
-                $handler!($receiver, term_sig_rx, |maybe_chunk| {
+                $handler!('outer, $receiver, term_sig_rx, |maybe_chunk| {
                     match maybe_chunk {
                         Some(chunk) => {
                             let mut write_guard = $sink.write().await;
@@ -136,13 +136,13 @@ macro_rules! impl_collect_lines {
                             for line in lr {
                                 match $collect(line, sink) {
                                     Next::Continue => {}
-                                    Next::Break => break,
+                                    Next::Break => break 'outer,
                                 }
                             }
                         }
                         None => {
                             // EOF reached.
-                            break;
+                            break 'outer;
                         }
                     }
                 });
@@ -159,7 +159,7 @@ macro_rules! impl_collect_chunks_async {
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         Collector {
             task: Some(tokio::spawn(async move {
-                $handler!($receiver, term_sig_rx, |maybe_chunk| {
+                $handler!('outer, $receiver, term_sig_rx, |maybe_chunk| {
                     match maybe_chunk {
                         Some(chunk) => {
                             // TODO: refactor error handling?
@@ -169,13 +169,13 @@ macro_rules! impl_collect_chunks_async {
                                 fut.await
                             };
                             match result {
-                                Next::Continue => continue,
-                                Next::Break => break,
+                                Next::Continue => {},
+                                Next::Break => break 'outer,
                             }
                         }
                         None => {
                             // EOF reached.
-                            break;
+                            break 'outer;
                         }
                     }
                 });
@@ -193,9 +193,10 @@ macro_rules! impl_collect_lines_async {
         Collector {
             task: Some(tokio::spawn(async move {
                 let mut line_buffer = String::new();
-                handle_subscription!($receiver, term_sig_rx, |maybe_chunk| {
+                $handler!('outer, $receiver, term_sig_rx, |maybe_chunk| {
                     match maybe_chunk {
                         Some(chunk) => {
+                            tracing::info!("chunk: {:?}", chunk);
                             let mut write_guard = $sink.write().await;
                             let sink = &mut *write_guard;
                             let lr = LineReader {
@@ -204,10 +205,14 @@ macro_rules! impl_collect_lines_async {
                             };
                             for line in lr {
                                 match $collect(line, sink).await {
-                                    Next::Continue => continue,
-                                    Next::Break => break,
+                                    Next::Continue => {},
+                                    Next::Break => {
+                                        tracing::info!("break");
+                                        break 'outer
+                                    },
                                 }
                             }
+                            tracing::info!("end of  chunk processing");
                         }
                         None => {
                             // EOF reached.
@@ -220,7 +225,7 @@ macro_rules! impl_collect_lines_async {
                                     }
                                 }
                             }
-                            break;
+                            break 'outer;
                         }
                     }
                 });

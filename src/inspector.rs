@@ -38,14 +38,22 @@ impl Inspector {
     ///
     /// If none of these may occur in your case, this could/will hang forever!
     pub async fn wait(mut self) -> Result<(), InspectorError> {
-        // Drop the `task_termination_sender`, so that we do not try to use it on `Drop`.
-        let _ = self.task_termination_sender.take();
+        // Take the `task_termination_sender`. Let's make sure nobody can ever interfere with us
+        // waiting here. DO NOT drop it, or the task will terminate (at least if it also takes the
+        // receive-error as a signal to terminate)!
+        let tts = self.task_termination_sender.take();
 
-        self.task
+        let result = self
+            .task
             .take()
             .expect("`task` to be present.")
             .await
-            .map_err(InspectorError::TaskJoin)
+            .map_err(InspectorError::TaskJoin);
+
+        // Drop the termination sender, we don't need it. Task is now terminated.
+        drop(tts);
+
+        result
     }
 
     /// Sends a cancellation event to the inspector, letting it shut down.

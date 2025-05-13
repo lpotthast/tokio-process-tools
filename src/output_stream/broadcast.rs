@@ -127,8 +127,8 @@ impl BroadcastOutputStream {
 // receiver: tokio::sync::broadcast::Receiver<Option<Vec<u8>>>,
 // term_rx: tokio::sync::oneshot::Receiver<()>,
 macro_rules! handle_subscription {
-    ($receiver:expr, $term_rx:expr, |$chunk:ident| $body:block) => {
-        loop {
+    ($loop_label:tt, $receiver:expr, $term_rx:expr, |$chunk:ident| $body:block) => {
+        $loop_label: loop {
             tokio::select! {
                 out = $receiver.recv() => {
                     match out {
@@ -138,14 +138,14 @@ macro_rules! handle_subscription {
                         }
                         Err(RecvError::Closed) => {
                             // All senders have been dropped.
-                            break;
+                            break $loop_label;
                         },
                         Err(RecvError::Lagged(lagged)) => {
                             tracing::warn!(lagged, "Inspector is lagging behind");
                         }
                     }
                 }
-                _msg = &mut $term_rx => break,
+                _msg = &mut $term_rx => break $loop_label,
             }
         }
     };

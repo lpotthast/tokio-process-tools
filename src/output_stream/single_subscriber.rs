@@ -192,8 +192,8 @@ impl SingleSubscriberOutputStream {
 // receiver: tokio::sync::mpsc::Receiver<Option<bytes::Bytes>>
 // term_rx: tokio::sync::oneshot::Receiver<()>
 macro_rules! handle_subscription {
-    ($receiver:expr, $term_rx:expr, |$chunk:ident| $body:block) => {
-        loop {
+    ($loop_label:tt, $receiver:expr, $term_rx:expr, |$chunk:ident| $body:block) => {
+        $loop_label: loop {
             tokio::select! {
                 out = $receiver.recv() => {
                     match out {
@@ -203,11 +203,11 @@ macro_rules! handle_subscription {
                         }
                         None => {
                             // All senders have been dropped.
-                            break;
+                            break $loop_label;
                         }
                     }
                 }
-                _msg = &mut $term_rx => break,
+                _msg = &mut $term_rx => break $loop_label,
             }
         }
     };
@@ -416,7 +416,7 @@ mod tests {
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, Next};
     use assertr::assert_that;
-    use assertr::prelude::PartialEqAssertions;
+    use assertr::prelude::{PartialEqAssertions, VecAssertions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -477,6 +477,47 @@ mod tests {
             };
             Ok(())
         });
+    }
+
+    /// This tests that our impl macros properly `break 'outer`, as they might be in an inner loop!
+    /// With `break` instead of `break 'outer`, this test would never complete, as the `Next::Break`
+    /// would not terminate the collector!
+    #[tokio::test]
+    #[traced_test]
+    async fn inspect_lines_async() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 32);
+
+        let seen: Vec<String> = Vec::new();
+        let collector = os.collect_lines_async(seen, move |line, seen: &mut Vec<String>| {
+            Box::pin(async move {
+                if line == "break" {
+                    seen.push(line);
+                    Next::Break
+                } else {
+                    seen.push(line);
+                    Next::Continue
+                }
+            })
+        });
+
+        let _writer = tokio::spawn(async move {
+            write_half.write_all("start\n".as_bytes()).await.unwrap();
+            write_half.write_all("break\n".as_bytes()).await.unwrap();
+            write_half.write_all("end\n".as_bytes()).await.unwrap();
+
+            loop {
+                write_half
+                    .write_all("gibberish\n".as_bytes())
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let seen = collector.wait().await.unwrap();
+
+        assert_that(seen).contains_exactly(&["start", "break"]);
     }
 
     #[tokio::test]
