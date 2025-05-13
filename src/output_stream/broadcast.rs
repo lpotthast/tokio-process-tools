@@ -253,6 +253,21 @@ impl BroadcastOutputStream {
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+    pub fn collect_lines_into_write<W: Sink + AsyncWriteExt + Unpin>(
+        &self,
+        write: W,
+    ) -> Collector<W> {
+        self.collect_lines_async(write, move |line, write| {
+            Box::pin(async move {
+                if let Err(err) = write.write_all(line.as_bytes()).await {
+                    tracing::warn!("Could not write line to write sink: {err:#?}");
+                };
+                Next::Continue
+            })
+        })
+    }
+
+    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_into_write_mapped<
         W: Sink + AsyncWriteExt + Unpin,
         B: AsRef<[u8]> + Send,
@@ -267,6 +282,27 @@ impl BroadcastOutputStream {
                 let mapped = mapped.as_ref();
                 if let Err(err) = write.write_all(mapped).await {
                     tracing::warn!("Could not write chunk to write sink: {err:#?}");
+                };
+                Next::Continue
+            })
+        })
+    }
+
+    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+    pub fn collect_lines_into_write_mapped<
+        W: Sink + AsyncWriteExt + Unpin,
+        B: AsRef<[u8]> + Send,
+    >(
+        &self,
+        write: W,
+        mapper: impl Fn(String) -> B + Send + Sync + Copy + 'static,
+    ) -> Collector<W> {
+        self.collect_lines_async(write, move |line, write| {
+            Box::pin(async move {
+                let mapped = mapper(line);
+                let mapped = mapped.as_ref();
+                if let Err(err) = write.write_all(mapped).await {
+                    tracing::warn!("Could not write line to write sink: {err:#?}");
                 };
                 Next::Continue
             })
