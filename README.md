@@ -6,10 +6,10 @@ A library designed to assist with interacting and managing processes spawned via
 
 ## Features
 
-- Inspecting stdout/stderr streams asynchronously.
-- Collecting stdout/stderr streams asynchronously into some new structure.
+- Inspecting stdout/stderr streams synchronously and asynchronously.
+- Collecting stdout/stderr streams synchronously and asynchronously into some new structure.
 - Waiting for specific output on stdout/stderr.
-- Gracefully terminating a processes or killing it if unresponsive.
+- Gracefully terminating a process or killing it if unresponsive.
 
 ## Example Usage
 
@@ -17,27 +17,62 @@ Here is an example that demonstrates how to spawn a process, handle its output, 
 library.
 
 ```rust
-async fn start_server() -> tokio_process_tools::TerminateOnDrop {
+use crate::broadcast::BroadcastOutputStream;
+use crate::output_stream::Next;
+use crate::ProcessHandle;
+
+async fn start_process() {
+    // Create a command.
     let cmd = tokio::process::Command::new("some-long-running-process");
 
-    let handle = tokio_process_tools::ProcessHandle::spawn("my-process-handle", cmd).unwrap();
+    // Let tokio_process_tools spawn the command. It will automatically set up output capturing.
+    // Use either:
+    // - SingleSubscriberOutputStream: If you expect only a single consumer per stream.
+    // - BroadcastOutputStream: If you expect to have multiple concurrent consumers per stream.
+    let mut process =
+        ProcessHandle::<BroadcastOutputStream>::spawn("my-process-handle", cmd).unwrap();
 
-    let _out_inspector = handle.stdout().inspect(|stdout_line| {
-        tracing::debug!(stdout_line, "some-long-running-process wrote");
+    // Access the stdout/stderr streams with their respective accessor functions.
+    let stdout_inspector = process.stdout().inspect_lines(|line| {
+        tracing::info!(line, "stdout");
+        Next::Continue
     });
-    let _err_inspector = handle.stdout().inspect(|stderr_line| {
-        tracing::debug!(stderr_line, "some-long-running-process wrote");
+    let stderr_inspector = process.stderr().inspect_lines_async(async |line| {
+        tracing::warn!(line, "stderr");
+        Next::Continue
     });
 
-    handle
+    // You can wait for a line fulfilling an assertion. Optionally with a timeout.
+    // This is syntactic sugar over an `inspect_lines`.
+    process
         .stdout()
-        .wait_for(|line| line.contains("started successfully on port 8080"))
+        .wait_for_line(|line| line.contains("started successfully on port 8080"))
         .await;
 
-    handle.terminate_on_drop(
-        std::time::Duration::from_secs(3),
-        std::time::Duration::from_secs(8),
-    )
+    // Wait for the natural completion of the process (with an optional timeout).
+    process
+        .wait_for_completion(Some(std::time::Duration::from_secs(30)))
+        .await
+        .unwrap();
+
+    // Or explicitly terminate the process.
+    process
+        .terminate(
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(8),
+        )
+        .await
+        .unwrap();
+
+    // Or combine both.
+    process
+        .wait_for_completion_or_terminate(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(8),
+        )
+        .await
+        .unwrap();
 }
 ```
 
@@ -47,14 +82,14 @@ Add the following line to your `Cargo.toml` to include this library as part of y
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.3.0"
+tokio-process-tools = "0.5.0"
 ```
 
 Ensure that the `tokio` runtime is also set up in your project. Only use the features you need!:
 
 ```toml
 [dependencies]
-tokio = { version = "1.43.0", features = ["full"] }
+tokio = { version = "1.45.0", features = ["full"] }
 ```
 
 **IMPORTANT**:

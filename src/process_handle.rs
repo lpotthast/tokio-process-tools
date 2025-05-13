@@ -1,7 +1,9 @@
-use crate::output_stream::{extract_output_streams, OutputStream};
+use crate::output_stream::broadcast::BroadcastOutputStream;
+use crate::output_stream::single_subscriber::{FromStreamOptions, SingleSubscriberOutputStream};
+use crate::output_stream::BackpressureControl;
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{signal, WaitError};
+use crate::{signal, CollectorError, OutputStream, StreamType};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
@@ -15,7 +17,8 @@ pub enum TerminationError {
     #[error("Failed to send signal to process: {0}")]
     SignallingFailed(#[from] io::Error),
 
-    #[error("Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}"
+    #[error(
+        "Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}"
     )]
     TerminationFailed {
         not_terminated_after_sigint: io::Error,
@@ -26,45 +29,213 @@ pub enum TerminationError {
 
 /// Represents the running state of a process.
 #[derive(Debug)]
-pub enum IsRunning {
-    /// Process is still running.
+pub enum RunningState {
+    /// The process is still running.
     Running,
 
-    /// Process has terminated with the given exit status.
-    NotRunning(ExitStatus),
+    /// The process has terminated with the given exit status.
+    Terminated(ExitStatus),
 
     /// Failed to determine process state.
     Uncertain(io::Error),
 }
 
-impl IsRunning {
+impl RunningState {
     pub fn as_bool(&self) -> bool {
         match self {
-            IsRunning::Running => true,
-            IsRunning::NotRunning(_) | IsRunning::Uncertain(_) => false,
+            RunningState::Running => true,
+            RunningState::Terminated(_) | RunningState::Uncertain(_) => false,
         }
     }
 }
 
-impl From<IsRunning> for bool {
-    fn from(is_running: IsRunning) -> Self {
+impl From<RunningState> for bool {
+    fn from(is_running: RunningState) -> Self {
         match is_running {
-            IsRunning::Running => true,
-            IsRunning::NotRunning(_) | IsRunning::Uncertain(_) => false,
+            RunningState::Running => true,
+            RunningState::Terminated(_) | RunningState::Uncertain(_) => false,
         }
     }
+}
+
+/// Errors that can occur when waiting for process output.
+#[derive(Debug, Error)]
+pub enum WaitError {
+    #[error("A general io error occurred")]
+    IoError(#[from] io::Error),
+
+    #[error("Collector failed")]
+    CollectorFailed(#[from] CollectorError), // TODO: refactor?
 }
 
 #[derive(Debug)]
-pub struct ProcessHandle {
+pub struct ProcessHandle<O: OutputStream> {
     pub(crate) name: Cow<'static, str>,
     child: Child,
-    std_out_stream: OutputStream,
-    std_err_stream: OutputStream,
+    std_out_stream: O,
+    std_err_stream: O,
     panic_on_drop: Option<PanicOnDrop>,
 }
 
-impl ProcessHandle {
+impl ProcessHandle<BroadcastOutputStream> {
+    pub fn spawn(
+        name: impl Into<Cow<'static, str>>,
+        cmd: tokio::process::Command,
+    ) -> io::Result<ProcessHandle<BroadcastOutputStream>> {
+        Self::spawn_with_capacity(name, cmd, 128, 128)
+    }
+
+    pub fn spawn_with_capacity(
+        name: impl Into<Cow<'static, str>>,
+        mut cmd: tokio::process::Command,
+        stdout_channel_capacity: usize,
+        stderr_channel_capacity: usize,
+    ) -> io::Result<ProcessHandle<BroadcastOutputStream>> {
+        Self::prepare_command(&mut cmd).spawn().map(|child| {
+            Self::new_from_child_with_piped_io_and_capacity(
+                name,
+                child,
+                stdout_channel_capacity,
+                stderr_channel_capacity,
+            )
+        })
+    }
+
+    fn new_from_child_with_piped_io_and_capacity(
+        name: impl Into<Cow<'static, str>>,
+        mut child: Child,
+        stdout_channel_capacity: usize,
+        stderr_channel_capacity: usize,
+    ) -> ProcessHandle<BroadcastOutputStream> {
+        let stdout = child
+            .stdout
+            .take()
+            .expect("Child process stdout wasn't captured");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("Child process stderr wasn't captured");
+
+        let (child, std_out_stream, std_err_stream) = (
+            child,
+            BroadcastOutputStream::from_stream(stdout, StreamType::StdOut, stdout_channel_capacity),
+            BroadcastOutputStream::from_stream(stderr, StreamType::StdErr, stderr_channel_capacity),
+        );
+
+        let mut this = ProcessHandle {
+            name: name.into(),
+            child,
+            std_out_stream,
+            std_err_stream,
+            panic_on_drop: None,
+        };
+        this.must_be_terminated();
+        this
+    }
+
+    pub async fn wait_with_output(
+        &mut self,
+    ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
+        // TODO: Configurable line collection
+        let out_collector = self.std_out_stream.collect_lines_into_vec();
+        let err_collector = self.std_err_stream.collect_lines_into_vec();
+
+        let status = self.wait().await?;
+        let std_out = out_collector.cancel().await?;
+        let std_err = err_collector.cancel().await?;
+
+        Ok((status, std_out, std_err))
+    }
+}
+
+impl ProcessHandle<SingleSubscriberOutputStream> {
+    pub fn spawn(
+        name: impl Into<Cow<'static, str>>,
+        cmd: tokio::process::Command,
+    ) -> io::Result<Self> {
+        Self::spawn_with_capacity(name, cmd, 128, 128)
+    }
+
+    pub fn spawn_with_capacity(
+        name: impl Into<Cow<'static, str>>,
+        mut cmd: tokio::process::Command,
+        stdout_channel_capacity: usize,
+        stderr_channel_capacity: usize,
+    ) -> io::Result<Self> {
+        Self::prepare_command(&mut cmd).spawn().map(|child| {
+            Self::new_from_child_with_piped_io_and_capacity(
+                name,
+                child,
+                stdout_channel_capacity,
+                stderr_channel_capacity,
+            )
+        })
+    }
+
+    fn new_from_child_with_piped_io_and_capacity(
+        name: impl Into<Cow<'static, str>>,
+        mut child: Child,
+        stdout_channel_capacity: usize,
+        stderr_channel_capacity: usize,
+    ) -> Self {
+        let stdout = child
+            .stdout
+            .take()
+            .expect("Child process stdout wasn't captured");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("Child process stderr wasn't captured");
+
+        let (child, std_out_stream, std_err_stream) = (
+            child,
+            SingleSubscriberOutputStream::from_stream(
+                stdout,
+                StreamType::StdOut,
+                BackpressureControl::DropLatestIncomingIfBufferFull,
+                FromStreamOptions {
+                    channel_capacity: stdout_channel_capacity,
+                    ..Default::default()
+                },
+            ),
+            SingleSubscriberOutputStream::from_stream(
+                stderr,
+                StreamType::StdErr,
+                BackpressureControl::DropLatestIncomingIfBufferFull,
+                FromStreamOptions {
+                    channel_capacity: stderr_channel_capacity,
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let mut this = ProcessHandle {
+            name: name.into(),
+            child,
+            std_out_stream,
+            std_err_stream,
+            panic_on_drop: None,
+        };
+        this.must_be_terminated();
+        this
+    }
+
+    pub async fn wait_with_output(
+        &mut self,
+    ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
+        // TODO: Configurable line collection
+        let out_collector = self.std_out_stream.collect_lines_into_vec();
+        let err_collector = self.std_err_stream.collect_lines_into_vec();
+
+        let status = self.wait().await?;
+        let std_out = out_collector.cancel().await?;
+        let std_err = err_collector.cancel().await?;
+
+        Ok((status, std_out, std_err))
+    }
+}
+
+impl<O: OutputStream> ProcessHandle<O> {
     /// On Windows, you can only send `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` to process groups,
     /// which works more like `killpg`. Sending to the current process ID will likely trigger
     /// undefined behavior of sending the event to every process that's attached to the console,
@@ -104,94 +275,32 @@ impl ProcessHandle {
             .kill_on_drop(true)
     }
 
-    pub fn spawn(
-        name: impl Into<Cow<'static, str>>,
-        cmd: tokio::process::Command,
-    ) -> io::Result<Self> {
-        Self::spawn_with_capacity(name, cmd, 128, 128)
-    }
-
-    pub fn spawn_with_capacity(
-        name: impl Into<Cow<'static, str>>,
-        mut cmd: tokio::process::Command,
-        stdout_channel_capacity: usize,
-        stderr_channel_capacity: usize,
-    ) -> io::Result<Self> {
-        Self::prepare_command(&mut cmd).spawn().map(|child| {
-            Self::new_from_child_with_piped_io_and_capacity(
-                name,
-                child,
-                stdout_channel_capacity,
-                stderr_channel_capacity,
-            )
-        })
-    }
-
-    fn new_from_child_with_piped_io_and_capacity(
-        name: impl Into<Cow<'static, str>>,
-        child: Child,
-        stdout_channel_capacity: usize,
-        stderr_channel_capacity: usize,
-    ) -> Self {
-        let (child, std_out_stream, std_err_stream) =
-            extract_output_streams(child, stdout_channel_capacity, stderr_channel_capacity);
-        let mut this = Self {
-            name: name.into(),
-            child,
-            std_out_stream,
-            std_err_stream,
-            panic_on_drop: None,
-        };
-        this.must_be_terminated();
-        this
-    }
-
     pub fn id(&self) -> Option<u32> {
         self.child.id()
     }
 
     //noinspection RsSelfConvention
-    pub fn is_running(&mut self) -> IsRunning {
+    pub fn is_running(&mut self) -> RunningState {
         match self.child.try_wait() {
-            Ok(None) => IsRunning::Running,
-            Ok(Some(exit_status)) => IsRunning::NotRunning(exit_status),
-            Err(err) => IsRunning::Uncertain(err),
+            Ok(None) => RunningState::Running,
+            Ok(Some(exit_status)) => RunningState::Terminated(exit_status),
+            Err(err) => RunningState::Uncertain(err),
         }
     }
 
-    pub fn stdout(&self) -> &OutputStream {
+    pub fn stdout(&self) -> &O {
         &self.std_out_stream
     }
+    pub fn stdout_mut(&mut self) -> &mut O {
+        &mut self.std_out_stream
+    }
 
-    pub fn stderr(&self) -> &OutputStream {
+    pub fn stderr(&self) -> &O {
         &self.std_err_stream
     }
 
-    /// NOTE: Successfully awaiting the completion of the process will unset the
-    /// "must be terminated" setting, as a successfully awaited process is already terminated.
-    /// Dropping this `ProcessHandle` after calling `wait` should never lead to a
-    /// "must be terminated" panic being raised.
-    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        match self.child.wait().await {
-            Ok(status) => {
-                self.must_not_be_terminated();
-                Ok(status)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    pub async fn wait_with_output(
-        &mut self,
-    ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
-        let out_collector = self.std_out_stream.collect_into_vec();
-        let err_collector = self.std_err_stream.collect_into_vec();
-
-        let status = self.wait().await?;
-        let std_out = out_collector.abort().await?;
-        let std_err = err_collector.abort().await?;
-
-        Ok((status, std_out, std_err))
+    pub fn stderr_mut(&mut self) -> &mut O {
+        &mut self.std_err_stream
     }
 
     /// Sets a panic-on-drop mechanism for this `ProcessHandle`.
@@ -220,29 +329,25 @@ impl ProcessHandle {
     }
 
     pub fn must_not_be_terminated(&mut self) {
-        self.panic_on_drop.take().map(|mut it| it.defuse());
+        if let Some(mut it) = self.panic_on_drop.take() {
+            it.defuse()
+        }
     }
 
+    /// **SAFETY: This only works when your code is running in a multithreaded tokio runtime!**
+    ///
+    /// Prefer manual termination of the process or awaiting it and relying on the (automatically
+    /// configured) `must_be_terminated` logic, raising a panic when a process was neither awaited
+    /// nor terminated before being dropped.
     pub fn terminate_on_drop(
         self,
         graceful_termination_timeout: Duration,
         forceful_termination_timeout: Duration,
-    ) -> TerminateOnDrop {
+    ) -> TerminateOnDrop<O> {
         TerminateOnDrop {
             process_handle: self,
             interrupt_timeout: graceful_termination_timeout,
             terminate_timeout: forceful_termination_timeout,
-        }
-    }
-
-    /// Wait for this process to run to completion within `timeout` if set or unbound otherwise.
-    async fn await_termination(&mut self, timeout: Option<Duration>) -> io::Result<ExitStatus> {
-        match timeout {
-            None => self.wait().await,
-            Some(timeout) => match tokio::time::timeout(timeout, self.wait()).await {
-                Ok(exit_status) => exit_status,
-                Err(err) => Err(err.into()),
-            },
         }
     }
 
@@ -274,7 +379,7 @@ impl ProcessHandle {
         self.send_interrupt_signal()
             .map_err(TerminationError::SignallingFailed)?;
 
-        match self.await_termination(Some(interrupt_timeout)).await {
+        match self.wait_for_completion(Some(interrupt_timeout)).await {
             Ok(exit_status) => Ok(exit_status),
             Err(not_terminated_after_sigint) => {
                 tracing::warn!(
@@ -286,7 +391,7 @@ impl ProcessHandle {
                 self.send_terminate_signal()
                     .map_err(TerminationError::SignallingFailed)?;
 
-                match self.await_termination(Some(terminate_timeout)).await {
+                match self.wait_for_completion(Some(terminate_timeout)).await {
                     Ok(exit_status) => Ok(exit_status),
                     Err(not_terminated_after_sigterm) => {
                         tracing::warn!(
@@ -299,16 +404,19 @@ impl ProcessHandle {
                             Ok(()) => {
                                 // Note: A SIGKILL should typically (somewhat) immediately lead to
                                 // termination of the process. But there are cases in which even
-                                // a SIGKILL does not / can not / will not kill a process.
+                                // a SIGKILL does not / cannot / will not kill a process.
                                 // Something must have gone horribly wrong then...
                                 // But: We do not want to wait indefinitely in case this happens
                                 // and therefore wait (at max) for a fixed three seconds after any
                                 // SIGKILL event.
-                                match self.await_termination(Some(Duration::from_secs(3))).await {
+                                match self.wait_for_completion(Some(Duration::from_secs(3))).await {
                                     Ok(exit_status) => Ok(exit_status),
                                     Err(not_terminated_after_sigkill) => {
-                                        // Unlikely. See note above.
-                                        tracing::error!("Process, having custom name '{}', did not terminate after receiving a SIGINT, SIGTERM and SIGKILL event (or equivalent on the current platform). Something must have gone horribly wrong... Process may still be running. Manual intervention and investigation required!", self.name);
+                                        // Unlikely. See the note above.
+                                        tracing::error!(
+                                            "Process, having custom name '{}', did not terminate after receiving a SIGINT, SIGTERM and SIGKILL event (or equivalent on the current platform). Something must have gone horribly wrong... Process may still be running. Manual intervention and investigation required!",
+                                            self.name
+                                        );
                                         Err(TerminationError::TerminationFailed {
                                             not_terminated_after_sigint,
                                             not_terminated_after_sigterm,
@@ -341,9 +449,49 @@ impl ProcessHandle {
         self.child.kill().await
     }
 
+    /// Successfully awaiting the completion of the process will unset the
+    /// "must be terminated" setting, as a successfully awaited process is already terminated.
+    /// Dropping this `ProcessHandle` after calling `wait` should never lead to a
+    /// "must be terminated" panic being raised.
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        match self.child.wait().await {
+            Ok(status) => {
+                self.must_not_be_terminated();
+                Ok(status)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Wait for this process to run to completion. Within `timeout`, if set, or unbound otherwise.
+    pub async fn wait_for_completion(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> io::Result<ExitStatus> {
+        match timeout {
+            None => self.wait().await,
+            Some(timeout) => match tokio::time::timeout(timeout, self.wait()).await {
+                Ok(exit_status) => exit_status,
+                Err(err) => Err(err.into()),
+            },
+        }
+    }
+
+    pub async fn wait_for_completion_or_terminate(
+        &mut self,
+        wait_timeout: Duration,
+        interrupt_timeout: Duration,
+        terminate_timeout: Duration,
+    ) -> Result<ExitStatus, TerminationError> {
+        match self.wait_for_completion(Some(wait_timeout)).await {
+            Ok(exit_status) => Ok(exit_status),
+            Err(_err) => self.terminate(interrupt_timeout, terminate_timeout).await,
+        }
+    }
+
     /// Consumes this handle to provide the wrapped `tokio::process::Child` instance as well as the
     /// stdout and stderr output streams.
-    pub fn into_inner(self) -> (Child, OutputStream, OutputStream) {
+    pub fn into_inner(self) -> (Child, O, O) {
         (self.child, self.std_out_stream, self.std_err_stream)
     }
 }
@@ -351,15 +499,29 @@ impl ProcessHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assertr::prelude::*;
 
     #[tokio::test]
     async fn test_termination() {
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("5");
-        let mut handle = ProcessHandle::spawn("sleep", cmd).unwrap();
-        handle
+
+        let started_at = jiff::Zoned::now();
+        let mut handle = ProcessHandle::<BroadcastOutputStream>::spawn("sleep", cmd).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let exit_status = handle
             .terminate(Duration::from_secs(1), Duration::from_secs(1))
             .await
             .unwrap();
+        let terminated_at = jiff::Zoned::now();
+
+        // We terminate after roughly 100 ms of waiting.
+        // Let's use a 50 ms grace period on the assertion taken up by performing the termination.
+        // We can increase this if the test should turn out to be flaky.
+        let ran_for = started_at.duration_until(&terminated_at);
+        assert_that(ran_for.as_secs_f32()).is_close_to(0.1, 0.5);
+
+        // When terminated, we do not get an exit code (unix).
+        assert_that(exit_status.code()).is_none();
     }
 }
