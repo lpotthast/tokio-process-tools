@@ -47,8 +47,9 @@ impl<S: Sink> Collector<S> {
     ///
     /// A collector will automatically terminate when either:
     ///
-    /// 1. The underlying stream (write-side) is closed.
-    /// 2. The first `Next::Break` is observed.
+    /// 1. The underlying write-side of the stream is dropped.
+    /// 2. The underlying stream is closed (by receiving an EOF / final read of 0 bytes).
+    /// 3. The first `Next::Break` is observed.
     ///
     /// If none of these may occur in your case, this could/will hang forever!
     pub async fn wait(mut self) -> Result<S, CollectorError> {
