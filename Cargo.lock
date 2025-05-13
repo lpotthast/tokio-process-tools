@@ -34,9 +34,9 @@ checksum = "55cc3b69f167a1ef2e161439aa98aed94e6028e5f9a59be9a6ffb47aef1651f9"
 
 [[package]]
 name = "assertr"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef0989d525f93654f46ce1cf06009129cd0643e350d9a234f7fd087624ab9211"
+checksum = "ee04bda89c7246f204608c0da37401aba6e93c7050ce213da219554a31717d4d"
 dependencies = [
  "indoc",
  "num",
