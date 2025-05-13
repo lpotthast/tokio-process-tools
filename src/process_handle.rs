@@ -1,5 +1,5 @@
 use crate::output_stream::broadcast::BroadcastOutputStream;
-use crate::output_stream::single_subscriber::{FromStreamOptions, SingleOutputStream};
+use crate::output_stream::single_subscriber::{FromStreamOptions, SingleSubscriberOutputStream};
 use crate::output_stream::BackpressureControl;
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
@@ -29,31 +29,31 @@ pub enum TerminationError {
 
 /// Represents the running state of a process.
 #[derive(Debug)]
-pub enum IsRunning {
-    /// Process is still running.
+pub enum RunningState {
+    /// The process is still running.
     Running,
 
-    /// Process has terminated with the given exit status.
-    NotRunning(ExitStatus),
+    /// The process has terminated with the given exit status.
+    Terminated(ExitStatus),
 
     /// Failed to determine process state.
     Uncertain(io::Error),
 }
 
-impl IsRunning {
+impl RunningState {
     pub fn as_bool(&self) -> bool {
         match self {
-            IsRunning::Running => true,
-            IsRunning::NotRunning(_) | IsRunning::Uncertain(_) => false,
+            RunningState::Running => true,
+            RunningState::Terminated(_) | RunningState::Uncertain(_) => false,
         }
     }
 }
 
-impl From<IsRunning> for bool {
-    fn from(is_running: IsRunning) -> Self {
+impl From<RunningState> for bool {
+    fn from(is_running: RunningState) -> Self {
         match is_running {
-            IsRunning::Running => true,
-            IsRunning::NotRunning(_) | IsRunning::Uncertain(_) => false,
+            RunningState::Running => true,
+            RunningState::Terminated(_) | RunningState::Uncertain(_) => false,
         }
     }
 }
@@ -148,7 +148,7 @@ impl ProcessHandle<BroadcastOutputStream> {
     }
 }
 
-impl ProcessHandle<SingleOutputStream> {
+impl ProcessHandle<SingleSubscriberOutputStream> {
     pub fn spawn(
         name: impl Into<Cow<'static, str>>,
         cmd: tokio::process::Command,
@@ -189,23 +189,23 @@ impl ProcessHandle<SingleOutputStream> {
 
         let (child, std_out_stream, std_err_stream) = (
             child,
-            SingleOutputStream::from_stream(
+            SingleSubscriberOutputStream::from_stream(
                 stdout,
                 StreamType::StdOut,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
                 FromStreamOptions {
                     channel_capacity: stdout_channel_capacity,
                     ..Default::default()
-                }
+                },
             ),
-            SingleOutputStream::from_stream(
+            SingleSubscriberOutputStream::from_stream(
                 stderr,
                 StreamType::StdErr,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
                 FromStreamOptions {
                     channel_capacity: stderr_channel_capacity,
                     ..Default::default()
-                }
+                },
             ),
         );
 
@@ -280,11 +280,11 @@ impl<O: OutputStream> ProcessHandle<O> {
     }
 
     //noinspection RsSelfConvention
-    pub fn is_running(&mut self) -> IsRunning {
+    pub fn is_running(&mut self) -> RunningState {
         match self.child.try_wait() {
-            Ok(None) => IsRunning::Running,
-            Ok(Some(exit_status)) => IsRunning::NotRunning(exit_status),
-            Err(err) => IsRunning::Uncertain(err),
+            Ok(None) => RunningState::Running,
+            Ok(Some(exit_status)) => RunningState::Terminated(exit_status),
+            Err(err) => RunningState::Uncertain(err),
         }
     }
 

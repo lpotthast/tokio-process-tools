@@ -1,5 +1,4 @@
 use crate::output_stream::Next;
-use std::error::Error;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
@@ -17,9 +16,10 @@ pub trait Sink: Debug + Send + Sync + 'static {}
 
 impl<T> Sink for T where T: Debug + Send + Sync + 'static {}
 
-pub type CollectError = Box<dyn Error + Send + Sync>;
-
-pub type AsyncCollectFn<'a> = Pin<Box<dyn Future<Output = Result<Next, CollectError>> + Send + 'a>>;
+// NOTE: We use Pin<Box> here to force usage of Higher-Rank Trait Bounds (HRTBs).
+// The returned futures will most-likely capture the `&mut T`and are therefore poised
+// by its lifetime. Without the trait-object usage, this would not work.
+pub type AsyncCollectFn<'a> = Pin<Box<dyn Future<Output = Next> + Send + 'a>>;
 
 /// A collector for stream data, inspecting it chunk by chunk but also providing mutable access
 /// to a sink in which the data can be stored.

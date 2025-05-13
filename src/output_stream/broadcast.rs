@@ -1,8 +1,11 @@
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
+use crate::output_stream::impls::{
+    impl_collect_chunks, impl_collect_chunks_async, impl_collect_lines, impl_collect_lines_async,
+    impl_inspect_chunks, impl_inspect_lines, impl_inspect_lines_async,
+};
 use crate::output_stream::{LineReader, Next};
-use crate::{OutputStream, StreamType};
-use std::error::Error;
+use crate::output_stream::{OutputStream, StreamType};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
@@ -150,110 +153,28 @@ macro_rules! handle_subscription {
 
 // Impls for inspecting the output of the stream.
 impl BroadcastOutputStream {
-    /// NOTE: This is a convenience function.
-    /// Only use it if you trust the output of the child process.
-    /// This will happily collect gigabytes of output in an allocated `String` if the captured
-    /// process never writes a line break!
-    ///
-    /// For more control, use `inspect_chunks` instead.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_chunks(&self, f: impl Fn(Vec<u8>) -> Next + Send + 'static) -> Inspector {
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    pub fn inspect_chunks(&self, mut f: impl FnMut(Vec<u8>) -> Next + Send + 'static) -> Inspector {
         let mut receiver = self.subscribe();
-        Inspector {
-            task: Some(tokio::spawn(async move {
-                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            if let Next::Break = f(chunk) {
-                                break;
-                            }
-                        }
-                        None => {
-                            // EOF reached.
-                            break;
-                        }
-                    }
-                });
-            })),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_inspect_chunks!(receiver, f, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines(&self, mut f: impl FnMut(String) -> Next + Send + 'static) -> Inspector {
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.subscribe();
-        Inspector {
-            task: Some(tokio::spawn(async move {
-                let mut line_buffer = String::new();
-                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let lr = LineReader {
-                                remaining_chunk: &chunk,
-                                line_buffer: &mut line_buffer,
-                            };
-                            for line in lr {
-                                let next = f(line);
-                                if next == Next::Break {
-                                    break;
-                                }
-                            }
-                        }
-                        None => {
-                            if !line_buffer.is_empty() {
-                                f(line_buffer);
-                            }
-                            break;
-                        }
-                    }
-                });
-            })),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_inspect_lines!(receiver, f, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_lines_async<F, Fut>(&self, f: F) -> Inspector
+    pub fn inspect_lines_async<Fut>(
+        &self,
+        mut f: impl FnMut(String) -> Fut + Send + 'static,
+    ) -> Inspector
     where
-        F: Fn(String) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<Next, Box<dyn Error + Send + Sync>>> + Send + Sync,
+        Fut: Future<Output = Next> + Send + Sync,
     {
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.subscribe();
-        Inspector {
-            task: Some(tokio::spawn(async move {
-                let mut line_buffer = String::new();
-                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let lr = LineReader {
-                                remaining_chunk: &chunk,
-                                line_buffer: &mut line_buffer,
-                            };
-                            for line in lr {
-                                match f(line).await {
-                                    Ok(Next::Continue) => {}
-                                    Ok(Next::Break) => break,
-                                    Err(err) => {
-                                        // TODO: Should this break the inspector?
-                                        tracing::warn!(?err, "Inspection failed")
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            if !line_buffer.is_empty() {
-                                f(line_buffer);
-                            }
-                            break;
-                        }
-                    }
-                });
-            })),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_inspect_lines_async!(receiver, f, handle_subscription)
     }
 }
 
@@ -263,74 +184,24 @@ impl BroadcastOutputStream {
     pub fn collect_chunks<S: Sink>(
         &self,
         into: S,
-        collect: impl Fn(Vec<u8>, &mut S) + Send + 'static,
+        mut collect: impl FnMut(Vec<u8>, &mut S) + Send + 'static,
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
-        let (t_send, mut t_recv) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.subscribe();
-        Collector {
-            task: Some(tokio::spawn(async move {
-                handle_subscription!(receiver, t_recv, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let mut write_guard = sink.write().await;
-                            collect(chunk, &mut (*write_guard));
-                        }
-                        None => {
-                            // EOF reached.
-                            break;
-                        }
-                    }
-                });
-                Arc::try_unwrap(sink).expect("single owner").into_inner()
-            })),
-            task_termination_sender: Some(t_send),
-        }
+        impl_collect_chunks!(receiver, collect, sink, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines<S: Sink>(
         &self,
         into: S,
-        collect: impl Fn(String, &mut S) -> Next + Send + 'static,
+        mut collect: impl FnMut(String, &mut S) -> Next + Send + 'static,
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
-        let (t_send, mut t_recv) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.subscribe();
-        Collector {
-            task: Some(tokio::spawn(async move {
-                let mut line_buffer = String::new();
-                handle_subscription!(receiver, t_recv, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let mut write_guard = sink.write().await;
-                            let sink = &mut *write_guard;
-                            let lr = LineReader {
-                                remaining_chunk: &chunk,
-                                line_buffer: &mut line_buffer,
-                            };
-                            for line in lr {
-                                match collect(line, sink) {
-                                    Next::Continue => {}
-                                    Next::Break => break,
-                                }
-                            }
-                        }
-                        None => {
-                            // EOF reached.
-                            break;
-                        }
-                    }
-                });
-                Arc::try_unwrap(sink).expect("single owner").into_inner()
-            })),
-            task_termination_sender: Some(t_send),
-        }
+        impl_collect_lines!(receiver, collect, sink, handle_subscription)
     }
 
-    // NOTE: We only use Pin<Box> here to force usage of Higher-Rank Trait Bounds (HRTBs).
-    // The returned futures will most-likely capture the `&mut T`and are therefore poised
-    // by its lifetime. Without the trait-object usage, this would not work.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_async<S, F>(&self, into: S, collect: F) -> Collector<S>
     where
@@ -338,41 +209,10 @@ impl BroadcastOutputStream {
         F: Fn(Vec<u8>, &mut S) -> AsyncCollectFn<'_> + Send + 'static,
     {
         let sink = Arc::new(RwLock::new(into));
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.subscribe();
-        Collector {
-            task: Some(tokio::spawn(async move {
-                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            // TODO: refactor error handling?
-                            let result = {
-                                let mut write_guard = sink.write().await;
-                                let fut = collect(chunk, &mut *write_guard);
-                                fut.await
-                            };
-                            match result {
-                                Ok(_next) => { /* do nothing */ }
-                                Err(err) => {
-                                    tracing::warn!(?err, "Collecting failed")
-                                }
-                            }
-                        }
-                        None => {
-                            // EOF reached.
-                            break;
-                        }
-                    }
-                });
-                Arc::try_unwrap(sink).expect("single owner").into_inner()
-            })),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_collect_chunks_async!(receiver, collect, sink, handle_subscription)
     }
 
-    // NOTE: We only use Pin<Box> here to force usage of Higher-Rank Trait Bounds (HRTBs).
-    // The returned futures will most-likely capture the `&mut T`and are therefore poised
-    // by its lifetime. Without the trait-object usage, this would not work.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_async<S, F>(&self, into: S, collect: F) -> Collector<S>
     where
@@ -380,53 +220,8 @@ impl BroadcastOutputStream {
         F: Fn(String, &mut S) -> AsyncCollectFn<'_> + Send + Sync + 'static,
     {
         let sink = Arc::new(RwLock::new(into));
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.subscribe();
-        Collector {
-            task: Some(tokio::spawn(async move {
-                let mut line_buffer = String::new();
-                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let mut write_guard = sink.write().await;
-                            let sink = &mut *write_guard;
-                            let lr = LineReader {
-                                remaining_chunk: &chunk,
-                                line_buffer: &mut line_buffer,
-                            };
-                            for line in lr {
-                                match collect(line, sink).await {
-                                    Ok(Next::Continue) => {}
-                                    Ok(Next::Break) => break,
-                                    Err(err) => {
-                                        // TODO: Should this break the inspector?
-                                        tracing::warn!(?err, "Collection failed")
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            // EOF reached.
-                            if !line_buffer.is_empty() {
-                                let mut write_guard = sink.write().await;
-                                let sink = &mut *write_guard;
-                                match collect(line_buffer, sink).await {
-                                    Ok(Next::Continue) | Ok(Next::Break) => {
-                                        /* irrelevant, we always break on EOF */
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(?err, "Collection failed");
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                });
-                Arc::try_unwrap(sink).expect("single owner").into_inner()
-            })),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_collect_lines_async!(receiver, collect, sink, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
@@ -449,9 +244,10 @@ impl BroadcastOutputStream {
     ) -> Collector<W> {
         self.collect_chunks_async(write, move |chunk, write| {
             Box::pin(async move {
-                write.write_all(&chunk).await?;
-                //write.write_all("\n".as_bytes()).await?;
-                Ok(Next::Continue)
+                if let Err(err) = write.write_all(&chunk).await {
+                    tracing::warn!("Could not write chunk to write sink: {err:#?}");
+                };
+                Next::Continue
             })
         })
     }
@@ -469,8 +265,10 @@ impl BroadcastOutputStream {
             Box::pin(async move {
                 let mapped = mapper(chunk);
                 let mapped = mapped.as_ref();
-                write.write_all(mapped).await?;
-                Ok(Next::Continue)
+                if let Err(err) = write.write_all(mapped).await {
+                    tracing::warn!("Could not write chunk to write sink: {err:#?}");
+                };
+                Next::Continue
             })
         })
     }
@@ -559,7 +357,7 @@ mod tests {
         let consumer = os.inspect_lines_async(async |_line| {
             // Mimic a slow consumer.
             sleep(Duration::from_millis(100)).await;
-            Ok(Next::Continue)
+            Next::Continue
         });
 
         #[rustfmt::skip]

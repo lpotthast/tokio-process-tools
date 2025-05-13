@@ -8,14 +8,14 @@ mod terminate_on_drop;
 
 pub use collector::{Collector, CollectorError, Sink};
 pub use inspector::{Inspector, InspectorError};
-pub use output_stream::{OutputStream, StreamType};
-pub use process_handle::{IsRunning, ProcessHandle, TerminationError};
+pub use output_stream::{broadcast, single_subscriber, OutputStream, StreamType};
+pub use process_handle::{ProcessHandle, RunningState, TerminationError};
 pub use terminate_on_drop::TerminateOnDrop;
 
 #[cfg(test)]
 mod test {
     use crate::output_stream::broadcast::BroadcastOutputStream;
-    use crate::{IsRunning, ProcessHandle};
+    use crate::{ProcessHandle, RunningState};
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::process::Command;
@@ -47,11 +47,11 @@ mod test {
             .expect("Failed to spawn `sleep` command");
 
         match process.is_running() {
-            IsRunning::Running => {}
-            IsRunning::NotRunning(exit_status) => {
+            RunningState::Running => {}
+            RunningState::Terminated(exit_status) => {
                 assert_that(exit_status).fail("Process should be running");
             }
-            IsRunning::Uncertain(_) => {
+            RunningState::Uncertain(_) => {
                 assert_that_ref(&process).fail("Process state should not be uncertain");
             }
         };
@@ -59,14 +59,14 @@ mod test {
         let _exit_status = process.wait().await.unwrap();
 
         match process.is_running() {
-            IsRunning::Running => {
+            RunningState::Running => {
                 assert_that(process).fail("Process should not be running anymore");
             }
-            IsRunning::NotRunning(exit_status) => {
+            RunningState::Terminated(exit_status) => {
                 assert_that(exit_status.code()).is_some().is_equal_to(0);
                 assert_that(exit_status.success()).is_true();
             }
-            IsRunning::Uncertain(_) => {
+            RunningState::Uncertain(_) => {
                 assert_that(process).fail("Process state should not be uncertain");
             }
         };
@@ -83,15 +83,15 @@ mod test {
             .await
             .unwrap();
         match process.is_running() {
-            IsRunning::Running => {
+            RunningState::Running => {
                 assert_that(process).fail("Process should not be running anymore");
             }
-            IsRunning::NotRunning(exit_status) => {
+            RunningState::Terminated(exit_status) => {
                 // Terminating a process with a signal results in no code being emitted (on linux).
                 assert_that(exit_status.code()).is_none();
                 assert_that(exit_status.success()).is_false();
             }
-            IsRunning::Uncertain(_) => {
+            RunningState::Uncertain(_) => {
                 assert_that(process).fail("Process state should not be uncertain");
             }
         };

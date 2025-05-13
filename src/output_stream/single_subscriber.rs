@@ -1,8 +1,10 @@
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
-use crate::output_stream::{BackpressureControl, LineReader, Next};
-use crate::{OutputStream, StreamType};
-use std::error::Error;
+use crate::output_stream::impls::{
+    impl_collect_chunks, impl_collect_chunks_async, impl_collect_lines, impl_collect_lines_async,
+    impl_inspect_chunks, impl_inspect_lines, impl_inspect_lines_async,
+};
+use crate::output_stream::{BackpressureControl, LineReader, Next, OutputStream, StreamType};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
@@ -19,7 +21,7 @@ use tokio::time::error::Elapsed;
 /// This has the upside of requiring as few memory allocations as possible.
 /// If multiple concurrent inspections are required, prefer using the
 /// `output_stream::broadcast::BroadcastOutputSteam`.
-pub struct SingleOutputStream {
+pub struct SingleSubscriberOutputStream {
     ty: StreamType,
 
     /// The task that captured the `tokio::sync::mpsc::Sender` part and is asynchronously awaiting
@@ -31,15 +33,15 @@ pub struct SingleOutputStream {
     receiver: Option<tokio::sync::mpsc::Receiver<Option<bytes::Bytes>>>,
 }
 
-impl OutputStream for SingleOutputStream {}
+impl OutputStream for SingleSubscriberOutputStream {}
 
-impl Drop for SingleOutputStream {
+impl Drop for SingleSubscriberOutputStream {
     fn drop(&mut self) {
         self.stream_reader.abort();
     }
 }
 
-impl Debug for SingleOutputStream {
+impl Debug for SingleSubscriberOutputStream {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SingleOutputStream")
             .field("ty", &self.ty)
@@ -152,13 +154,13 @@ impl Default for FromStreamOptions {
     }
 }
 
-impl SingleOutputStream {
+impl SingleSubscriberOutputStream {
     pub fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
         stream: S,
         ty: StreamType,
         backpressure_control: BackpressureControl,
         options: FromStreamOptions,
-    ) -> SingleOutputStream {
+    ) -> SingleSubscriberOutputStream {
         let (tx_stdout, rx_stdout) =
             tokio::sync::mpsc::channel::<Option<bytes::Bytes>>(options.channel_capacity);
 
@@ -170,7 +172,7 @@ impl SingleOutputStream {
             backpressure_control,
         );
 
-        SingleOutputStream {
+        SingleSubscriberOutputStream {
             ty,
             stream_reader: output_collector,
             receiver: Some(rx_stdout),
@@ -212,39 +214,14 @@ macro_rules! handle_subscription {
 }
 
 // Impls for inspecting the output of the stream.
-impl SingleOutputStream {
-    /// NOTE: This is a convenience function.
-    /// Only use it if you trust the output of the child process.
-    /// This will happily collect gigabytes of output in an allocated `String` if the captured
-    /// process never writes a line break!
-    ///
-    /// For more control, use `inspect_chunks` instead.
+impl SingleSubscriberOutputStream {
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_chunks(
         &mut self,
         f: impl Fn(bytes::Bytes) -> Next + Send + 'static,
     ) -> Inspector {
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.take_receiver();
-        let task = tokio::spawn(async move {
-            handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                match maybe_chunk {
-                    Some(chunk) => {
-                        if let Next::Break = f(chunk) {
-                            break;
-                        }
-                    }
-                    None => {
-                        // EOF reached.
-                        break;
-                    }
-                }
-            });
-        });
-        Inspector {
-            task: Some(task),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_inspect_chunks!(receiver, f, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
@@ -252,83 +229,25 @@ impl SingleOutputStream {
         &mut self,
         mut f: impl FnMut(String) -> Next + Send + 'static,
     ) -> Inspector {
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.take_receiver();
-        Inspector {
-            task: Some(tokio::spawn(async move {
-                let mut line_buffer = String::new();
-                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let lr = LineReader {
-                                remaining_chunk: &chunk,
-                                line_buffer: &mut line_buffer,
-                            };
-                            for line in lr {
-                                let next = f(line);
-                                if next == Next::Break {
-                                    break;
-                                }
-                            }
-                        }
-                        None => {
-                            if !line_buffer.is_empty() {
-                                f(line_buffer);
-                            }
-                            break;
-                        }
-                    }
-                });
-            })),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_inspect_lines!(receiver, f, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_lines_async<F, Fut>(&mut self, f: F) -> Inspector
+    pub fn inspect_lines_async<Fut>(
+        &mut self,
+        mut f: impl FnMut(String) -> Fut + Send + 'static,
+    ) -> Inspector
     where
-        F: Fn(String) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<Next, Box<dyn Error + Send + Sync>>> + Send + Sync,
+        Fut: Future<Output = Next> + Send + Sync,
     {
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.take_receiver();
-        Inspector {
-            task: Some(tokio::spawn(async move {
-                let mut line_buffer = String::new();
-                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let lr = LineReader {
-                                remaining_chunk: &chunk,
-                                line_buffer: &mut line_buffer,
-                            };
-                            for line in lr {
-                                match f(line).await {
-                                    Ok(Next::Continue) => {}
-                                    Ok(Next::Break) => break,
-                                    Err(err) => {
-                                        // TODO: Should this break the inspector?
-                                        tracing::warn!(?err, "Inspection failed")
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            if !line_buffer.is_empty() {
-                                f(line_buffer);
-                            }
-                            break;
-                        }
-                    }
-                });
-            })),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_inspect_lines_async!(receiver, f, handle_subscription)
     }
 }
 
 // Impls for collecting the output of the stream.
-impl SingleOutputStream {
+impl SingleSubscriberOutputStream {
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks<S: Sink>(
         &mut self,
@@ -336,26 +255,8 @@ impl SingleOutputStream {
         collect: impl Fn(bytes::Bytes, &mut S) + Send + 'static,
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
-        let (t_send, mut t_recv) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.take_receiver();
-        Collector {
-            task: Some(tokio::spawn(async move {
-                handle_subscription!(receiver, t_recv, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let mut write_guard = sink.write().await;
-                            collect(chunk, &mut (*write_guard));
-                        }
-                        None => {
-                            // EOF reached.
-                            break;
-                        }
-                    }
-                });
-                Arc::try_unwrap(sink).expect("single owner").into_inner()
-            })),
-            task_termination_sender: Some(t_send),
-        }
+        impl_collect_chunks!(receiver, collect, sink, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
@@ -365,42 +266,10 @@ impl SingleOutputStream {
         collect: impl Fn(String, &mut S) -> Next + Send + 'static,
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
-        let (t_send, mut t_recv) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.take_receiver();
-        Collector {
-            task: Some(tokio::spawn(async move {
-                let mut line_buffer = String::new();
-                handle_subscription!(receiver, t_recv, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let mut write_guard = sink.write().await;
-                            let sink = &mut *write_guard;
-                            let lr = LineReader {
-                                remaining_chunk: &chunk,
-                                line_buffer: &mut line_buffer,
-                            };
-                            for line in lr {
-                                match collect(line, sink) {
-                                    Next::Continue => {}
-                                    Next::Break => break,
-                                }
-                            }
-                        }
-                        None => {
-                            // EOF reached.
-                            break;
-                        }
-                    }
-                });
-                Arc::try_unwrap(sink).expect("single owner").into_inner()
-            })),
-            task_termination_sender: Some(t_send),
-        }
+        impl_collect_lines!(receiver, collect, sink, handle_subscription)
     }
 
-    // NOTE: We only use Pin<Box> here to force usage of Higher-Rank Trait Bounds (HRTBs).
-    // The returned futures will most-likely capture the `&mut T`and are therefore poised
-    // by its lifetime. Without the trait-object usage, this would not work.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_async<S, F>(&mut self, into: S, collect: F) -> Collector<S>
     where
@@ -408,41 +277,10 @@ impl SingleOutputStream {
         F: Fn(bytes::Bytes, &mut S) -> AsyncCollectFn<'_> + Send + 'static,
     {
         let sink = Arc::new(RwLock::new(into));
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.take_receiver();
-        Collector {
-            task: Some(tokio::spawn(async move {
-                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            // TODO: refactor error handling?
-                            let result = {
-                                let mut write_guard = sink.write().await;
-                                let fut = collect(chunk, &mut *write_guard);
-                                fut.await
-                            };
-                            match result {
-                                Ok(_next) => { /* do nothing */ }
-                                Err(err) => {
-                                    tracing::warn!(?err, "Collecting failed")
-                                }
-                            }
-                        }
-                        None => {
-                            // EOF reached.
-                            break;
-                        }
-                    }
-                });
-                Arc::try_unwrap(sink).expect("single owner").into_inner()
-            })),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_collect_chunks_async!(receiver, collect, sink, handle_subscription)
     }
 
-    // NOTE: We only use Pin<Box> here to force usage of Higher-Rank Trait Bounds (HRTBs).
-    // The returned futures will most-likely capture the `&mut T`and are therefore poised
-    // by its lifetime. Without the trait-object usage, this would not work.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_async<S, F>(&mut self, into: S, collect: F) -> Collector<S>
     where
@@ -450,53 +288,8 @@ impl SingleOutputStream {
         F: Fn(String, &mut S) -> AsyncCollectFn<'_> + Send + Sync + 'static,
     {
         let sink = Arc::new(RwLock::new(into));
-        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         let mut receiver = self.take_receiver();
-        Collector {
-            task: Some(tokio::spawn(async move {
-                let mut line_buffer = String::new();
-                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            let mut write_guard = sink.write().await;
-                            let sink = &mut *write_guard;
-                            let lr = LineReader {
-                                remaining_chunk: &chunk,
-                                line_buffer: &mut line_buffer,
-                            };
-                            for line in lr {
-                                match collect(line, sink).await {
-                                    Ok(Next::Continue) => {}
-                                    Ok(Next::Break) => break,
-                                    Err(err) => {
-                                        // TODO: Should this break the inspector?
-                                        tracing::warn!(?err, "Collection failed")
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            // EOF reached.
-                            if !line_buffer.is_empty() {
-                                let mut write_guard = sink.write().await;
-                                let sink = &mut *write_guard;
-                                match collect(line_buffer, sink).await {
-                                    Ok(Next::Continue) | Ok(Next::Break) => {
-                                        /* irrelevant, we always break on EOF */
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(?err, "Collection failed");
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                });
-                Arc::try_unwrap(sink).expect("single owner").into_inner()
-            })),
-            task_termination_sender: Some(term_sig_tx),
-        }
+        impl_collect_lines_async!(receiver, collect, sink, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
@@ -519,9 +312,10 @@ impl SingleOutputStream {
     ) -> Collector<W> {
         self.collect_chunks_async(write, move |chunk, write| {
             Box::pin(async move {
-                write.write_all(&chunk).await?;
-                //write.write_all("\n".as_bytes()).await?;
-                Ok(Next::Continue)
+                if let Err(err) = write.write_all(&chunk).await {
+                    tracing::warn!("Could not write chunk to write sink: {err:#?}");
+                };
+                Next::Continue
             })
         })
     }
@@ -539,15 +333,17 @@ impl SingleOutputStream {
             Box::pin(async move {
                 let mapped = mapper(chunk);
                 let mapped = mapped.as_ref();
-                write.write_all(mapped).await?;
-                Ok(Next::Continue)
+                if let Err(err) = write.write_all(mapped).await {
+                    tracing::warn!("Could not write chunk to write sink: {err:#?}");
+                };
+                Next::Continue
             })
         })
     }
 }
 
 // Impls for waiting for a specific line of output.
-impl SingleOutputStream {
+impl SingleSubscriberOutputStream {
     /// This function is cancel safe.
     pub async fn wait_for_line(
         &mut self,
@@ -577,7 +373,9 @@ impl SingleOutputStream {
 #[cfg(test)]
 mod tests {
     use crate::output_stream::broadcast::BroadcastOutputStream;
-    use crate::output_stream::single_subscriber::{FromStreamOptions, SingleOutputStream};
+    use crate::output_stream::single_subscriber::{
+        FromStreamOptions, SingleSubscriberOutputStream,
+    };
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, Next};
     use crate::StreamType;
@@ -593,7 +391,7 @@ mod tests {
     #[traced_test]
     async fn handles_backpressure_by_dropping_newer_chunks_after_channel_buffer_filled_up() {
         let (read_half, mut write_half) = tokio::io::duplex(64);
-        let mut os = SingleOutputStream::from_stream(
+        let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
             StreamType::StdOut,
             BackpressureControl::DropLatestIncomingIfBufferFull,
@@ -606,7 +404,7 @@ mod tests {
         let inspector = os.inspect_lines_async(async |_line| {
             // Mimic a slow consumer.
             sleep(Duration::from_millis(100)).await;
-            Ok(Next::Continue)
+            Next::Continue
         });
 
         #[rustfmt::skip]
@@ -648,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn collect_lines_to_file() {
         let (read_half, write_half) = tokio::io::duplex(64);
-        let mut os = SingleOutputStream::from_stream(
+        let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
             StreamType::StdOut,
             BackpressureControl::DropLatestIncomingIfBufferFull,
@@ -683,7 +481,7 @@ mod tests {
         let collector = os.collect_lines_async(temp_file, |line, temp_file| {
             Box::pin(async move {
                 writeln!(temp_file, "{}", line).unwrap();
-                Ok(Next::Continue)
+                Next::Continue
             })
         });
 

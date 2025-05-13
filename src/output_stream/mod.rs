@@ -1,12 +1,13 @@
 use std::borrow::Cow;
 
 pub mod broadcast;
+pub(crate) mod impls;
 pub mod single_subscriber;
 
 /// We support the following implementations:
 ///
-/// - [BroadcastOutputStream]
-/// - [crate::output_stream::broadcast::SingleOutputStream]
+/// - [broadcast::BroadcastOutputStream]
+/// - [single_subscriber::SingleSubscriberOutputStream]
 pub trait OutputStream {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,21 +41,20 @@ pub enum Next {
     Break,
 }
 
-/// Processes a byte chunk, handling line breaks and applying a callback function to complete lines.
+/// Conceptually, this iterator appends the given byte slice to the current line buffer, which may
+/// already hold some previously written data.
+/// The resulting view of data is split by newlines (`\n`). Every completed line is yielded.
+/// The remainder of the chunk, not completed with a newline character, will become the new content
+/// of `line_buffer`.
 ///
-/// This function takes a byte slice and appends it to the current line buffer. When it encounters
-/// newline characters, it calls the callback function with the completed line and continues
-/// processing the remainder of the chunk.
+/// The implementation tries to allocate as little as possible.
 ///
-/// # Parameters
-/// * `chunk` - Byte slice to process
-/// * `line_buffer` - Current accumulated line content
-/// * `process_line` - Callback function to apply to completed lines
-///
-/// # Returns
-/// The updated line buffer with any remaining content after the last newline
+/// # Members
+/// * `chunk` - New slice of bytes to process.
+/// * `line_buffer` - Buffer for reading one line.
+///                   May hold previously seen, not-yet-closed, line-data.
 pub(crate) struct LineReader<'c, 'b> {
-    remaining_chunk: &'c [u8],
+    chunk: &'c [u8],
     line_buffer: &'b mut String,
 }
 
@@ -62,21 +62,21 @@ impl Iterator for LineReader<'_, '_> {
     type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining_chunk.is_empty() {
+        if self.chunk.is_empty() {
             return None;
         }
 
-        match self.remaining_chunk.iter().position(|b| *b == b'\n') {
+        match self.chunk.iter().position(|b| *b == b'\n') {
             None => {
                 // No more line breaks - consume the remaining chunk.
                 self.line_buffer
-                    .push_str(String::from_utf8_lossy(self.remaining_chunk).as_ref());
-                self.remaining_chunk = &[];
+                    .push_str(String::from_utf8_lossy(self.chunk).as_ref());
+                self.chunk = &[];
                 None
             }
             Some(pos) => {
                 // Found a line break at `pos` - process the line and continue.
-                let (until_line_break, rest) = self.remaining_chunk.split_at(pos);
+                let (until_line_break, rest) = self.chunk.split_at(pos);
                 self.line_buffer
                     .push_str(String::from_utf8_lossy(until_line_break).as_ref());
 
@@ -87,7 +87,7 @@ impl Iterator for LineReader<'_, '_> {
                 // Ensure we don't go out of bounds when skipping the newline character.
                 self.line_buffer.clear();
                 self.line_buffer.shrink_to(2048);
-                self.remaining_chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
+                self.chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
 
                 Some(to_return)
             }
@@ -130,7 +130,7 @@ mod tests {
             let mut collected_lines: Vec<String> = Vec::new();
 
             let lr = LineReader {
-                remaining_chunk: chunk,
+                chunk: chunk,
                 line_buffer: &mut line_buffer,
             };
             for line in lr {
@@ -205,7 +205,7 @@ mod tests {
             let mut collected_lines = Vec::new();
 
             let lr = LineReader {
-                remaining_chunk: chunk,
+                chunk: chunk,
                 line_buffer: &mut line_buffer,
             };
             for line in lr {
