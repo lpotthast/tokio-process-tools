@@ -1,6 +1,6 @@
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
-use crate::output_stream::{process_lines_in_chunk, process_lines_in_chunk_async, Next};
+use crate::output_stream::{LineReader, Next};
 use crate::{OutputStream, StreamType};
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
@@ -120,38 +120,32 @@ impl BroadcastOutputStream {
     }
 }
 
-/// Handles subscription output with a custom handler
-async fn handle_subscription<F>(
-    mut chunk_receiver: tokio::sync::broadcast::Receiver<Option<Vec<u8>>>,
-    mut term_sig_rx: tokio::sync::oneshot::Receiver<()>,
-    mut handler: F,
-) where
-    F: FnMut(Option<Vec<u8>>) -> Next,
-{
-    loop {
-        tokio::select! {
-            out = chunk_receiver.recv() => {
-                match out {
-                    Ok(maybe_chunk) => {
-                        match handler(maybe_chunk) {
-                            Next::Continue => continue,
-                            Next::Break => break,
+// Expected types:
+// receiver: tokio::sync::broadcast::Receiver<Option<Vec<u8>>>,
+// term_rx: tokio::sync::oneshot::Receiver<()>,
+macro_rules! handle_subscription {
+    ($receiver:expr, $term_rx:expr, |$chunk:ident| $body:block) => {
+        loop {
+            tokio::select! {
+                out = $receiver.recv() => {
+                    match out {
+                        Ok(maybe_chunk) => {
+                            let $chunk = maybe_chunk;
+                            $body
+                        }
+                        Err(RecvError::Closed) => {
+                            // All senders have been dropped.
+                            break;
+                        },
+                        Err(RecvError::Lagged(lagged)) => {
+                            tracing::warn!(lagged, "Inspector is lagging behind");
                         }
                     }
-                    Err(RecvError::Closed) => {
-                        // All senders have been dropped.
-                        break;
-                    }
-                    Err(RecvError::Lagged(lagged)) => {
-                        tracing::warn!(lagged, "Inspector is lagging behind");
-                    }
                 }
-            }
-            _msg = &mut term_sig_rx => {
-                break;
+                _msg = &mut $term_rx => break,
             }
         }
-    }
+    };
 }
 
 // Impls for inspecting the output of the stream.
@@ -164,98 +158,100 @@ impl BroadcastOutputStream {
     /// For more control, use `inspect_chunks` instead.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_chunks(&self, f: impl Fn(Vec<u8>) -> Next + Send + 'static) -> Inspector {
-        let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-        let receiver = self.subscribe();
-        let task = tokio::spawn(async move {
-            handle_subscription(receiver, term_sig_rx, move |maybe_chunk| {
-                match maybe_chunk {
-                    Some(chunk) => f(chunk),
-                    None => {
-                        // EOF reached.
-                        Next::Break
-                    }
-                }
-            })
-            .await;
-        });
+        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut receiver = self.subscribe();
         Inspector {
-            task: Some(task),
+            task: Some(tokio::spawn(async move {
+                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            if let Next::Break = f(chunk) {
+                                break;
+                            }
+                        }
+                        None => {
+                            // EOF reached.
+                            break;
+                        }
+                    }
+                });
+            })),
             task_termination_sender: Some(term_sig_tx),
         }
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines(&self, mut f: impl FnMut(String) -> Next + Send + 'static) -> Inspector {
-        let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-        let receiver = self.subscribe();
-        let task = tokio::spawn(async move {
-            let mut line_buffer = String::new();
-            handle_subscription(
-                receiver,
-                term_sig_rx,
-                move |maybe_chunk| match maybe_chunk {
-                    Some(chunk) => process_lines_in_chunk(&chunk, &mut line_buffer, &mut f),
-                    None => {
-                        if !line_buffer.is_empty() {
-                            f(line_buffer.clone());
-                        }
-                        Next::Break
-                    }
-                },
-            )
-            .await;
-        });
+        let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut receiver = self.subscribe();
         Inspector {
-            task: Some(task),
+            task: Some(tokio::spawn(async move {
+                let mut line_buffer = String::new();
+                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            let lr = LineReader {
+                                remaining_chunk: &chunk,
+                                line_buffer: &mut line_buffer,
+                            };
+                            for line in lr {
+                                let next = f(line);
+                                if next == Next::Break {
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            if !line_buffer.is_empty() {
+                                f(line_buffer);
+                            }
+                            break;
+                        }
+                    }
+                });
+            })),
             task_termination_sender: Some(term_sig_tx),
         }
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_lines_async<F, Fut>(&self, mut f: F) -> Inspector
+    pub fn inspect_lines_async<F, Fut>(&self, f: F) -> Inspector
     where
         F: Fn(String) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Next, Box<dyn Error + Send + Sync>>> + Send + Sync,
     {
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let mut out_receiver = self.subscribe();
-        let capture = tokio::spawn(async move {
-            let mut line_buffer = String::new();
-            loop {
-                tokio::select! {
-                    out = out_receiver.recv() => {
-                        match out {
-                            Ok(Some(chunk)) => {
-                                let next = process_lines_in_chunk_async(&chunk, &mut line_buffer, &mut f).await;
-                                if next == Next::Break {
-                                    break;
+        let mut receiver = self.subscribe();
+        Inspector {
+            task: Some(tokio::spawn(async move {
+                let mut line_buffer = String::new();
+                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            let lr = LineReader {
+                                remaining_chunk: &chunk,
+                                line_buffer: &mut line_buffer,
+                            };
+                            for line in lr {
+                                match f(line).await {
+                                    Ok(Next::Continue) => {}
+                                    Ok(Next::Break) => break,
+                                    Err(err) => {
+                                        // TODO: Should this break the inspector?
+                                        tracing::warn!(?err, "Inspection failed")
+                                    }
                                 }
-                            }
-                            Ok(None) => {
-                                if !line_buffer.is_empty() {
-                                    f(line_buffer);
-                                }
-                                break;
-                            }
-                            Err(RecvError::Closed) => {
-                                // All senders have been dropped.
-                                break;
-                            }
-                            Err(RecvError::Lagged(lagged)) => {
-                                tracing::warn!(lagged, "Inspector is lagging behind");
                             }
                         }
+                        None => {
+                            if !line_buffer.is_empty() {
+                                f(line_buffer);
+                            }
+                            break;
+                        }
                     }
-                    _msg = &mut term_sig_rx => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        Inspector {
-            task: Some(capture),
+                });
+            })),
             task_termination_sender: Some(term_sig_tx),
         }
     }
@@ -269,44 +265,25 @@ impl BroadcastOutputStream {
         into: S,
         collect: impl Fn(Vec<u8>, &mut S) + Send + 'static,
     ) -> Collector<S> {
-        let target = Arc::new(RwLock::new(into));
-
+        let sink = Arc::new(RwLock::new(into));
         let (t_send, mut t_recv) = tokio::sync::oneshot::channel::<()>();
-
-        let mut out_receiver = self.subscribe();
-        let capture = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    out = out_receiver.recv() => {
-                        match out {
-                            Ok(Some(chunk)) => {
-                                let mut write_guard = target.write().await;
-                                collect(chunk, &mut (*write_guard));
-                            }
-                            Ok(None) => {
-                                // EOF reached.
-                                break;
-                            }
-                            Err(RecvError::Closed) => {
-                                // All senders have been dropped.
-                                break;
-                            }
-                            Err(RecvError::Lagged(lagged)) => {
-                                tracing::warn!(lagged, "Inspector is lagging behind");
-                            }
+        let mut receiver = self.subscribe();
+        Collector {
+            task: Some(tokio::spawn(async move {
+                handle_subscription!(receiver, t_recv, |maybe_chunk| {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            let mut write_guard = sink.write().await;
+                            collect(chunk, &mut (*write_guard));
+                        }
+                        None => {
+                            // EOF reached.
+                            break;
                         }
                     }
-                    _msg = &mut t_recv => {
-                        tracing::info!("Terminating collector!");
-                        break;
-                    }
-                }
-            }
-            Arc::try_unwrap(target).expect("single owner").into_inner()
-        });
-
-        Collector {
-            task: Some(capture),
+                });
+                Arc::try_unwrap(sink).expect("single owner").into_inner()
+            })),
             task_termination_sender: Some(t_send),
         }
     }
@@ -317,50 +294,36 @@ impl BroadcastOutputStream {
         into: S,
         collect: impl Fn(String, &mut S) -> Next + Send + 'static,
     ) -> Collector<S> {
-        let target = Arc::new(RwLock::new(into));
-
+        let sink = Arc::new(RwLock::new(into));
         let (t_send, mut t_recv) = tokio::sync::oneshot::channel::<()>();
-
-        let mut out_receiver = self.subscribe();
-        let capture = tokio::spawn(async move {
-            let mut line_buffer = String::new();
-            loop {
-                tokio::select! {
-                    out = out_receiver.recv() => {
-                        match out {
-                            Ok(Some(chunk)) => {
-                                let mut write_guard = target.write().await;
-                                let next = process_lines_in_chunk(&chunk, &mut line_buffer, &mut |line| {
-                                    collect(line, &mut (*write_guard))
-                                });
-                                if next == Next::Break {
-                                    break;
+        let mut receiver = self.subscribe();
+        Collector {
+            task: Some(tokio::spawn(async move {
+                let mut line_buffer = String::new();
+                handle_subscription!(receiver, t_recv, |maybe_chunk| {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            let mut write_guard = sink.write().await;
+                            let sink = &mut *write_guard;
+                            let lr = LineReader {
+                                remaining_chunk: &chunk,
+                                line_buffer: &mut line_buffer,
+                            };
+                            for line in lr {
+                                match collect(line, sink) {
+                                    Next::Continue => {}
+                                    Next::Break => break,
                                 }
                             }
-                            Ok(None) => {
-                                // EOF reached.
-                                break;
-                            }
-                            Err(RecvError::Closed) => {
-                                // All senders have been dropped.
-                                break;
-                            }
-                            Err(RecvError::Lagged(lagged)) => {
-                                tracing::warn!(lagged, "Inspector is lagging behind");
-                            }
+                        }
+                        None => {
+                            // EOF reached.
+                            break;
                         }
                     }
-                    _msg = &mut t_recv => {
-                        tracing::info!("Terminating collector!");
-                        break;
-                    }
-                }
-            }
-            Arc::try_unwrap(target).expect("single owner").into_inner()
-        });
-
-        Collector {
-            task: Some(capture),
+                });
+                Arc::try_unwrap(sink).expect("single owner").into_inner()
+            })),
             task_termination_sender: Some(t_send),
         }
     }
@@ -374,49 +337,35 @@ impl BroadcastOutputStream {
         S: Sink,
         F: Fn(Vec<u8>, &mut S) -> AsyncCollectFn<'_> + Send + 'static,
     {
-        let target = Arc::new(RwLock::new(into));
-
+        let sink = Arc::new(RwLock::new(into));
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let mut out_receiver = self.subscribe();
-        let capture = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    out = out_receiver.recv() => {
-                        match out {
-                            Ok(Some(chunk)) => {
-                                // TODO: refactor error handling?
-                                let result = {
-                                    let mut write_guard = target.write().await;
-                                    let fut = collect(chunk, &mut *write_guard);
-                                    fut.await
-                                };
-                                match result {
-                                    Ok(_next) => { /* do nothing */ }
-                                    Err(err) => {
-                                        tracing::warn!(?err, "Collecting failed")
-                                    }
+        let mut receiver = self.subscribe();
+        Collector {
+            task: Some(tokio::spawn(async move {
+                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            // TODO: refactor error handling?
+                            let result = {
+                                let mut write_guard = sink.write().await;
+                                let fut = collect(chunk, &mut *write_guard);
+                                fut.await
+                            };
+                            match result {
+                                Ok(_next) => { /* do nothing */ }
+                                Err(err) => {
+                                    tracing::warn!(?err, "Collecting failed")
                                 }
                             }
-                            Ok(None) | Err(RecvError::Closed) => {
-                                // EOF reached or all senders dropped.
-                                break;
-                            }
-                            Err(RecvError::Lagged(lagged)) => {
-                                tracing::warn!(lagged, "Inspector is lagging behind");
-                            }
+                        }
+                        None => {
+                            // EOF reached.
+                            break;
                         }
                     }
-                    _msg = &mut term_sig_rx => {
-                        break;
-                    }
-                }
-            }
-            Arc::try_unwrap(target).expect("single owner").into_inner()
-        });
-
-        Collector {
-            task: Some(capture),
+                });
+                Arc::try_unwrap(sink).expect("single owner").into_inner()
+            })),
             task_termination_sender: Some(term_sig_tx),
         }
     }
@@ -431,76 +380,51 @@ impl BroadcastOutputStream {
         F: Fn(String, &mut S) -> AsyncCollectFn<'_> + Send + Sync + 'static,
     {
         let sink = Arc::new(RwLock::new(into));
-
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let mut out_receiver = self.subscribe();
-
-        // Extract the collection function into an Arc to move ownership into the task
-        let collect_fn = Arc::new(collect);
-
-        let capture = tokio::spawn(async move {
-            let mut line_buffer = String::new();
-
-            loop {
-                tokio::select! {
-                    out = out_receiver.recv() => {
-                        match out {
-                            Ok(Some(chunk)) => {
-                                let next = process_lines_in_chunk_async(&chunk, &mut line_buffer, &mut |line| {
-                                    let collect_fn = collect_fn.clone();
-                                    let sink = sink.clone();
-                                    async move {
-                                        let mut sink_guard = sink.write().await;
-                                        let result = collect_fn(line.clone(), &mut *sink_guard).await;
-                                        drop(sink_guard); // Explicitly release the lock
-                                        match result {
-                                            Ok(next) => Ok(next),
-                                            Err(err) => {
-                                                tracing::warn!(?err, "Collection failed");
-                                                Ok(Next::Continue)
-                                            }
-                                        }
-                                    }
-                                }).await;
-                                if next == Next::Break {
-                                    break;
-                                }
-                            }
-                            Ok(None) => {
-                                // EOF reached.
-                                if !line_buffer.is_empty() {
-                                    let mut write_guard = sink.write().await;
-                                    let fut = collect_fn(line_buffer, &mut *write_guard);
-                                    let result = fut.await;
-                                    match result {
-                                        Ok(_next) => { /* not relevant, we always break on EOF */ },
-                                        Err(err) => {
-                                            tracing::warn!(?err, "Collection failed");
-                                        }
+        let mut receiver = self.subscribe();
+        Collector {
+            task: Some(tokio::spawn(async move {
+                let mut line_buffer = String::new();
+                handle_subscription!(receiver, term_sig_rx, |maybe_chunk| {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            let mut write_guard = sink.write().await;
+                            let sink = &mut *write_guard;
+                            let lr = LineReader {
+                                remaining_chunk: &chunk,
+                                line_buffer: &mut line_buffer,
+                            };
+                            for line in lr {
+                                match collect(line, sink).await {
+                                    Ok(Next::Continue) => {}
+                                    Ok(Next::Break) => break,
+                                    Err(err) => {
+                                        // TODO: Should this break the inspector?
+                                        tracing::warn!(?err, "Collection failed")
                                     }
                                 }
-                                break;
-                            }
-                            Err(RecvError::Closed) => {
-                                // All senders have been dropped.
-                                break;
-                            }
-                            Err(RecvError::Lagged(lagged)) => {
-                                tracing::warn!(lagged, "Inspector is lagging behind");
                             }
                         }
+                        None => {
+                            // EOF reached.
+                            if !line_buffer.is_empty() {
+                                let mut write_guard = sink.write().await;
+                                let sink = &mut *write_guard;
+                                match collect(line_buffer, sink).await {
+                                    Ok(Next::Continue) | Ok(Next::Break) => {
+                                        /* irrelevant, we always break on EOF */
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(?err, "Collection failed");
+                                    }
+                                }
+                            }
+                            break;
+                        }
                     }
-                    _msg = &mut term_sig_rx => {
-                        break;
-                    }
-                }
-            }
-            Arc::try_unwrap(sink).expect("single owner").into_inner()
-        });
-
-        Collector {
-            task: Some(capture),
+                });
+                Arc::try_unwrap(sink).expect("single owner").into_inner()
+            })),
             task_termination_sender: Some(term_sig_tx),
         }
     }

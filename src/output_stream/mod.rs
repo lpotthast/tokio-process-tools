@@ -1,6 +1,4 @@
 use std::borrow::Cow;
-use std::error::Error;
-use std::future::Future;
 
 pub mod broadcast;
 pub mod single_subscriber;
@@ -55,97 +53,51 @@ pub enum Next {
 ///
 /// # Returns
 /// The updated line buffer with any remaining content after the last newline
-fn process_lines_in_chunk(
-    chunk: &[u8],
-    line_buffer: &mut String,
-    process_line: &mut impl FnMut(String) -> Next,
-) -> Next {
-    let mut current_chunk = chunk;
-    let mut next = Next::Continue;
-
-    while !current_chunk.is_empty() {
-        match current_chunk.iter().position(|b| *b == b'\n') {
-            None => {
-                // No more line breaks - append remaining chunk and exit loop.
-                line_buffer.push_str(String::from_utf8_lossy(current_chunk).as_ref());
-                break;
-            }
-            Some(pos) => {
-                // Found a line break at `pos` - process the line and continue.
-                let (until_line_break, rest) = current_chunk.split_at(pos);
-                line_buffer.push_str(String::from_utf8_lossy(until_line_break).as_ref());
-
-                // Process the completed line.
-                next = process_line(line_buffer.clone());
-
-                // Reset line buffer and continue with rest of chunk (skip the newline).
-                // Ensure we don't go out of bounds when skipping the newline character.
-                line_buffer.clear();
-                line_buffer.shrink_to(2048);
-                current_chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
-
-                if next == Next::Break {
-                    break;
-                }
-            }
-        }
-    }
-
-    next
+pub(crate) struct LineReader<'c, 'b> {
+    remaining_chunk: &'c [u8],
+    line_buffer: &'b mut String,
 }
 
-async fn process_lines_in_chunk_async<
-    Fut: Future<Output = Result<Next, Box<dyn Error + Send + Sync>>> + Send,
->(
-    chunk: &[u8],
-    line_buffer: &mut String,
-    process_line: &mut impl FnMut(String) -> Fut,
-) -> Next {
-    let mut current_chunk = chunk;
-    let mut next = Next::Continue;
+impl Iterator for LineReader<'_, '_> {
+    type Item = String;
 
-    while !current_chunk.is_empty() {
-        match current_chunk.iter().position(|b| *b == b'\n') {
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_chunk.is_empty() {
+            return None;
+        }
+
+        match self.remaining_chunk.iter().position(|b| *b == b'\n') {
             None => {
-                // No more line breaks - append remaining chunk and exit loop.
-                line_buffer.push_str(String::from_utf8_lossy(current_chunk).as_ref());
-                break;
+                // No more line breaks - consume the remaining chunk.
+                self.line_buffer
+                    .push_str(String::from_utf8_lossy(self.remaining_chunk).as_ref());
+                self.remaining_chunk = &[];
+                None
             }
             Some(pos) => {
                 // Found a line break at `pos` - process the line and continue.
-                let (until_line_break, rest) = current_chunk.split_at(pos);
-                line_buffer.push_str(String::from_utf8_lossy(until_line_break).as_ref());
+                let (until_line_break, rest) = self.remaining_chunk.split_at(pos);
+                self.line_buffer
+                    .push_str(String::from_utf8_lossy(until_line_break).as_ref());
 
                 // Process the completed line.
-                let fut = process_line(line_buffer.clone());
-                let result = fut.await;
-                match result {
-                    Ok(ok) => next = ok,
-                    Err(err) => {
-                        // TODO: Should this break the inspector?
-                        tracing::warn!(?err, "Inspection failed")
-                    }
-                }
+                let to_return = self.line_buffer.clone();
 
                 // Reset line buffer and continue with rest of chunk (skip the newline).
                 // Ensure we don't go out of bounds when skipping the newline character.
-                line_buffer.clear();
-                line_buffer.shrink_to(2048);
-                current_chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
+                self.line_buffer.clear();
+                self.line_buffer.shrink_to(2048);
+                self.remaining_chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
 
-                if next == Next::Break {
-                    break;
-                }
+                Some(to_return)
             }
         }
     }
-
-    next
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::output_stream::{process_lines_in_chunk, Next};
+    use crate::output_stream::LineReader;
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -177,10 +129,13 @@ mod tests {
             let mut line_buffer = String::from(initial_line_buffer);
             let mut collected_lines: Vec<String> = Vec::new();
 
-            let _next = process_lines_in_chunk(chunk, &mut line_buffer, &mut |line: String| {
+            let lr = LineReader {
+                remaining_chunk: chunk,
+                line_buffer: &mut line_buffer,
+            };
+            for line in lr {
                 collected_lines.push(line);
-                Next::Continue
-            });
+            }
 
             assert_that(line_buffer)
                 .with_detail_message(format!("Test case: {test_name}"))
@@ -249,10 +204,13 @@ mod tests {
             let mut line_buffer = String::from("");
             let mut collected_lines = Vec::new();
 
-            let _next = process_lines_in_chunk(chunk, &mut line_buffer, &mut |line: String| {
+            let lr = LineReader {
+                remaining_chunk: chunk,
+                line_buffer: &mut line_buffer,
+            };
+            for line in lr {
                 collected_lines.push(line);
-                Next::Continue
-            });
+            }
 
             assert_that(line_buffer).is_equal_to("");
             assert_that(collected_lines[0].as_str()).contains("valid utf8");
