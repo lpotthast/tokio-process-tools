@@ -12,8 +12,8 @@ use std::time::Duration;
 /// # Usage Guidelines
 ///
 /// This type should only be used when:
-/// - Your code is running in a multithreaded tokio runtime
-/// - Automatic process cleanup on drop is absolutely necessary
+/// - Your code is running in a multithreaded tokio runtime.
+/// - Automatic process cleanup on drop is absolutely necessary.
 ///
 /// # Recommended Alternatives
 ///

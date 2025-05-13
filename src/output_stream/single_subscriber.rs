@@ -208,8 +208,6 @@ async fn handle_subscription<F>(
                     }
                     None => {
                         // All senders have been dropped.
-                        // TODO: track name. Warning still correct?
-                        tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                         break;
                     }
                 }
@@ -313,7 +311,6 @@ impl SingleOutputStream {
                             }
                             None => {
                                 // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                                 break;
                             }
                         }
@@ -360,7 +357,6 @@ impl SingleOutputStream {
                             }
                             None => {
                                 // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                                 break;
                             }
                         }
@@ -412,7 +408,6 @@ impl SingleOutputStream {
                             }
                             None => {
                                 // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                                 break;
                             }
                         }
@@ -471,7 +466,6 @@ impl SingleOutputStream {
                             }
                             None => {
                                 // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                                 break;
                             }
                         }
@@ -553,7 +547,6 @@ impl SingleOutputStream {
                             }
                             None => {
                                 // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                                 break;
                             }
                         }
@@ -676,15 +669,15 @@ mod tests {
             },
         );
 
-        let consumer = os.inspect_lines_async(async |_line| {
+        let inspector = os.inspect_lines_async(async |_line| {
             // Mimic a slow consumer.
-            sleep(Duration::from_millis(110)).await;
+            sleep(Duration::from_millis(100)).await;
             Ok(Next::Continue)
         });
 
         #[rustfmt::skip]
         let producer = tokio::spawn(async move {
-            for count in 1..=20 {
+            for count in 1..=15 {
                 write_half
                     .write(format!("{count}\n").as_bytes())
                     .await
@@ -693,28 +686,26 @@ mod tests {
             }
         });
 
-        sleep(Duration::from_millis(500)).await;
         producer.await.unwrap();
-        sleep(Duration::from_millis(100)).await;
-        consumer.cancel().await.unwrap();
+        inspector.wait().await.unwrap();
         drop(os);
 
         logs_assert(|lines: &[&str]| {
             match lines
                 .iter()
-                .filter(|line| line.contains("Stream reader is lagging behind lagged=2"))
+                .filter(|line| line.contains("Stream reader is lagging behind lagged=1"))
                 .count()
             {
                 1 => {}
-                n => return Err(format!("Expected one matching log, but found {}", n)),
+                n => return Err(format!("Expected exactly one lagged=1 log, but found {n}")),
             };
             match lines
                 .iter()
                 .filter(|line| line.contains("Stream reader is lagging behind lagged=3"))
                 .count()
             {
-                3 => {}
-                n => return Err(format!("Expected exactly 3 or logs, but found {}", n)),
+                2 => {}
+                n => return Err(format!("Expected exactly two lagged=3 logs, but found {n}")),
             };
             Ok(())
         });

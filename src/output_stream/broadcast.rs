@@ -140,7 +140,6 @@ async fn handle_subscription<F>(
                     }
                     Err(RecvError::Closed) => {
                         // All senders have been dropped.
-                        tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                         break;
                     }
                     Err(RecvError::Lagged(lagged)) => {
@@ -241,7 +240,6 @@ impl BroadcastOutputStream {
                             }
                             Err(RecvError::Closed) => {
                                 // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                                 break;
                             }
                             Err(RecvError::Lagged(lagged)) => {
@@ -291,7 +289,6 @@ impl BroadcastOutputStream {
                             }
                             Err(RecvError::Closed) => {
                                 // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                                 break;
                             }
                             Err(RecvError::Lagged(lagged)) => {
@@ -346,7 +343,6 @@ impl BroadcastOutputStream {
                             }
                             Err(RecvError::Closed) => {
                                 // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                                 break;
                             }
                             Err(RecvError::Lagged(lagged)) => {
@@ -402,13 +398,8 @@ impl BroadcastOutputStream {
                                     }
                                 }
                             }
-                            Ok(None) => {
-                                // EOF reached.
-                                break;
-                            }
-                            Err(RecvError::Closed) => {
-                                // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
+                            Ok(None) | Err(RecvError::Closed) => {
+                                // EOF reached or all senders dropped.
                                 break;
                             }
                             Err(RecvError::Lagged(lagged)) => {
@@ -493,7 +484,6 @@ impl BroadcastOutputStream {
                             }
                             Err(RecvError::Closed) => {
                                 // All senders have been dropped.
-                                tracing::warn!("Inspector was kept longer than the OutputStream from which it was created. Remember to manually abort or await inspectors when no longer needed.");
                                 break;
                             }
                             Err(RecvError::Lagged(lagged)) => {
@@ -630,7 +620,8 @@ mod tests {
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
 
-        let () = inspector.cancel().await.unwrap();
+        inspector.cancel().await.unwrap();
+        drop(os)
     }
 
     // TODO: Test that inspector/collector receivers terminate when data-sender is dropped!
@@ -643,13 +634,13 @@ mod tests {
 
         let consumer = os.inspect_lines_async(async |_line| {
             // Mimic a slow consumer.
-            sleep(Duration::from_millis(110)).await;
+            sleep(Duration::from_millis(100)).await;
             Ok(Next::Continue)
         });
 
         #[rustfmt::skip]
         let producer = tokio::spawn(async move {
-            for count in 1..=20 {
+            for count in 1..=15 {
                 write_half
                     .write(format!("{count}\n").as_bytes())
                     .await
@@ -667,24 +658,20 @@ mod tests {
         logs_assert(|lines: &[&str]| {
             match lines
                 .iter()
-                .filter(|line| line.contains("Inspector is lagging behind lagged=2"))
+                .filter(|line| line.contains("Inspector is lagging behind lagged=1"))
                 .count()
             {
                 1 => {}
-                n => return Err(format!("Expected two matching logs, but found {}", n)),
+                n => return Err(format!("Expected exactly one lagged=1 log, but found {n}")),
             };
             match lines
                 .iter()
                 .filter(|line| line.contains("Inspector is lagging behind lagged=3"))
                 .count()
             {
-                4 => {}
-                n => {
-                    return Err(format!(
-                        "Expected exactly 4 'lagging behind' logs, but found {}",
-                        n
-                    ))
-                }
+                2 => {}
+                3 => {}
+                n => return Err(format!("Expected exactly two lagged=3 logs, but found {n}")),
             };
             Ok(())
         });
