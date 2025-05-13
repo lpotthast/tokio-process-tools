@@ -171,7 +171,7 @@ impl BroadcastOutputStream {
         mut f: impl FnMut(String) -> Fut + Send + 'static,
     ) -> Inspector
     where
-        Fut: Future<Output = Next> + Send + Sync,
+        Fut: Future<Output = Next> + Send,
     {
         let mut receiver = self.subscribe();
         impl_inspect_lines_async!(receiver, f, handle_subscription)

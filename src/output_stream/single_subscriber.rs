@@ -10,8 +10,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 
@@ -239,7 +239,7 @@ impl SingleSubscriberOutputStream {
         mut f: impl FnMut(String) -> Fut + Send + 'static,
     ) -> Inspector
     where
-        Fut: Future<Output = Next> + Send + Sync,
+        Fut: Future<Output = Next> + Send,
     {
         let mut receiver = self.take_receiver();
         impl_inspect_lines_async!(receiver, f, handle_subscription)
@@ -372,13 +372,13 @@ impl SingleSubscriberOutputStream {
 
 #[cfg(test)]
 mod tests {
+    use crate::StreamType;
     use crate::output_stream::broadcast::BroadcastOutputStream;
     use crate::output_stream::single_subscriber::{
         FromStreamOptions, SingleSubscriberOutputStream,
     };
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, Next};
-    use crate::StreamType;
     use assertr::assert_that;
     use assertr::prelude::PartialEqAssertions;
     use std::io::{Read, Seek, SeekFrom, Write};
