@@ -33,7 +33,7 @@ macro_rules! impl_inspect_lines {
                     match maybe_chunk {
                         Some(chunk) => {
                             let lr = LineReader {
-                                chunk: &chunk,
+                                chunk: chunk.as_ref(),
                                 line_buffer: &mut line_buffer,
                             };
                             for line in lr {
@@ -68,7 +68,7 @@ macro_rules! impl_inspect_lines_async {
                     match maybe_chunk {
                         Some(chunk) => {
                             let lr = LineReader {
-                                chunk: &chunk,
+                                chunk: chunk.as_ref(),
                                 line_buffer: &mut line_buffer,
                             };
                             for line in lr {
@@ -130,7 +130,7 @@ macro_rules! impl_collect_lines {
                             let mut write_guard = $sink.write().await;
                             let sink = &mut *write_guard;
                             let lr = LineReader {
-                                chunk: &chunk,
+                                chunk: chunk.as_ref(),
                                 line_buffer: &mut line_buffer,
                             };
                             for line in lr {
@@ -162,7 +162,6 @@ macro_rules! impl_collect_chunks_async {
                 $handler!('outer, $receiver, term_sig_rx, |maybe_chunk| {
                     match maybe_chunk {
                         Some(chunk) => {
-                            // TODO: refactor error handling?
                             let result = {
                                 let mut write_guard = $sink.write().await;
                                 let fut = $collect(chunk, &mut *write_guard);
@@ -200,7 +199,7 @@ macro_rules! impl_collect_lines_async {
                             let mut write_guard = $sink.write().await;
                             let sink = &mut *write_guard;
                             let lr = LineReader {
-                                chunk: &chunk,
+                                chunk: chunk.as_ref(),
                                 line_buffer: &mut line_buffer,
                             };
                             for line in lr {

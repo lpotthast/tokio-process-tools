@@ -1,9 +1,9 @@
 use crate::output_stream::broadcast::BroadcastOutputStream;
-use crate::output_stream::single_subscriber::{FromStreamOptions, SingleSubscriberOutputStream};
-use crate::output_stream::BackpressureControl;
+use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
+use crate::output_stream::{BackpressureControl, FromStreamOptions};
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{signal, CollectorError, OutputStream, StreamType};
+use crate::{CollectorError, OutputStream, StreamType, signal};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
@@ -118,8 +118,22 @@ impl ProcessHandle<BroadcastOutputStream> {
 
         let (child, std_out_stream, std_err_stream) = (
             child,
-            BroadcastOutputStream::from_stream(stdout, StreamType::StdOut, stdout_channel_capacity),
-            BroadcastOutputStream::from_stream(stderr, StreamType::StdErr, stderr_channel_capacity),
+            BroadcastOutputStream::from_stream(
+                stdout,
+                StreamType::StdOut,
+                FromStreamOptions {
+                    channel_capacity: stdout_channel_capacity,
+                    ..Default::default()
+                },
+            ),
+            BroadcastOutputStream::from_stream(
+                stderr,
+                StreamType::StdErr,
+                FromStreamOptions {
+                    channel_capacity: stderr_channel_capacity,
+                    ..Default::default()
+                },
+            ),
         );
 
         let mut this = ProcessHandle {

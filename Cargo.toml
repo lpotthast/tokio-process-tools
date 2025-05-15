@@ -15,9 +15,9 @@ authors = ["Lukas Potthast <privat@lukas-potthast.de>"]
 
 [dependencies]
 bytes = "1.10.1"
-thiserror = "2.0.10"
-tokio = { version = "1.39.3", features = ["full"] }
-tracing = "0.1.40"
+thiserror = "2.0.12"
+tokio = { version = "1.45.0", features = ["full"] }
+tracing = "0.1.41"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["signal", "process"] }
@@ -26,8 +26,8 @@ nix = { version = "0.30.1", features = ["signal", "process"] }
 windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Console"] }
 
 [dev-dependencies]
-assertr = "0.3.0"
-tempfile = "3.15.0"
+assertr = "0.3.1"
+tempfile = "3.20.0"
 mockall = "0.13.1"
 tracing-test = "0.2.5"
 jiff = "0.2.13"
