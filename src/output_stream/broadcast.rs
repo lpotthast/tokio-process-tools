@@ -6,6 +6,7 @@ use crate::output_stream::impls::{
 };
 use crate::output_stream::{LineReader, Next};
 use crate::output_stream::{OutputStream, StreamType};
+use bytes::Bytes;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ pub struct BroadcastOutputStream {
     /// awaiting new output, sending it to all registered receivers in chunks. TODO: of up to size ???
     stream_reader: JoinHandle<()>,
 
-    sender: tokio::sync::broadcast::Sender<Option<Vec<u8>>>,
+    sender: tokio::sync::broadcast::Sender<Option<Bytes>>,
 }
 
 impl OutputStream for BroadcastOutputStream {}
@@ -46,34 +47,57 @@ impl Debug for BroadcastOutputStream {
             .field("output_collector", &"non-debug < JoinHandle<()> >")
             .field(
                 "sender",
-                &"non-debug < tokio::sync::broadcast::Sender<Option<String>> >",
+                &"non-debug < tokio::sync::broadcast::Sender<Option<Bytes>> >",
             )
             .finish()
     }
 }
 
+/// Uses a single `bytes::BytesMut` instance into which the input stream is read.
+/// Every frame sent into `sender` is a frozen slice of that buffer.
+/// Once frames were handled by all active receivers, the space of the frame is reclaimed and reused.
 fn read_chunked<B: AsyncRead + Unpin + Send + 'static, const BUFFER_SIZE: usize>(
-    mut reader: BufReader<B>,
-    sender: tokio::sync::broadcast::Sender<Option<Vec<u8>>>,
+    mut read: B,
+    sender: tokio::sync::broadcast::Sender<Option<Bytes>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // A BytesMut may grow when used in a `read_buf` call.
+        let mut buf = bytes::BytesMut::with_capacity(BUFFER_SIZE);
         loop {
-            let mut buf = [0; BUFFER_SIZE]; // 16kb
-            match reader.read(&mut buf).await {
+            let _ = buf.try_reclaim(BUFFER_SIZE);
+            read.
+
+            match read.read_buf(&mut buf).await {
                 Ok(bytes_read) => {
                     let is_eof = bytes_read == 0;
 
                     let to_send = match is_eof {
                         true => None,
-                        false => Some(Vec::from(&buf[..bytes_read])),
+                        false => {
+                            // Split of at least `chunk_size` bytes and send it, even if we were
+                            // able to read more than `chunk_size` bytes.
+                            // We could have read more
+                            let split_to = usize::min(BUFFER_SIZE, bytes_read);
+                            // Splitting off bytes reduces the remaining capacity of our BytesMut.
+                            // It might have now reached a capacity of 0. But this is fine!
+                            // The next usage of it in `read_buf` will not return `0`, as you may
+                            // expect from the read_buf documentation. The BytesMut will grow
+                            // to allow buffering of more data.
+                            Some(buf.split_to(split_to).freeze())
+                        }
                     };
 
+                    // When we could not send the chunk, we get it back in the error value and
+                    // then drop it. This means that the BytesMut storage portion of that chunk
+                    // is now reclaimable and can be used for storing the next chunk of incoming
+                    // bytes.
+                    // This all means, that the
                     match sender.send(to_send) {
                         Ok(_received_by) => {}
                         Err(err) => {
-                            // All receivers already dropped.
+                            // No receivers: All already dropped or none was yet created.
                             // We intentionally ignore these errors.
-                            // If they occur, the user wasn't interested in seeing this chunk.
+                            // If they occur, the user just wasn't interested in seeing this chunk.
                             // We won't store it (history) to later feed it back to a new subscriber.
                             tracing::debug!(
                                 error = %err,
@@ -102,10 +126,11 @@ impl BroadcastOutputStream {
         const CHUNK_BUFFER_SIZE: usize = 16 * 1024; // 16kb
 
         let (tx_stdout, _rx_stdout) =
-            tokio::sync::broadcast::channel::<Option<Vec<u8>>>(channel_capacity);
+            tokio::sync::broadcast::channel::<Option<Bytes>>(channel_capacity);
 
-        let buf_reader = BufReader::with_capacity(INPUT_BUFFER_SIZE, stream);
-        let output_collector = read_chunked::<_, CHUNK_BUFFER_SIZE>(buf_reader, tx_stdout.clone());
+        // TODO: Do we really want to force this intermediate buffer?
+        //let buf_reader = BufReader::with_capacity(INPUT_BUFFER_SIZE, stream);
+        let output_collector = read_chunked::<_, CHUNK_BUFFER_SIZE>(stream, tx_stdout.clone());
 
         BroadcastOutputStream {
             ty,
@@ -118,13 +143,13 @@ impl BroadcastOutputStream {
         &self.ty
     }
 
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Option<Vec<u8>>> {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Option<Bytes>> {
         self.sender.subscribe()
     }
 }
 
 // Expected types:
-// receiver: tokio::sync::broadcast::Receiver<Option<Vec<u8>>>,
+// receiver: tokio::sync::broadcast::Receiver<Option<Bytes>>,
 // term_rx: tokio::sync::oneshot::Receiver<()>,
 macro_rules! handle_subscription {
     ($loop_label:tt, $receiver:expr, $term_rx:expr, |$chunk:ident| $body:block) => {
@@ -154,7 +179,7 @@ macro_rules! handle_subscription {
 // Impls for inspecting the output of the stream.
 impl BroadcastOutputStream {
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_chunks(&self, mut f: impl FnMut(Vec<u8>) -> Next + Send + 'static) -> Inspector {
+    pub fn inspect_chunks(&self, mut f: impl FnMut(Bytes) -> Next + Send + 'static) -> Inspector {
         let mut receiver = self.subscribe();
         impl_inspect_chunks!(receiver, f, handle_subscription)
     }
@@ -184,7 +209,7 @@ impl BroadcastOutputStream {
     pub fn collect_chunks<S: Sink>(
         &self,
         into: S,
-        mut collect: impl FnMut(Vec<u8>, &mut S) + Send + 'static,
+        mut collect: impl FnMut(Bytes, &mut S) + Send + 'static,
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.subscribe();
@@ -206,7 +231,7 @@ impl BroadcastOutputStream {
     pub fn collect_chunks_async<S, F>(&self, into: S, collect: F) -> Collector<S>
     where
         S: Sink,
-        F: Fn(Vec<u8>, &mut S) -> AsyncCollectFn<'_> + Send + 'static,
+        F: Fn(Bytes, &mut S) -> AsyncCollectFn<'_> + Send + 'static,
     {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.subscribe();
@@ -225,7 +250,7 @@ impl BroadcastOutputStream {
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_into_vec(&self) -> Collector<Vec<Vec<u8>>> {
+    pub fn collect_chunks_into_vec(&self) -> Collector<Vec<Bytes>> {
         self.collect_chunks(Vec::new(), |chunk, vec| vec.push(chunk))
     }
 
@@ -274,7 +299,7 @@ impl BroadcastOutputStream {
     >(
         &self,
         write: W,
-        mapper: impl Fn(Vec<u8>) -> B + Send + Sync + Copy + 'static,
+        mapper: impl Fn(Bytes) -> B + Send + Sync + Copy + 'static,
     ) -> Collector<W> {
         self.collect_chunks_async(write, move |chunk, write| {
             Box::pin(async move {

@@ -123,6 +123,10 @@ fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
     })
 }
 
+/// NOTE: The maximum possible memory consumption is: `chunk_size * channel_capacity`.
+/// Although reaching that level requires:
+/// 1. A receiver to listen for chunks.
+/// 2. The channel getting full.
 pub struct FromStreamOptions {
     /// The size of the buffer used when reading from the stream in bytes.
     ///
