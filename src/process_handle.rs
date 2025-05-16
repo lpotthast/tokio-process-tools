@@ -1,9 +1,9 @@
 use crate::output_stream::broadcast::BroadcastOutputStream;
-use crate::output_stream::single_subscriber::{FromStreamOptions, SingleSubscriberOutputStream};
-use crate::output_stream::BackpressureControl;
+use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
+use crate::output_stream::{BackpressureControl, FromStreamOptions};
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{signal, CollectorError, OutputStream, StreamType};
+use crate::{CollectorError, OutputStream, signal};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
@@ -14,8 +14,11 @@ use tokio::process::Child;
 
 #[derive(Debug, Error)]
 pub enum TerminationError {
-    #[error("Failed to send signal to process: {0}")]
-    SignallingFailed(#[from] io::Error),
+    #[error("Failed to send '{signal}' signal to process: {source}")]
+    SignallingFailed {
+        source: io::Error,
+        signal: &'static str,
+    },
 
     #[error(
         "Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}"
@@ -65,7 +68,7 @@ pub enum WaitError {
     IoError(#[from] io::Error),
 
     #[error("Collector failed")]
-    CollectorFailed(#[from] CollectorError), // TODO: refactor?
+    CollectorFailed(#[from] CollectorError),
 }
 
 #[derive(Debug)]
@@ -118,8 +121,20 @@ impl ProcessHandle<BroadcastOutputStream> {
 
         let (child, std_out_stream, std_err_stream) = (
             child,
-            BroadcastOutputStream::from_stream(stdout, StreamType::StdOut, stdout_channel_capacity),
-            BroadcastOutputStream::from_stream(stderr, StreamType::StdErr, stderr_channel_capacity),
+            BroadcastOutputStream::from_stream(
+                stdout,
+                FromStreamOptions {
+                    channel_capacity: stdout_channel_capacity,
+                    ..Default::default()
+                },
+            ),
+            BroadcastOutputStream::from_stream(
+                stderr,
+                FromStreamOptions {
+                    channel_capacity: stderr_channel_capacity,
+                    ..Default::default()
+                },
+            ),
         );
 
         let mut this = ProcessHandle {
@@ -191,7 +206,6 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
             child,
             SingleSubscriberOutputStream::from_stream(
                 stdout,
-                StreamType::StdOut,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
                 FromStreamOptions {
                     channel_capacity: stdout_channel_capacity,
@@ -200,7 +214,6 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
             ),
             SingleSubscriberOutputStream::from_stream(
                 stderr,
-                StreamType::StdErr,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
                 FromStreamOptions {
                     channel_capacity: stderr_channel_capacity,
@@ -377,7 +390,10 @@ impl<O: OutputStream> ProcessHandle<O> {
         self.must_not_be_terminated();
 
         self.send_interrupt_signal()
-            .map_err(TerminationError::SignallingFailed)?;
+            .map_err(|err| TerminationError::SignallingFailed {
+                source: err,
+                signal: "SIGINT",
+            })?;
 
         match self.wait_for_completion(Some(interrupt_timeout)).await {
             Ok(exit_status) => Ok(exit_status),
@@ -389,7 +405,10 @@ impl<O: OutputStream> ProcessHandle<O> {
                 );
 
                 self.send_terminate_signal()
-                    .map_err(TerminationError::SignallingFailed)?;
+                    .map_err(|err| TerminationError::SignallingFailed {
+                        source: err,
+                        signal: "SIGTERM",
+                    })?;
 
                 match self.wait_for_completion(Some(terminate_timeout)).await {
                     Ok(exit_status) => Ok(exit_status),

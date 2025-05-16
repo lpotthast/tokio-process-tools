@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use bytes::Buf;
 
 pub mod broadcast;
 pub(crate) mod impls;
@@ -9,6 +9,56 @@ pub mod single_subscriber;
 /// - [broadcast::BroadcastOutputStream]
 /// - [single_subscriber::SingleSubscriberOutputStream]
 pub trait OutputStream {}
+
+/// NOTE: The maximum possible memory consumption is: `chunk_size * channel_capacity`.
+/// Although reaching that level requires:
+/// 1. A receiver to listen for chunks.
+/// 2. The channel getting full.
+pub struct FromStreamOptions {
+    /// The size of an individual chunk read from the read buffer in bytes.
+    ///
+    /// default: 16 * 1024 // 16 kb
+    pub chunk_size: usize,
+
+    /// The number of chunks held by the underlying async channel.
+    ///
+    /// When the subscriber (if present) is not fast enough to consume chunks equally fast or faster
+    /// than them getting read, this acts as a buffer to hold not-yet processed messages.
+    /// The bigger, the better, in terms of system resilience to write-spikes.
+    /// Multiply with `chunk_size` to obtain the amount of system resources this will consume at
+    /// max.
+    pub channel_capacity: usize,
+}
+
+impl Default for FromStreamOptions {
+    fn default() -> Self {
+        Self {
+            chunk_size: 16 * 1024, // 16 kb
+            channel_capacity: 128, // => 16 kb * 128 = 2 mb (max memory usage consumption)
+        }
+    }
+}
+
+/// A "chunk" is an arbitrarily sized byte slice read from the underlying stream.
+/// The slices' length is at max of the previously configured maximum `chunk_size`.
+///
+/// We use the word "chunk", as it is often used when processing collections in segments or when
+/// dealing with buffered I/O operations where data arrives in variable-sized pieces.
+///
+/// In contrast to this, a "frame" typically carries more specific semantics. It usually implies a
+/// complete logical unit with defined boundaries within a protocol or format. This we do not have
+/// here.
+///
+/// Note: If the underlying stream is of lower buffer size, chunks of length `chunk_size` may
+/// never be observed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Chunk(bytes::Bytes);
+
+impl AsRef<[u8]> for Chunk {
+    fn as_ref(&self) -> &[u8] {
+        self.0.chunk()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackpressureControl {
@@ -21,15 +71,6 @@ pub enum BackpressureControl {
     /// relying on the application to drop data instead of writing to stdout/stderr in order
     /// to not block.
     BlockUntilBufferHasSpace,
-}
-
-/// Represents the type of the stream (stdout or stderr)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamType {
-    StdOut,
-    StdErr,
-
-    Other(Cow<'static, str>),
 }
 
 /// Control flag to indicate whether processing should continue or break.
@@ -115,9 +156,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // TODO: also test async variant
     #[test]
-    fn test_process_lines_in_chunk() {
+    fn line_reader() {
         // Helper function to reduce duplication in test cases
         fn run_test_case(
             test_name: &str,
@@ -130,7 +170,7 @@ mod tests {
             let mut collected_lines: Vec<String> = Vec::new();
 
             let lr = LineReader {
-                chunk: chunk,
+                chunk,
                 line_buffer: &mut line_buffer,
             };
             for line in lr {
@@ -205,7 +245,7 @@ mod tests {
             let mut collected_lines = Vec::new();
 
             let lr = LineReader {
-                chunk: chunk,
+                chunk,
                 line_buffer: &mut line_buffer,
             };
             for line in lr {

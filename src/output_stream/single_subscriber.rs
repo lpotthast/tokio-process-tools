@@ -1,17 +1,20 @@
+use crate::InspectorError;
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
 use crate::output_stream::impls::{
     impl_collect_chunks, impl_collect_chunks_async, impl_collect_lines, impl_collect_lines_async,
     impl_inspect_chunks, impl_inspect_lines, impl_inspect_lines_async,
 };
-use crate::output_stream::{BackpressureControl, LineReader, Next, OutputStream, StreamType};
+use crate::output_stream::{
+    BackpressureControl, Chunk, FromStreamOptions, LineReader, Next, OutputStream,
+};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::RwLock;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 
@@ -22,15 +25,13 @@ use tokio::time::error::Elapsed;
 /// If multiple concurrent inspections are required, prefer using the
 /// `output_stream::broadcast::BroadcastOutputSteam`.
 pub struct SingleSubscriberOutputStream {
-    ty: StreamType,
-
-    /// The task that captured the `tokio::sync::mpsc::Sender` part and is asynchronously awaiting
-    /// new output, sending it to our receiver in chunks. TODO: of up to size ???
+    /// The task that captured our `mpsc::Sender` and is now asynchronously awaiting
+    /// new output from the underlying stream, sending it to our registered receiver (if present).
     stream_reader: JoinHandle<()>,
 
     /// The receiver is wrapped in an `Option` so that we can take it out of it and move it
     /// into an inspector or collector task.
-    receiver: Option<tokio::sync::mpsc::Receiver<Option<bytes::Bytes>>>,
+    receiver: Option<mpsc::Receiver<Option<Chunk>>>,
 }
 
 impl OutputStream for SingleSubscriberOutputStream {}
@@ -43,113 +44,132 @@ impl Drop for SingleSubscriberOutputStream {
 
 impl Debug for SingleSubscriberOutputStream {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SingleOutputStream")
-            .field("ty", &self.ty)
+        f.debug_struct("SingleSubscriberOutputStream")
             .field("output_collector", &"non-debug < JoinHandle<()> >")
             .field(
                 "receiver",
-                &"non-debug < tokio::sync::mpsc::Receiver<Option<bytes::Bytes>> >",
+                &"non-debug < tokio::sync::mpsc::Receiver<Option<Chunk>> >",
             )
             .finish()
     }
 }
 
-fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
-    mut reader: BufReader<B>,
+/// Uses a single `bytes::BytesMut` instance into which the input stream is read.
+/// Every chunk sent into `sender` is a frozen slice of that buffer.
+/// Once chunks were handled by all active receivers, the space of the chunk is reclaimed and reused.
+async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
+    mut read: R,
     chunk_size: usize,
-    sender: tokio::sync::mpsc::Sender<Option<bytes::Bytes>>,
+    sender: mpsc::Sender<Option<Chunk>>,
     backpressure_control: BackpressureControl,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        // NOTE: buf may grow when required! TODO
-        let mut buf = bytes::BytesMut::with_capacity(chunk_size);
-        let mut lagged: usize = 0;
-        loop {
-            match reader.read_buf(&mut buf).await {
-                Ok(bytes_read) => {
-                    let is_eof = bytes_read == 0;
+) {
+    struct AfterSend {
+        do_break: bool,
+    }
 
-                    let to_send = match is_eof {
-                        true => None,
-                        false => Some(buf.split().freeze()),
-                    };
+    fn try_send_chunk(
+        chunk: Option<Chunk>,
+        sender: &mpsc::Sender<Option<Chunk>>,
+        lagged: &mut usize,
+    ) -> AfterSend {
+        match sender.try_send(chunk) {
+            Ok(()) => {
+                if *lagged > 0 {
+                    tracing::debug!(lagged, "Stream reader is lagging behind");
+                    *lagged = 0;
+                }
+            }
+            Err(err) => {
+                match err {
+                    TrySendError::Full(_data) => {
+                        *lagged += 1;
+                    }
+                    TrySendError::Closed(_data) => {
+                        // All receivers already dropped.
+                        // We intentionally ignore this error.
+                        // If it occurs, the user just isn't interested in
+                        // newer chunks anymore.
+                        return AfterSend { do_break: true };
+                    }
+                }
+            }
+        }
+        AfterSend { do_break: false }
+    }
 
-                    match backpressure_control {
+    async fn send_chunk(chunk: Option<Chunk>, sender: &mpsc::Sender<Option<Chunk>>) -> AfterSend {
+        match sender.send(chunk).await {
+            Ok(()) => {}
+            Err(_err) => {
+                // All receivers already dropped.
+                // We intentionally ignore this error.
+                // If it occurs, the user just isn't interested in
+                // newer chunks anymore.
+                return AfterSend { do_break: true };
+            }
+        }
+        AfterSend { do_break: false }
+    }
+
+    // NOTE: buf may grow when required!
+    let mut buf = bytes::BytesMut::with_capacity(chunk_size);
+    let mut lagged: usize = 0;
+    loop {
+        let _ = buf.try_reclaim(chunk_size);
+        match read.read_buf(&mut buf).await {
+            Ok(bytes_read) => {
+                let is_eof = bytes_read == 0;
+
+                match is_eof {
+                    true => match backpressure_control {
                         BackpressureControl::DropLatestIncomingIfBufferFull => {
-                            match sender.try_send(to_send) {
-                                Ok(()) => {
-                                    if lagged > 0 {
-                                        tracing::debug!(lagged, "Stream reader is lagging behind");
-                                        lagged = 0;
-                                    }
-                                }
-                                Err(err) => {
-                                    match err {
-                                        TrySendError::Full(_data) => {
-                                            lagged += 1;
-                                        }
-                                        TrySendError::Closed(_data) => {
-                                            // All receivers already dropped.
-                                            // We intentionally ignore this error.
-                                            // If it occurs, the user just isn't interested in
-                                            // newer chunks anymore.
-                                            break;
-                                        }
-                                    }
-                                }
+                            let after = try_send_chunk(None, &sender, &mut lagged);
+                            if after.do_break {
+                                break;
                             }
                         }
                         BackpressureControl::BlockUntilBufferHasSpace => {
-                            match sender.send(to_send).await {
-                                Ok(()) => {}
-                                Err(_err) => {
-                                    // All receivers already dropped.
-                                    // We intentionally ignore this error.
-                                    // If it occurs, the user just isn't interested in
-                                    // newer chunks anymore.
-                                    break;
+                            let after = send_chunk(None, &sender).await;
+                            if after.do_break {
+                                break;
+                            }
+                        }
+                    },
+                    false => {
+                        while !buf.is_empty() {
+                            let split_to = usize::min(chunk_size, buf.len());
+
+                            match backpressure_control {
+                                BackpressureControl::DropLatestIncomingIfBufferFull => {
+                                    let after = try_send_chunk(
+                                        Some(Chunk(buf.split_to(split_to).freeze())),
+                                        &sender,
+                                        &mut lagged,
+                                    );
+                                    if after.do_break {
+                                        break;
+                                    }
+                                }
+                                BackpressureControl::BlockUntilBufferHasSpace => {
+                                    let after = send_chunk(
+                                        Some(Chunk(buf.split_to(split_to).freeze())),
+                                        &sender,
+                                    )
+                                    .await;
+                                    if after.do_break {
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
+                };
 
-                    if is_eof {
-                        break;
-                    }
+                if is_eof {
+                    break;
                 }
-                Err(err) => panic!("Could not read from stream: {err}"),
             }
-        }
-    })
-}
-
-pub struct FromStreamOptions {
-    /// The size of the buffer used when reading from the stream in bytes.
-    ///
-    /// default: 32 * 1024 // 32 kb
-    pub read_buffer_size: usize,
-
-    /// The size of an individual chunk read from the read buffer in bytes.
-    ///
-    /// default: 16 * 1024 // 16 kb
-    pub chunk_size: usize,
-
-    /// The number of chunks held by the underlying async channel.
-    ///
-    /// When the subscriber (if present) is not fast enough to consume chunks equally fast or faster
-    /// than them getting read, this acts as a buffer to hold not-yet processed messages.
-    /// The bigger, the better, in terms of system resilience to write-spikes.
-    /// Multiply with `chunk_size` to obtain the amount of system resources this will consume at
-    /// max.
-    pub channel_capacity: usize,
-}
-
-impl Default for FromStreamOptions {
-    fn default() -> Self {
-        Self {
-            read_buffer_size: 32 * 1024, // 32 kb
-            chunk_size: 16 * 1024,       // 16 kb
-            channel_capacity: 128,       // => 16 kb * 128 = 2 mb (max memory usage consumption)
+            Err(err) => panic!("Could not read from stream: {err}"),
         }
     }
 }
@@ -157,39 +177,31 @@ impl Default for FromStreamOptions {
 impl SingleSubscriberOutputStream {
     pub fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
         stream: S,
-        ty: StreamType,
         backpressure_control: BackpressureControl,
         options: FromStreamOptions,
     ) -> SingleSubscriberOutputStream {
-        let (tx_stdout, rx_stdout) =
-            tokio::sync::mpsc::channel::<Option<bytes::Bytes>>(options.channel_capacity);
+        let (tx_stdout, rx_stdout) = mpsc::channel::<Option<Chunk>>(options.channel_capacity);
 
-        let buf_reader = BufReader::with_capacity(options.read_buffer_size, stream);
-        let output_collector = read_chunked(
-            buf_reader,
+        let stream_reader = tokio::spawn(read_chunked(
+            stream,
             options.chunk_size,
             tx_stdout,
             backpressure_control,
-        );
+        ));
 
         SingleSubscriberOutputStream {
-            ty,
-            stream_reader: output_collector,
+            stream_reader,
             receiver: Some(rx_stdout),
         }
     }
 
-    pub fn ty(&self) -> &StreamType {
-        &self.ty
-    }
-
-    fn take_receiver(&mut self) -> tokio::sync::mpsc::Receiver<Option<bytes::Bytes>> {
-        self.receiver.take().unwrap()
+    fn take_receiver(&mut self) -> mpsc::Receiver<Option<Chunk>> {
+        self.receiver.take().expect("Receiver not yet to be taken. The SingleSubscriberOutputStream only supports one subscriber, but one was already created.")
     }
 }
 
 // Expected types:
-// receiver: tokio::sync::mpsc::Receiver<Option<bytes::Bytes>>
+// receiver: tokio::sync::mpsc::Receiver<Option<Chunk>>
 // term_rx: tokio::sync::oneshot::Receiver<()>
 macro_rules! handle_subscription {
     ($loop_label:tt, $receiver:expr, $term_rx:expr, |$chunk:ident| $body:block) => {
@@ -216,10 +228,7 @@ macro_rules! handle_subscription {
 // Impls for inspecting the output of the stream.
 impl SingleSubscriberOutputStream {
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_chunks(
-        &mut self,
-        f: impl Fn(bytes::Bytes) -> Next + Send + 'static,
-    ) -> Inspector {
+    pub fn inspect_chunks(&mut self, f: impl Fn(Chunk) -> Next + Send + 'static) -> Inspector {
         let mut receiver = self.take_receiver();
         impl_inspect_chunks!(receiver, f, handle_subscription)
     }
@@ -252,7 +261,7 @@ impl SingleSubscriberOutputStream {
     pub fn collect_chunks<S: Sink>(
         &mut self,
         into: S,
-        collect: impl Fn(bytes::Bytes, &mut S) + Send + 'static,
+        collect: impl Fn(Chunk, &mut S) + Send + 'static,
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
@@ -274,7 +283,7 @@ impl SingleSubscriberOutputStream {
     pub fn collect_chunks_async<S, F>(&mut self, into: S, collect: F) -> Collector<S>
     where
         S: Sink,
-        F: Fn(bytes::Bytes, &mut S) -> AsyncCollectFn<'_> + Send + 'static,
+        F: Fn(Chunk, &mut S) -> AsyncCollectFn<'_> + Send + 'static,
     {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
@@ -293,8 +302,8 @@ impl SingleSubscriberOutputStream {
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_into_vec(&mut self) -> Collector<Vec<bytes::Bytes>> {
-        self.collect_chunks(Vec::new(), |chunk, vec| vec.push(chunk))
+    pub fn collect_chunks_into_vec(&mut self) -> Collector<Vec<u8>> {
+        self.collect_chunks(Vec::new(), |chunk, vec| vec.extend(chunk.as_ref()))
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
@@ -312,7 +321,7 @@ impl SingleSubscriberOutputStream {
     ) -> Collector<W> {
         self.collect_chunks_async(write, move |chunk, write| {
             Box::pin(async move {
-                if let Err(err) = write.write_all(&chunk).await {
+                if let Err(err) = write.write_all(chunk.as_ref()).await {
                     tracing::warn!("Could not write chunk to write sink: {err:#?}");
                 };
                 Next::Continue
@@ -342,7 +351,7 @@ impl SingleSubscriberOutputStream {
     >(
         &mut self,
         write: W,
-        mapper: impl Fn(bytes::Bytes) -> B + Send + Sync + Copy + 'static,
+        mapper: impl Fn(Chunk) -> B + Send + Sync + Copy + 'static,
     ) -> Collector<W> {
         self.collect_chunks_async(write, move |chunk, write| {
             Box::pin(async move {
@@ -380,7 +389,6 @@ impl SingleSubscriberOutputStream {
 
 // Impls for waiting for a specific line of output.
 impl SingleSubscriberOutputStream {
-    /// This function is cancel safe.
     pub async fn wait_for_line(
         &mut self,
         predicate: impl Fn(String) -> bool + Send + Sync + 'static,
@@ -392,11 +400,16 @@ impl SingleSubscriberOutputStream {
                 Next::Continue
             }
         });
-        // TODO: Should we propagate the error here?
-        inspector.wait().await.unwrap();
+        match inspector.wait().await {
+            Ok(()) => {}
+            Err(err) => match err {
+                InspectorError::TaskJoin(join_error) => {
+                    panic!("Inspector task join error: {join_error:#?}");
+                }
+            },
+        };
     }
 
-    /// This function is cancel safe.
     pub async fn wait_for_line_with_timeout(
         &mut self,
         predicate: impl Fn(String) -> bool + Send + Sync + 'static,
@@ -408,20 +421,51 @@ impl SingleSubscriberOutputStream {
 
 #[cfg(test)]
 mod tests {
-    use crate::StreamType;
-    use crate::output_stream::broadcast::BroadcastOutputStream;
-    use crate::output_stream::single_subscriber::{
-        FromStreamOptions, SingleSubscriberOutputStream,
-    };
+    use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
     use crate::output_stream::tests::write_test_data;
-    use crate::output_stream::{BackpressureControl, Next};
-    use assertr::assert_that;
-    use assertr::prelude::{PartialEqAssertions, VecAssertions};
+    use crate::output_stream::{BackpressureControl, FromStreamOptions, Next};
+    use crate::single_subscriber::read_chunked;
+    use assertr::prelude::*;
+    use mockall::{automock, predicate};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
     use tokio::time::sleep;
     use tracing_test::traced_test;
+
+    #[tokio::test]
+    #[traced_test]
+    async fn read_chunked_does_not_terminate_when_first_read_can_fill_the_entire_bytes_mut_buffer()
+    {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        // Let's preemptively write more data into the stream than our later selected chunk size (2)
+        // can handle, forcing the initial read to completely fill our chunk buffer.
+        // Our expectation is that we still receive all data written here through multiple
+        // consecutive reads.
+        // The behavior of bytes::BytesMut, potentially reaching zero capacity when splitting a
+        // full buffer of, must not prevent this from happening but allocate more memory instead!
+        write_half.write_all(b"hello world").await.unwrap();
+        write_half.flush().await.unwrap();
+
+        let stream_reader = tokio::spawn(read_chunked(
+            read_half,
+            2,
+            tx,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+        ));
+
+        drop(write_half); // This closes the stream and should let stream_reader terminate.
+        stream_reader.await.unwrap();
+
+        let mut chunks = Vec::<String>::new();
+        while let Some(Some(chunk)) = rx.recv().await {
+            chunks.push(String::from_utf8_lossy(chunk.as_ref()).to_string());
+        }
+        assert_that(chunks).contains_exactly(&["he", "ll", "o ", "wo", "rl", "d"]);
+    }
 
     #[tokio::test]
     #[traced_test]
@@ -429,7 +473,6 @@ mod tests {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
-            StreamType::StdOut,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 channel_capacity: 2,
@@ -479,6 +522,42 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn inspect_lines() {
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let mut os = SingleSubscriberOutputStream::from_stream(
+            read_half,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions::default(),
+        );
+
+        #[automock]
+        trait LineVisitor {
+            fn visit(&self, line: String);
+        }
+
+        let mut mock = MockLineVisitor::new();
+        #[rustfmt::skip]
+        fn configure(mock: &mut MockLineVisitor) {
+            mock.expect_visit().with(predicate::eq("Cargo.lock".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("Cargo.toml".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("README.md".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("src".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("target".to_string())).times(1).return_const(());
+        }
+        configure(&mut mock);
+
+        let inspector = os.inspect_lines(move |line| {
+            mock.visit(line);
+            Next::Continue
+        });
+
+        tokio::spawn(write_test_data(write_half)).await.unwrap();
+
+        inspector.cancel().await.unwrap();
+        drop(os)
+    }
+
     /// This tests that our impl macros properly `break 'outer`, as they might be in an inner loop!
     /// With `break` instead of `break 'outer`, this test would never complete, as the `Next::Break`
     /// would not terminate the collector!
@@ -486,7 +565,14 @@ mod tests {
     #[traced_test]
     async fn inspect_lines_async() {
         let (read_half, mut write_half) = tokio::io::duplex(64);
-        let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 32);
+        let mut os = SingleSubscriberOutputStream::from_stream(
+            read_half,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions {
+                chunk_size: 32,
+                ..Default::default()
+            },
+        );
 
         let seen: Vec<String> = Vec::new();
         let collector = os.collect_lines_async(seen, move |line, seen: &mut Vec<String>| {
@@ -525,7 +611,6 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
-            StreamType::StdOut,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 channel_capacity: 32,
@@ -552,7 +637,14 @@ mod tests {
     #[tokio::test]
     async fn collect_lines_async_to_file() {
         let (read_half, write_half) = tokio::io::duplex(64);
-        let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 32);
+        let mut os = SingleSubscriberOutputStream::from_stream(
+            read_half,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions {
+                chunk_size: 32,
+                ..Default::default()
+            },
+        );
 
         let temp_file = tempfile::tempfile().unwrap();
         let collector = os.collect_lines_async(temp_file, |line, temp_file| {
@@ -576,10 +668,18 @@ mod tests {
     #[traced_test]
     async fn collect_chunks_into_write_mapped() {
         let (read_half, write_half) = tokio::io::duplex(64);
-        let os = BroadcastOutputStream::from_stream(read_half, StreamType::StdOut, 32);
+        let mut os = SingleSubscriberOutputStream::from_stream(
+            read_half,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions {
+                chunk_size: 32,
+                ..Default::default()
+            },
+        );
 
         let temp_file = tokio::fs::File::options()
             .create(true)
+            .truncate(true)
             .write(true)
             .read(true)
             .open(std::env::temp_dir().join(
@@ -589,7 +689,7 @@ mod tests {
             .unwrap();
 
         let collector = os.collect_chunks_into_write_mapped(temp_file, |chunk| {
-            String::from_utf8_lossy(&chunk).to_string()
+            String::from_utf8_lossy(chunk.as_ref()).to_string()
         });
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
@@ -600,5 +700,23 @@ mod tests {
         temp_file.read_to_string(&mut contents).await.unwrap();
 
         assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn multiple_subscribers_are_not_possible() {
+        let (read_half, _write_half) = tokio::io::duplex(64);
+        let mut os = SingleSubscriberOutputStream::from_stream(
+            read_half,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions::default(),
+        );
+
+        let _inspector = os.inspect_lines(|_line| Next::Continue);
+
+        // Doesn't matter if we call `inspect_lines` or some other "consuming" function instead.
+        assert_that_panic_by(move || os.inspect_lines(|_line| Next::Continue))
+            .has_type::<String>()
+            .is_equal_to("Receiver not yet to be taken. The SingleSubscriberOutputStream only supports one subscriber, but one was already created.");
     }
 }
