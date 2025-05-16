@@ -156,9 +156,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // TODO: also test async variant
     #[test]
-    fn test_process_lines_in_chunk() {
+    fn line_reader() {
         // Helper function to reduce duplication in test cases
         fn run_test_case(
             test_name: &str,
@@ -171,7 +170,7 @@ mod tests {
             let mut collected_lines: Vec<String> = Vec::new();
 
             let lr = LineReader {
-                chunk: chunk,
+                chunk,
                 line_buffer: &mut line_buffer,
             };
             for line in lr {
@@ -246,7 +245,7 @@ mod tests {
             let mut collected_lines = Vec::new();
 
             let lr = LineReader {
-                chunk: chunk,
+                chunk,
                 line_buffer: &mut line_buffer,
             };
             for line in lr {
