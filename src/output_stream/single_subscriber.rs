@@ -1,3 +1,4 @@
+use crate::InspectorError;
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
 use crate::output_stream::impls::{
@@ -193,7 +194,7 @@ impl SingleSubscriberOutputStream {
     }
 
     fn take_receiver(&mut self) -> mpsc::Receiver<Option<Chunk>> {
-        self.receiver.take().unwrap()
+        self.receiver.take().expect("Receiver not yet to be taken. The SingleSubscriberOutputStream only supports one subscriber, but one was already created.")
     }
 }
 
@@ -397,8 +398,14 @@ impl SingleSubscriberOutputStream {
                 Next::Continue
             }
         });
-        // TODO: Should we propagate the error here?
-        inspector.wait().await.unwrap();
+        match inspector.wait().await {
+            Ok(()) => {}
+            Err(err) => match err {
+                InspectorError::TaskJoin(join_error) => {
+                    panic!("Inspector task join error: {join_error:#?}");
+                }
+            },
+        };
     }
 
     pub async fn wait_for_line_with_timeout(
@@ -694,5 +701,21 @@ mod tests {
         assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
     }
 
-    // TODO: Multiple subscribers are not possible!
+    #[tokio::test]
+    #[traced_test]
+    async fn multiple_subscribers_are_not_possible() {
+        let (read_half, _write_half) = tokio::io::duplex(64);
+        let mut os = SingleSubscriberOutputStream::from_stream(
+            read_half,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions::default(),
+        );
+
+        let _inspector = os.inspect_lines(|_line| Next::Continue);
+
+        // Doesn't matter if we call `inspect_lines` or some other "consuming" function instead.
+        assert_that_panic_by(move || os.inspect_lines(|_line| Next::Continue))
+            .has_type::<String>()
+            .is_equal_to("Receiver not yet to be taken. The SingleSubscriberOutputStream only supports one subscriber, but one was already created.");
+    }
 }
