@@ -334,7 +334,6 @@ impl BroadcastOutputStream {
 
 // Impls for waiting for a specific line of output.
 impl BroadcastOutputStream {
-    /// This function is cancel safe.
     pub async fn wait_for_line(&self, predicate: impl Fn(String) -> bool + Send + Sync + 'static) {
         let inspector = self.inspect_lines(move |line| {
             if predicate(line) {
@@ -353,7 +352,6 @@ impl BroadcastOutputStream {
         };
     }
 
-    /// This function is cancel safe.
     pub async fn wait_for_line_with_timeout(
         &self,
         predicate: impl Fn(String) -> bool + Send + Sync + 'static,

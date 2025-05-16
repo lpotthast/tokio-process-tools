@@ -386,7 +386,6 @@ impl SingleSubscriberOutputStream {
 
 // Impls for waiting for a specific line of output.
 impl SingleSubscriberOutputStream {
-    /// This function is cancel safe.
     pub async fn wait_for_line(
         &mut self,
         predicate: impl Fn(String) -> bool + Send + Sync + 'static,
@@ -402,7 +401,6 @@ impl SingleSubscriberOutputStream {
         inspector.wait().await.unwrap();
     }
 
-    /// This function is cancel safe.
     pub async fn wait_for_line_with_timeout(
         &mut self,
         predicate: impl Fn(String) -> bool + Send + Sync + 'static,
