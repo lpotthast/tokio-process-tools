@@ -68,7 +68,7 @@ pub enum WaitError {
     IoError(#[from] io::Error),
 
     #[error("Collector failed")]
-    CollectorFailed(#[from] CollectorError), // TODO: refactor?
+    CollectorFailed(#[from] CollectorError),
 }
 
 #[derive(Debug)]
@@ -390,7 +390,10 @@ impl<O: OutputStream> ProcessHandle<O> {
         self.must_not_be_terminated();
 
         self.send_interrupt_signal()
-            .map_err(|err| TerminationError::SignallingFailed { source: err, signal: "SIGINT"})?;
+            .map_err(|err| TerminationError::SignallingFailed {
+                source: err,
+                signal: "SIGINT",
+            })?;
 
         match self.wait_for_completion(Some(interrupt_timeout)).await {
             Ok(exit_status) => Ok(exit_status),
@@ -402,7 +405,10 @@ impl<O: OutputStream> ProcessHandle<O> {
                 );
 
                 self.send_terminate_signal()
-                    .map_err(|err| TerminationError::SignallingFailed { source: err, signal: "SIGTERM"})?;
+                    .map_err(|err| TerminationError::SignallingFailed {
+                        source: err,
+                        signal: "SIGTERM",
+                    })?;
 
                 match self.wait_for_completion(Some(terminate_timeout)).await {
                     Ok(exit_status) => Ok(exit_status),

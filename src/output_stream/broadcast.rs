@@ -11,7 +11,7 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
@@ -23,7 +23,7 @@ use tokio::time::error::Elapsed;
 /// of inducing memory allocations not required when only one consumer is listening.
 /// For that case, prefer using the `output_stream::single_subscriber::SingleOutputSteam`.
 pub struct BroadcastOutputStream {
-    /// The task that captured a clone of our `broadcast::Sender` and is asynchronously
+    /// The task that captured a clone of our `broadcast::Sender` and is now asynchronously
     /// awaiting new output from the underlying stream, sending it to all registered receivers.
     stream_reader: JoinHandle<()>,
 
@@ -54,71 +54,69 @@ impl Debug for BroadcastOutputStream {
 }
 
 /// Uses a single `bytes::BytesMut` instance into which the input stream is read.
-/// Every frame sent into `sender` is a frozen slice of that buffer.
-/// Once frames were handled by all active receivers, the space of the frame is reclaimed and reused.
-fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
+/// Every chunk sent into `sender` is a frozen slice of that buffer.
+/// Once chunks were handled by all active receivers, the space of the chunk is reclaimed and reused.
+async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
     mut read: B,
     chunk_size: usize,
     sender: broadcast::Sender<Option<Chunk>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let send_chunk = move |chunk: Option<Chunk>| {
-            // When we could not send the chunk, we get it back in the error value and
-            // then drop it. This means that the BytesMut storage portion of that chunk
-            // is now reclaimable and can be used for storing the next chunk of incoming
-            // bytes.
-            match sender.send(chunk) {
-                Ok(_received_by) => {}
-                Err(err) => {
-                    // No receivers: All already dropped or none was yet created.
-                    // We intentionally ignore these errors.
-                    // If they occur, the user just wasn't interested in seeing this chunk.
-                    // We won't store it (history) to later feed it back to a new subscriber.
-                    tracing::debug!(
-                        error = %err,
-                        "No active receivers for the output chunk, dropping it"
-                    );
-                }
-            }
-        };
-
-        // A BytesMut may grow when used in a `read_buf` call.
-        let mut buf = bytes::BytesMut::with_capacity(chunk_size);
-        loop {
-            let _ = buf.try_reclaim(chunk_size);
-            match read.read_buf(&mut buf).await {
-                Ok(bytes_read) => {
-                    let is_eof = bytes_read == 0;
-
-                    match is_eof {
-                        true => send_chunk(None),
-                        false => {
-                            while !buf.is_empty() {
-                                // Split of at least `chunk_size` bytes and send it, even if we were
-                                // able to read more than `chunk_size` bytes.
-                                // We could have read more
-                                let split_to = usize::min(chunk_size, buf.len());
-                                // Splitting off bytes reduces the remaining capacity of our BytesMut.
-                                // It might have now reached a capacity of 0. But this is fine!
-                                // The next usage of it in `read_buf` will not return `0`, as you may
-                                // expect from the read_buf documentation. The BytesMut will grow
-                                // to allow buffering of more data.
-                                //
-                                // NOTE: If we only split of at max `chunk_size` bytes, we have to repeat
-                                // this, unless all data is processed.
-                                send_chunk(Some(Chunk(buf.split_to(split_to).freeze())));
-                            }
-                        }
-                    };
-
-                    if is_eof {
-                        break;
-                    }
-                }
-                Err(err) => panic!("Could not read from stream: {err}"),
+) {
+    let send_chunk = move |chunk: Option<Chunk>| {
+        // When we could not send the chunk, we get it back in the error value and
+        // then drop it. This means that the BytesMut storage portion of that chunk
+        // is now reclaimable and can be used for storing the next chunk of incoming
+        // bytes.
+        match sender.send(chunk) {
+            Ok(_received_by) => {}
+            Err(err) => {
+                // No receivers: All already dropped or none was yet created.
+                // We intentionally ignore these errors.
+                // If they occur, the user just wasn't interested in seeing this chunk.
+                // We won't store it (history) to later feed it back to a new subscriber.
+                tracing::debug!(
+                    error = %err,
+                    "No active receivers for the output chunk, dropping it"
+                );
             }
         }
-    })
+    };
+
+    // A BytesMut may grow when used in a `read_buf` call.
+    let mut buf = bytes::BytesMut::with_capacity(chunk_size);
+    loop {
+        let _ = buf.try_reclaim(chunk_size);
+        match read.read_buf(&mut buf).await {
+            Ok(bytes_read) => {
+                let is_eof = bytes_read == 0;
+
+                match is_eof {
+                    true => send_chunk(None),
+                    false => {
+                        while !buf.is_empty() {
+                            // Split of at least `chunk_size` bytes and send it, even if we were
+                            // able to read more than `chunk_size` bytes.
+                            // We could have read more
+                            let split_to = usize::min(chunk_size, buf.len());
+                            // Splitting off bytes reduces the remaining capacity of our BytesMut.
+                            // It might have now reached a capacity of 0. But this is fine!
+                            // The next usage of it in `read_buf` will not return `0`, as you may
+                            // expect from the read_buf documentation. The BytesMut will grow
+                            // to allow buffering of more data.
+                            //
+                            // NOTE: If we only split of at max `chunk_size` bytes, we have to repeat
+                            // this, unless all data is processed.
+                            send_chunk(Some(Chunk(buf.split_to(split_to).freeze())));
+                        }
+                    }
+                };
+
+                if is_eof {
+                    break;
+                }
+            }
+            Err(err) => panic!("Could not read from stream: {err}"),
+        }
+    }
 }
 
 impl BroadcastOutputStream {
@@ -129,9 +127,7 @@ impl BroadcastOutputStream {
         let (sender, receiver) = broadcast::channel::<Option<Chunk>>(options.channel_capacity);
         drop(receiver);
 
-        // TODO: Do we really want to force this intermediate buffer?
-        let buf_reader = BufReader::with_capacity(options.read_buffer_size, stream);
-        let stream_reader = read_chunked(buf_reader, options.chunk_size, sender.clone());
+        let stream_reader = tokio::spawn(read_chunked(stream, options.chunk_size, sender.clone()));
 
         BroadcastOutputStream {
             stream_reader,
@@ -368,7 +364,7 @@ mod tests {
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{FromStreamOptions, Next};
     use assertr::assert_that;
-    use assertr::prelude::{PartialEqAssertions, VecAssertions};
+    use assertr::prelude::{LengthAssertions, PartialEqAssertions, VecAssertions};
     use mockall::*;
     use std::io::Read;
     use std::io::Seek;
@@ -386,7 +382,6 @@ mod tests {
     {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let (tx, mut rx) = broadcast::channel(10);
-        let buf_reader = tokio::io::BufReader::new(read_half);
 
         // Let's preemptively write more data into the stream than our later selected chunk size (2)
         // can handle, forcing the initial read to completely fill our chunk buffer.
@@ -397,10 +392,10 @@ mod tests {
         write_half.write_all(b"hello world").await.unwrap();
         write_half.flush().await.unwrap();
 
-        let stream_reader = tokio::spawn(read_chunked(buf_reader, 2, tx));
+        let stream_reader = tokio::spawn(read_chunked(read_half, 2, tx));
 
         drop(write_half); // This closes the stream and should let stream_reader terminate.
-        stream_reader.await.unwrap().unwrap();
+        stream_reader.await.unwrap();
 
         let mut chunks = Vec::<String>::new();
         while let Ok(Some(chunk)) = rx.recv().await {
@@ -409,7 +404,23 @@ mod tests {
         assert_that(chunks).contains_exactly(&["he", "ll", "o ", "wo", "rl", "d"]);
     }
 
-    // TODO: Test that inspector/collector receivers terminate when data-sender is dropped!
+    #[tokio::test]
+    #[traced_test]
+    async fn read_chunked_no_data() {
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let (tx, mut rx) = broadcast::channel(10);
+
+        let stream_reader = tokio::spawn(read_chunked(read_half, 2, tx));
+
+        drop(write_half); // This closes the stream and should let stream_reader terminate.
+        stream_reader.await.unwrap();
+
+        let mut chunks = Vec::<String>::new();
+        while let Ok(Some(chunk)) = rx.recv().await {
+            chunks.push(String::from_utf8_lossy(chunk.as_ref()).to_string());
+        }
+        assert_that(chunks).is_empty();
+    }
 
     #[tokio::test]
     #[traced_test]

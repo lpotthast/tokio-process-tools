@@ -15,11 +15,6 @@ pub trait OutputStream {}
 /// 1. A receiver to listen for chunks.
 /// 2. The channel getting full.
 pub struct FromStreamOptions {
-    /// The size of the buffer used when reading from the stream in bytes.
-    ///
-    /// default: 32 * 1024 // 32 kb
-    pub read_buffer_size: usize,
-
     /// The size of an individual chunk read from the read buffer in bytes.
     ///
     /// default: 16 * 1024 // 16 kb
@@ -38,9 +33,8 @@ pub struct FromStreamOptions {
 impl Default for FromStreamOptions {
     fn default() -> Self {
         Self {
-            read_buffer_size: 32 * 1024, // 32 kb
-            chunk_size: 16 * 1024,       // 16 kb
-            channel_capacity: 128,       // => 16 kb * 128 = 2 mb (max memory usage consumption)
+            chunk_size: 16 * 1024, // 16 kb
+            channel_capacity: 128, // => 16 kb * 128 = 2 mb (max memory usage consumption)
         }
     }
 }

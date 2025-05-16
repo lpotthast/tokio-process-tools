@@ -12,7 +12,7 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
@@ -25,8 +25,8 @@ use tokio::time::error::Elapsed;
 /// If multiple concurrent inspections are required, prefer using the
 /// `output_stream::broadcast::BroadcastOutputSteam`.
 pub struct SingleSubscriberOutputStream {
-    /// The task that captured the `tokio::sync::mpsc::Sender` part and is asynchronously awaiting
-    /// new output, sending it to our receiver in chunks. TODO: of up to size ???
+    /// The task that captured our `mpsc::Sender` and is now asynchronously awaiting
+    /// new output from the underlying stream, sending it to our registered receiver (if present).
     stream_reader: JoinHandle<()>,
 
     /// The receiver is wrapped in an `Option` so that we can take it out of it and move it
@@ -54,8 +54,11 @@ impl Debug for SingleSubscriberOutputStream {
     }
 }
 
-async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
-    mut reader: BufReader<B>,
+/// Uses a single `bytes::BytesMut` instance into which the input stream is read.
+/// Every chunk sent into `sender` is a frozen slice of that buffer.
+/// Once chunks were handled by all active receivers, the space of the chunk is reclaimed and reused.
+async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
+    mut read: R,
     chunk_size: usize,
     sender: mpsc::Sender<Option<Chunk>>,
     backpressure_control: BackpressureControl,
@@ -113,7 +116,7 @@ async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
     let mut lagged: usize = 0;
     loop {
         let _ = buf.try_reclaim(chunk_size);
-        match reader.read_buf(&mut buf).await {
+        match read.read_buf(&mut buf).await {
             Ok(bytes_read) => {
                 let is_eof = bytes_read == 0;
 
@@ -179,9 +182,8 @@ impl SingleSubscriberOutputStream {
     ) -> SingleSubscriberOutputStream {
         let (tx_stdout, rx_stdout) = mpsc::channel::<Option<Chunk>>(options.channel_capacity);
 
-        let buf_reader = BufReader::with_capacity(options.read_buffer_size, stream);
         let stream_reader = tokio::spawn(read_chunked(
-            buf_reader,
+            stream,
             options.chunk_size,
             tx_stdout,
             backpressure_control,
@@ -438,7 +440,6 @@ mod tests {
     {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let (tx, mut rx) = mpsc::channel(64);
-        let buf_reader = tokio::io::BufReader::new(read_half);
 
         // Let's preemptively write more data into the stream than our later selected chunk size (2)
         // can handle, forcing the initial read to completely fill our chunk buffer.
@@ -450,7 +451,7 @@ mod tests {
         write_half.flush().await.unwrap();
 
         let stream_reader = tokio::spawn(read_chunked(
-            buf_reader,
+            read_half,
             2,
             tx,
             BackpressureControl::DropLatestIncomingIfBufferFull,
