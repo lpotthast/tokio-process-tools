@@ -5,7 +5,7 @@ use crate::output_stream::impls::{
     impl_inspect_chunks, impl_inspect_lines, impl_inspect_lines_async,
 };
 use crate::output_stream::{
-    BackpressureControl, Chunk, FromStreamOptions, LineReader, Next, OutputStream, StreamType,
+    BackpressureControl, Chunk, FromStreamOptions, LineReader, Next, OutputStream,
 };
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -24,8 +24,6 @@ use tokio::time::error::Elapsed;
 /// If multiple concurrent inspections are required, prefer using the
 /// `output_stream::broadcast::BroadcastOutputSteam`.
 pub struct SingleSubscriberOutputStream {
-    ty: StreamType,
-
     /// The task that captured the `tokio::sync::mpsc::Sender` part and is asynchronously awaiting
     /// new output, sending it to our receiver in chunks. TODO: of up to size ???
     stream_reader: JoinHandle<()>,
@@ -46,7 +44,6 @@ impl Drop for SingleSubscriberOutputStream {
 impl Debug for SingleSubscriberOutputStream {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SingleSubscriberOutputStream")
-            .field("ty", &self.ty)
             .field("output_collector", &"non-debug < JoinHandle<()> >")
             .field(
                 "receiver",
@@ -104,7 +101,7 @@ async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
                 // We intentionally ignore this error.
                 // If it occurs, the user just isn't interested in
                 // newer chunks anymore.
-                AfterSend { do_break: true };
+                return AfterSend { do_break: true };
             }
         }
         AfterSend { do_break: false }
@@ -176,7 +173,6 @@ async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
 impl SingleSubscriberOutputStream {
     pub fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
         stream: S,
-        ty: StreamType,
         backpressure_control: BackpressureControl,
         options: FromStreamOptions,
     ) -> SingleSubscriberOutputStream {
@@ -191,14 +187,9 @@ impl SingleSubscriberOutputStream {
         ));
 
         SingleSubscriberOutputStream {
-            ty,
             stream_reader,
             receiver: Some(rx_stdout),
         }
-    }
-
-    pub fn ty(&self) -> &StreamType {
-        &self.ty
     }
 
     fn take_receiver(&mut self) -> mpsc::Receiver<Option<Chunk>> {
@@ -423,12 +414,12 @@ impl SingleSubscriberOutputStream {
 
 #[cfg(test)]
 mod tests {
-    use crate::StreamType;
     use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, FromStreamOptions, Next};
     use crate::single_subscriber::read_chunked;
     use assertr::prelude::*;
+    use mockall::{automock, predicate};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -449,7 +440,7 @@ mod tests {
         // Our expectation is that we still receive all data written here through multiple
         // consecutive reads.
         // The behavior of bytes::BytesMut, potentially reaching zero capacity when splitting a
-        // full buffer of, must not prevent this from happening!
+        // full buffer of, must not prevent this from happening but allocate more memory instead!
         write_half.write_all(b"hello world").await.unwrap();
         write_half.flush().await.unwrap();
 
@@ -476,7 +467,6 @@ mod tests {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
-            StreamType::StdOut,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 channel_capacity: 2,
@@ -526,6 +516,42 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn inspect_lines() {
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let mut os = SingleSubscriberOutputStream::from_stream(
+            read_half,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions::default(),
+        );
+
+        #[automock]
+        trait LineVisitor {
+            fn visit(&self, line: String);
+        }
+
+        let mut mock = MockLineVisitor::new();
+        #[rustfmt::skip]
+        fn configure(mock: &mut MockLineVisitor) {
+            mock.expect_visit().with(predicate::eq("Cargo.lock".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("Cargo.toml".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("README.md".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("src".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("target".to_string())).times(1).return_const(());
+        }
+        configure(&mut mock);
+
+        let inspector = os.inspect_lines(move |line| {
+            mock.visit(line);
+            Next::Continue
+        });
+
+        tokio::spawn(write_test_data(write_half)).await.unwrap();
+
+        inspector.cancel().await.unwrap();
+        drop(os)
+    }
+
     /// This tests that our impl macros properly `break 'outer`, as they might be in an inner loop!
     /// With `break` instead of `break 'outer`, this test would never complete, as the `Next::Break`
     /// would not terminate the collector!
@@ -535,7 +561,6 @@ mod tests {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
-            StreamType::StdOut,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 chunk_size: 32,
@@ -580,7 +605,6 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
-            StreamType::StdOut,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 channel_capacity: 32,
@@ -609,7 +633,6 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
-            StreamType::StdOut,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 chunk_size: 32,
@@ -641,7 +664,6 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
-            StreamType::StdOut,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 chunk_size: 32,
@@ -673,4 +695,6 @@ mod tests {
 
         assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
     }
+
+    // TODO: Multiple subscribers are not possible!
 }

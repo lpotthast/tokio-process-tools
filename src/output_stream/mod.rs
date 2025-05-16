@@ -1,5 +1,4 @@
 use bytes::Buf;
-use std::borrow::Cow;
 
 pub mod broadcast;
 pub(crate) mod impls;
@@ -78,15 +77,6 @@ pub enum BackpressureControl {
     /// relying on the application to drop data instead of writing to stdout/stderr in order
     /// to not block.
     BlockUntilBufferHasSpace,
-}
-
-/// Represents the type of the stream (stdout or stderr)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamType {
-    StdOut,
-    StdErr,
-
-    Other(Cow<'static, str>),
 }
 
 /// Control flag to indicate whether processing should continue or break.

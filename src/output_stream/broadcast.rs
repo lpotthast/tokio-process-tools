@@ -1,11 +1,12 @@
+use crate::InspectorError;
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
+use crate::output_stream::OutputStream;
 use crate::output_stream::impls::{
     impl_collect_chunks, impl_collect_chunks_async, impl_collect_lines, impl_collect_lines_async,
     impl_inspect_chunks, impl_inspect_lines, impl_inspect_lines_async,
 };
 use crate::output_stream::{Chunk, FromStreamOptions, LineReader, Next};
-use crate::output_stream::{OutputStream, StreamType};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
@@ -22,12 +23,13 @@ use tokio::time::error::Elapsed;
 /// of inducing memory allocations not required when only one consumer is listening.
 /// For that case, prefer using the `output_stream::single_subscriber::SingleOutputSteam`.
 pub struct BroadcastOutputStream {
-    ty: StreamType,
-
-    /// The task that captured the `tokio::sync::broadcast::Sender` part and is asynchronously
-    /// awaiting new output, sending it to all registered receivers in chunks. TODO: of up to size ???
+    /// The task that captured a clone of our `broadcast::Sender` and is asynchronously
+    /// awaiting new output from the underlying stream, sending it to all registered receivers.
     stream_reader: JoinHandle<()>,
 
+    /// We only store the chunk sender. The initial receiver is dropped immediately after creating
+    /// the channel.
+    /// New subscribers can be created from this sender.
     sender: broadcast::Sender<Option<Chunk>>,
 }
 
@@ -42,7 +44,6 @@ impl Drop for BroadcastOutputStream {
 impl Debug for BroadcastOutputStream {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BroadcastOutputStream")
-            .field("ty", &self.ty)
             .field("output_collector", &"non-debug < JoinHandle<()> >")
             .field(
                 "sender",
@@ -123,24 +124,19 @@ fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
 impl BroadcastOutputStream {
     pub(crate) fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
         stream: S,
-        ty: StreamType,
         options: FromStreamOptions,
     ) -> BroadcastOutputStream {
-        let (tx_stdout, _rx_stdout) = broadcast::channel::<Option<Chunk>>(options.channel_capacity);
+        let (sender, receiver) = broadcast::channel::<Option<Chunk>>(options.channel_capacity);
+        drop(receiver);
 
         // TODO: Do we really want to force this intermediate buffer?
         let buf_reader = BufReader::with_capacity(options.read_buffer_size, stream);
-        let output_collector = read_chunked(buf_reader, options.chunk_size, tx_stdout.clone());
+        let stream_reader = read_chunked(buf_reader, options.chunk_size, sender.clone());
 
         BroadcastOutputStream {
-            ty,
-            stream_reader: output_collector,
-            sender: tx_stdout,
+            stream_reader,
+            sender,
         }
-    }
-
-    pub fn ty(&self) -> &StreamType {
-        &self.ty
     }
 
     fn subscribe(&self) -> broadcast::Receiver<Option<Chunk>> {
@@ -149,6 +145,7 @@ impl BroadcastOutputStream {
 }
 
 // Expected types:
+// loop_label: &'static str
 // receiver: tokio::sync::broadcast::Receiver<Option<Chunk>>,
 // term_rx: tokio::sync::oneshot::Receiver<()>,
 macro_rules! handle_subscription {
@@ -346,8 +343,14 @@ impl BroadcastOutputStream {
                 Next::Continue
             }
         });
-        // TODO: Should we propagate the error here?
-        inspector.wait().await.unwrap();
+        match inspector.wait().await {
+            Ok(()) => {}
+            Err(err) => match err {
+                InspectorError::TaskJoin(join_error) => {
+                    panic!("Inspector task join error: {join_error:#?}");
+                }
+            },
+        };
     }
 
     /// This function is cancel safe.
@@ -363,14 +366,16 @@ impl BroadcastOutputStream {
 #[cfg(test)]
 mod tests {
     use super::read_chunked;
-    use crate::StreamType;
     use crate::output_stream::broadcast::BroadcastOutputStream;
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{FromStreamOptions, Next};
     use assertr::assert_that;
     use assertr::prelude::{PartialEqAssertions, VecAssertions};
     use mockall::*;
+    use std::io::Read;
+    use std::io::Seek;
     use std::io::SeekFrom;
+    use std::io::Write;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     use tokio::sync::broadcast;
@@ -406,45 +411,6 @@ mod tests {
         assert_that(chunks).contains_exactly(&["he", "ll", "o ", "wo", "rl", "d"]);
     }
 
-    #[tokio::test]
-    async fn inspect_lines() {
-        let (read_half, write_half) = tokio::io::duplex(64);
-        let os = BroadcastOutputStream::from_stream(
-            read_half,
-            StreamType::StdOut,
-            FromStreamOptions {
-                chunk_size: 32,
-                ..Default::default()
-            },
-        );
-
-        #[automock]
-        trait LineVisitor {
-            fn visit(&self, line: String);
-        }
-
-        let mut mock = MockLineVisitor::new();
-        #[rustfmt::skip]
-        fn configure(mock: &mut MockLineVisitor) {
-            mock.expect_visit().with(predicate::eq("Cargo.lock".to_string())).times(1).return_const(());
-            mock.expect_visit().with(predicate::eq("Cargo.toml".to_string())).times(1).return_const(());
-            mock.expect_visit().with(predicate::eq("README.md".to_string())).times(1).return_const(());
-            mock.expect_visit().with(predicate::eq("src".to_string())).times(1).return_const(());
-            mock.expect_visit().with(predicate::eq("target".to_string())).times(1).return_const(());
-        }
-        configure(&mut mock);
-
-        let inspector = os.inspect_lines(move |line| {
-            mock.visit(line);
-            Next::Continue
-        });
-
-        tokio::spawn(write_test_data(write_half)).await.unwrap();
-
-        inspector.cancel().await.unwrap();
-        drop(os)
-    }
-
     // TODO: Test that inspector/collector receivers terminate when data-sender is dropped!
 
     #[tokio::test]
@@ -453,7 +419,6 @@ mod tests {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(
             read_half,
-            StreamType::StdOut,
             FromStreamOptions {
                 channel_capacity: 2,
                 ..Default::default()
@@ -506,6 +471,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inspect_lines() {
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let os = BroadcastOutputStream::from_stream(read_half, FromStreamOptions::default());
+
+        #[automock]
+        trait LineVisitor {
+            fn visit(&self, line: String);
+        }
+
+        let mut mock = MockLineVisitor::new();
+        #[rustfmt::skip]
+        fn configure(mock: &mut MockLineVisitor) {
+            mock.expect_visit().with(predicate::eq("Cargo.lock".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("Cargo.toml".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("README.md".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("src".to_string())).times(1).return_const(());
+            mock.expect_visit().with(predicate::eq("target".to_string())).times(1).return_const(());
+        }
+        configure(&mut mock);
+
+        let inspector = os.inspect_lines(move |line| {
+            mock.visit(line);
+            Next::Continue
+        });
+
+        tokio::spawn(write_test_data(write_half)).await.unwrap();
+
+        inspector.cancel().await.unwrap();
+        drop(os)
+    }
+
+    /// This tests that our impl macros properly `break 'outer`, as they might be in an inner loop!
+    /// With `break` instead of `break 'outer`, this test would never complete, as the `Next::Break`
+    /// would not terminate the collector!
+    #[tokio::test]
+    #[traced_test]
+    async fn inspect_lines_async() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        let os = BroadcastOutputStream::from_stream(
+            read_half,
+            FromStreamOptions {
+                chunk_size: 32,
+                ..Default::default()
+            },
+        );
+
+        let seen: Vec<String> = Vec::new();
+        let collector = os.collect_lines_async(seen, move |line, seen: &mut Vec<String>| {
+            Box::pin(async move {
+                if line == "break" {
+                    seen.push(line);
+                    Next::Break
+                } else {
+                    seen.push(line);
+                    Next::Continue
+                }
+            })
+        });
+
+        let _writer = tokio::spawn(async move {
+            write_half.write_all("start\n".as_bytes()).await.unwrap();
+            write_half.write_all("break\n".as_bytes()).await.unwrap();
+            write_half.write_all("end\n".as_bytes()).await.unwrap();
+
+            loop {
+                write_half
+                    .write_all("gibberish\n".as_bytes())
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let seen = collector.wait().await.unwrap();
+
+        assert_that(seen).contains_exactly(&["start", "break"]);
+    }
+
+    #[tokio::test]
+    async fn collect_lines_to_file() {
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let os = BroadcastOutputStream::from_stream(
+            read_half,
+            FromStreamOptions {
+                channel_capacity: 32,
+                ..Default::default()
+            },
+        );
+
+        let temp_file = tempfile::tempfile().unwrap();
+        let collector = os.collect_lines(temp_file, |line, temp_file| {
+            writeln!(temp_file, "{}", line).unwrap();
+            Next::Continue
+        });
+
+        tokio::spawn(write_test_data(write_half)).await.unwrap();
+
+        let mut temp_file = collector.cancel().await.unwrap();
+        temp_file.seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = String::new();
+        temp_file.read_to_string(&mut contents).unwrap();
+
+        assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
+    }
+
+    #[tokio::test]
+    async fn collect_lines_async_to_file() {
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let os = BroadcastOutputStream::from_stream(
+            read_half,
+            FromStreamOptions {
+                chunk_size: 32,
+                ..Default::default()
+            },
+        );
+
+        let temp_file = tempfile::tempfile().unwrap();
+        let collector = os.collect_lines_async(temp_file, |line, temp_file| {
+            Box::pin(async move {
+                writeln!(temp_file, "{}", line).unwrap();
+                Next::Continue
+            })
+        });
+
+        tokio::spawn(write_test_data(write_half)).await.unwrap();
+
+        let mut temp_file = collector.cancel().await.unwrap();
+        temp_file.seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = String::new();
+        temp_file.read_to_string(&mut contents).unwrap();
+
+        assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn collect_chunks_into_write_mapped() {
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let os = BroadcastOutputStream::from_stream(
+            read_half,
+            FromStreamOptions {
+                chunk_size: 32,
+                ..Default::default()
+            },
+        );
+
+        let temp_file = tokio::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(std::env::temp_dir().join(
+                "tokio_process_tools_test_single_subscriber_collect_chunks_into_write_mapped.txt",
+            ))
+            .await
+            .unwrap();
+
+        let collector = os.collect_chunks_into_write_mapped(temp_file, |chunk| {
+            String::from_utf8_lossy(chunk.as_ref()).to_string()
+        });
+
+        tokio::spawn(write_test_data(write_half)).await.unwrap();
+
+        let mut temp_file = collector.cancel().await.unwrap();
+        temp_file.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut contents = String::new();
+        temp_file.read_to_string(&mut contents).await.unwrap();
+
+        assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
+    }
+
+    #[tokio::test]
     #[traced_test]
     async fn collect_chunks_into_write_in_parallel() {
         // Big enough to hold any individual test write that we perform.
@@ -513,7 +650,6 @@ mod tests {
 
         let os = BroadcastOutputStream::from_stream(
             read_half,
-            StreamType::StdOut,
             FromStreamOptions {
                 // Big enough to hold any individual test write that we perform.
                 // Actual chunks will be smaller.
