@@ -8,14 +8,16 @@ mod terminate_on_drop;
 
 pub use collector::{Collector, CollectorError, Sink};
 pub use inspector::{Inspector, InspectorError};
-pub use output_stream::{Next, OutputStream, broadcast, single_subscriber};
+pub use output_stream::{
+    LineParsingOptions, Next, NumBytes, NumBytesExt, OutputStream, broadcast, single_subscriber,
+};
 pub use process_handle::{ProcessHandle, RunningState, TerminationError};
 pub use terminate_on_drop::TerminateOnDrop;
 
 #[cfg(test)]
 mod test {
     use crate::output_stream::broadcast::BroadcastOutputStream;
-    use crate::{ProcessHandle, RunningState};
+    use crate::{LineParsingOptions, ProcessHandle, RunningState};
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::process::Command;
@@ -25,7 +27,10 @@ mod test {
         let cmd = Command::new("ls");
         let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("ls", cmd)
             .expect("Failed to spawn `ls` command");
-        let (status, stdout, stderr) = process.wait_with_output().await.unwrap();
+        let (status, stdout, stderr) = process
+            .wait_with_output(LineParsingOptions::default())
+            .await
+            .unwrap();
         assert_that(status.success()).is_true();
         assert_that(stdout).is_equal_to(&[
             "Cargo.lock",

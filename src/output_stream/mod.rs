@@ -82,6 +82,56 @@ pub enum Next {
     Break,
 }
 
+/// Configuration options for parsing lines from a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineParsingOptions {
+    /// Maximum length of a single line in bytes.
+    /// When reached, further data won't be appended to the current line.
+    /// The line will be emitted in its current state.
+    ///
+    /// A value of 0 means no limit (the default).
+    pub max_line_length: NumBytes,
+}
+
+impl Default for LineParsingOptions {
+    fn default() -> Self {
+        Self {
+            max_line_length: NumBytes::zero(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumBytes(usize);
+
+impl NumBytes {
+    pub fn zero() -> Self {
+        Self(0)
+    }
+}
+
+pub trait NumBytesExt {
+    fn bytes(self) -> NumBytes;
+
+    fn kilobytes(self) -> NumBytes;
+
+    fn megabytes(self) -> NumBytes;
+}
+
+impl NumBytesExt for usize {
+    fn bytes(self) -> NumBytes {
+        NumBytes(self)
+    }
+
+    fn kilobytes(self) -> NumBytes {
+        NumBytes(self * 1024)
+    }
+
+    fn megabytes(self) -> NumBytes {
+        NumBytes(self * 1024 * 1024)
+    }
+}
+
 /// Conceptually, this iterator appends the given byte slice to the current line buffer, which may
 /// already hold some previously written data.
 /// The resulting view of data is split by newlines (`\n`). Every completed line is yielded.
@@ -97,6 +147,7 @@ pub enum Next {
 pub(crate) struct LineReader<'c, 'b> {
     chunk: &'c [u8],
     line_buffer: &'b mut String,
+    options: LineParsingOptions, // TODO: use options
 }
 
 impl Iterator for LineReader<'_, '_> {
@@ -139,6 +190,7 @@ impl Iterator for LineReader<'_, '_> {
 #[cfg(test)]
 mod tests {
     use crate::output_stream::LineReader;
+    use crate::{LineParsingOptions, NumBytesExt};
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -172,6 +224,9 @@ mod tests {
             let lr = LineReader {
                 chunk,
                 line_buffer: &mut line_buffer,
+                options: LineParsingOptions {
+                    max_line_length: 16.kilobytes(),
+                },
             };
             for line in lr {
                 collected_lines.push(line);
@@ -247,6 +302,9 @@ mod tests {
             let lr = LineReader {
                 chunk,
                 line_buffer: &mut line_buffer,
+                options: LineParsingOptions {
+                    max_line_length: 16.kilobytes(),
+                },
             };
             for line in lr {
                 collected_lines.push(line);

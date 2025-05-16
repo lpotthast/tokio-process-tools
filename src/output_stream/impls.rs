@@ -24,7 +24,7 @@ macro_rules! impl_inspect_chunks {
 pub(crate) use impl_inspect_chunks;
 
 macro_rules! impl_inspect_lines {
-    ($receiver:expr, $f:ident, $handler:ident) => {{
+    ($receiver:expr, $f:ident, $options:ident, $handler:ident) => {{
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         Inspector {
             task: Some(tokio::spawn(async move {
@@ -35,6 +35,7 @@ macro_rules! impl_inspect_lines {
                             let lr = LineReader {
                                 chunk: chunk.as_ref(),
                                 line_buffer: &mut line_buffer,
+                                options: $options,
                             };
                             for line in lr {
                                 let next = $f(line);
@@ -59,7 +60,7 @@ macro_rules! impl_inspect_lines {
 pub(crate) use impl_inspect_lines;
 
 macro_rules! impl_inspect_lines_async {
-    ($receiver:expr, $f:ident, $handler:ident) => {{
+    ($receiver:expr, $f:ident, $options:ident, $handler:ident) => {{
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         Inspector {
             task: Some(tokio::spawn(async move {
@@ -70,6 +71,7 @@ macro_rules! impl_inspect_lines_async {
                             let lr = LineReader {
                                 chunk: chunk.as_ref(),
                                 line_buffer: &mut line_buffer,
+                                options: $options,
                             };
                             for line in lr {
                                 match $f(line).await {
@@ -119,7 +121,7 @@ macro_rules! impl_collect_chunks {
 pub(crate) use impl_collect_chunks;
 
 macro_rules! impl_collect_lines {
-    ($receiver:expr, $collect:ident, $sink:ident, $handler:ident) => {{
+    ($receiver:expr, $collect:ident, $options:ident, $sink:ident, $handler:ident) => {{
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         Collector {
             task: Some(tokio::spawn(async move {
@@ -132,6 +134,7 @@ macro_rules! impl_collect_lines {
                             let lr = LineReader {
                                 chunk: chunk.as_ref(),
                                 line_buffer: &mut line_buffer,
+                                options: $options,
                             };
                             for line in lr {
                                 match $collect(line, sink) {
@@ -187,7 +190,7 @@ macro_rules! impl_collect_chunks_async {
 pub(crate) use impl_collect_chunks_async;
 
 macro_rules! impl_collect_lines_async {
-    ($receiver:expr, $collect:ident, $sink:ident, $handler:ident) => {{
+    ($receiver:expr, $collect:ident, $options:ident, $sink:ident, $handler:ident) => {{
         let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
         Collector {
             task: Some(tokio::spawn(async move {
@@ -201,6 +204,7 @@ macro_rules! impl_collect_lines_async {
                             let lr = LineReader {
                                 chunk: chunk.as_ref(),
                                 line_buffer: &mut line_buffer,
+                                options: $options,
                             };
                             for line in lr {
                                 match $collect(line, sink).await {
