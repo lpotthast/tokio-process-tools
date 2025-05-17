@@ -371,7 +371,7 @@ mod tests {
                 last_line_length: None,
                 options: LineParsingOptions::default(),
             };
-            for (l, line) in lr.enumerate() {
+            for line in lr {
                 collected_lines.push(String::from_utf8_lossy(&line).to_string());
                 bytes.push(line);
             }
