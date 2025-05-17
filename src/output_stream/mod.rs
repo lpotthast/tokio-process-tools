@@ -1,4 +1,4 @@
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 
 pub mod broadcast;
 pub(crate) mod impls;
@@ -169,32 +169,46 @@ impl NumBytesExt for usize {
 ///
 /// The implementation tries to allocate as little as possible.
 ///
+/// It can be expected that `line_buffer` does not grow beyond `options.max_line_length` bytes
+/// **IF** any yielded line is dropped or cloned and **NOT** stored long term.
+/// Only then can the underlying storage, used to capture that line, be reused to capture the
+/// next line.
+///
 /// # Members
 /// * `chunk` - New slice of bytes to process.
 /// * `line_buffer` - Buffer for reading one line.
 ///   May hold previously seen, not-yet-closed, line-data.
 pub(crate) struct LineReader<'c, 'b> {
     chunk: &'c [u8],
-    line_buffer: &'b mut String,
+    line_buffer: &'b mut BytesMut,
+    last_line_length: Option<usize>,
     options: LineParsingOptions,
 }
 
-impl LineReader<'_, '_> {
+impl<'c, 'b> LineReader<'c, 'b> {
+    pub fn new(
+        chunk: &'c [u8],
+        line_buffer: &'b mut BytesMut,
+        options: LineParsingOptions,
+    ) -> Self {
+        Self {
+            chunk,
+            line_buffer,
+            last_line_length: None,
+            options,
+        }
+    }
+
     fn append_to_line_buffer(&mut self, chunk: &[u8]) {
-        self.line_buffer
-            .push_str(String::from_utf8_lossy(chunk).as_ref());
+        self.line_buffer.extend_from_slice(chunk)
     }
 
-    fn _take_line(&mut self) -> String {
-        let line = self.line_buffer.clone();
-        // Reset the line buffer and continue with rest of chunk (skip the newline).
-        // Ensure we don't go out of bounds when skipping the newline character.
-        self.line_buffer.clear();
-        self.line_buffer.shrink_to(2048);
-        line
+    fn _take_line(&mut self) -> bytes::Bytes {
+        self.last_line_length = Some(self.line_buffer.len());
+        self.line_buffer.split().freeze()
     }
 
-    fn take_line(&mut self, full_line_buffer: bool) -> String {
+    fn take_line(&mut self, full_line_buffer: bool) -> bytes::Bytes {
         if full_line_buffer {
             match self.options.overflow_behavior {
                 LineOverflowBehavior::DropAdditionalData => {
@@ -216,13 +230,26 @@ impl LineReader<'_, '_> {
 }
 
 impl Iterator for LineReader<'_, '_> {
-    type Item = String;
+    type Item = bytes::Bytes;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Ensure we never go out of bounds with our line buffer.
         // This also ensures that no-one creates a `LineReader` with a line buffer that is already
         // too large for our current `options.max_line_length`.
         assert!(self.line_buffer.len() <= self.options.max_line_length.0);
+
+        // Note: This will always be seen, even when the processed chunk ends with `\n`, as
+        // every iterator must once return `None` to signal that it has finished!
+        // And this, we only do later.
+        if let Some(last_line_length) = self.last_line_length.take() {
+            // The previous iteration yielded line of this length!
+            let reclaimed = self.line_buffer.try_reclaim(last_line_length);
+            if !reclaimed {
+                tracing::warn!(
+                    "Could not reclaim {last_line_length} bytes of line_buffer space. DO NOT store a yielded line (of type `bytes::Bytes`) long term. If you need to, clone it instead, to prevent the `line_buffer` from growing indefinitely (for any additional line processed). Also, make sure to set an appropriate `options.max_line_length`."
+                );
+            }
+        }
 
         // Code would work without this early-return. But this lets us skip a lot of actions on
         // empty slices.
@@ -289,8 +316,10 @@ mod tests {
     use crate::LineParsingOptions;
     use crate::output_stream::LineReader;
     use assertr::prelude::*;
+    use bytes::{Bytes, BytesMut};
     use std::time::Duration;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
+    use tracing_test::traced_test;
 
     pub(crate) async fn write_test_data(mut write: impl AsyncWrite + Unpin) {
         write.write_all("Cargo.lock\n".as_bytes()).await.unwrap();
@@ -306,6 +335,76 @@ mod tests {
     }
 
     #[test]
+    #[traced_test]
+    fn multi_byte_utf_8_characters_are_preserved_even_when_parsing_multiple_one_byte_chunks() {
+        let mut line_buffer = BytesMut::new();
+        let mut collected_lines: Vec<String> = Vec::new();
+
+        let data = "❤️❤️❤️\n👍\n";
+        for byte in data.as_bytes() {
+            let lr = LineReader {
+                chunk: &[*byte],
+                line_buffer: &mut line_buffer,
+                last_line_length: None,
+                options: LineParsingOptions::default(),
+            };
+            for line in lr {
+                collected_lines.push(String::from_utf8_lossy(&line).to_string());
+            }
+        }
+
+        assert_that(collected_lines).contains_exactly(&["❤️❤️❤️", "👍"]);
+    }
+
+    #[test]
+    #[traced_test]
+    fn reclaims_line_buffer_space_before_collecting_new_line() {
+        let mut line_buffer = BytesMut::new();
+        let mut collected_lines: Vec<String> = Vec::new();
+        let mut bytes: Vec<Bytes> = Vec::new();
+
+        let data = "❤️❤️❤️\n❤️❤️❤️\n";
+        for byte in data.as_bytes() {
+            let lr = LineReader {
+                chunk: &[*byte],
+                line_buffer: &mut line_buffer,
+                last_line_length: None,
+                options: LineParsingOptions::default(),
+            };
+            for (l, line) in lr.enumerate() {
+                collected_lines.push(String::from_utf8_lossy(&line).to_string());
+                bytes.push(line);
+            }
+        }
+
+        let data = "❤️❤️❤️\n";
+        let lr = LineReader {
+            chunk: data.as_bytes(),
+            line_buffer: &mut line_buffer,
+            last_line_length: None,
+            options: LineParsingOptions::default(),
+        };
+        for line in lr {
+            collected_lines.push(String::from_utf8_lossy(&line).to_string());
+            bytes.push(line);
+        }
+
+        assert_that(collected_lines).contains_exactly(&["❤️❤️❤️", "❤️❤️❤️", "❤️❤️❤️"]);
+
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains("Could not reclaim 18 bytes of line_buffer space. DO NOT store a yielded line (of type `bytes::Bytes`) long term. If you need to, clone it instead, to prevent the `line_buffer` from growing indefinitely (for any additional line processed). Also, make sure to set an appropriate `options.max_line_length`."))
+                .count()
+            {
+                3 => {}
+                n => return Err(format!("Expected exactly one log, but found {n}")),
+            };
+            Ok(())
+        });
+    }
+
+    #[test]
     fn line_reader() {
         // Helper function to reduce duplication in test cases
         fn run_test_case(
@@ -315,16 +414,17 @@ mod tests {
             expected_result: &str,
             expected_lines: &[&str],
         ) {
-            let mut line_buffer = String::from(initial_line_buffer);
+            let mut line_buffer = BytesMut::from(initial_line_buffer);
             let mut collected_lines: Vec<String> = Vec::new();
 
             let lr = LineReader {
                 chunk,
                 line_buffer: &mut line_buffer,
+                last_line_length: None,
                 options: LineParsingOptions::default(),
             };
             for line in lr {
-                collected_lines.push(line);
+                collected_lines.push(String::from_utf8_lossy(&line).to_string());
             }
 
             assert_that(line_buffer)
@@ -391,16 +491,17 @@ mod tests {
         {
             // This test case needs special handling due to its assertions
             let chunk = b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n";
-            let mut line_buffer = String::from("");
+            let mut line_buffer = BytesMut::new();
             let mut collected_lines = Vec::new();
 
             let lr = LineReader {
                 chunk,
                 line_buffer: &mut line_buffer,
+                last_line_length: None,
                 options: LineParsingOptions::default(),
             };
             for line in lr {
-                collected_lines.push(line);
+                collected_lines.push(String::from_utf8_lossy(&line).to_string());
             }
 
             assert_that(line_buffer).is_equal_to("");
