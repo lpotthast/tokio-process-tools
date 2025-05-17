@@ -3,7 +3,7 @@ use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
 use crate::output_stream::{BackpressureControl, FromStreamOptions};
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{CollectorError, OutputStream, signal};
+use crate::{CollectorError, LineParsingOptions, OutputStream, signal};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
@@ -150,10 +150,10 @@ impl ProcessHandle<BroadcastOutputStream> {
 
     pub async fn wait_with_output(
         &mut self,
+        options: LineParsingOptions,
     ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
-        // TODO: Configurable line collection
-        let out_collector = self.std_out_stream.collect_lines_into_vec();
-        let err_collector = self.std_err_stream.collect_lines_into_vec();
+        let out_collector = self.std_out_stream.collect_lines_into_vec(options);
+        let err_collector = self.std_err_stream.collect_lines_into_vec(options);
 
         let status = self.wait().await?;
         let std_out = out_collector.cancel().await?;
@@ -235,10 +235,10 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
 
     pub async fn wait_with_output(
         &mut self,
+        options: LineParsingOptions,
     ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
-        // TODO: Configurable line collection
-        let out_collector = self.std_out_stream.collect_lines_into_vec();
-        let err_collector = self.std_err_stream.collect_lines_into_vec();
+        let out_collector = self.std_out_stream.collect_lines_into_vec(options);
+        let err_collector = self.std_err_stream.collect_lines_into_vec(options);
 
         let status = self.wait().await?;
         let std_out = out_collector.cancel().await?;

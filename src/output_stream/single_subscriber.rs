@@ -1,4 +1,3 @@
-use crate::InspectorError;
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
 use crate::output_stream::impls::{
@@ -8,6 +7,7 @@ use crate::output_stream::impls::{
 use crate::output_stream::{
     BackpressureControl, Chunk, FromStreamOptions, LineReader, Next, OutputStream,
 };
+use crate::{InspectorError, LineParsingOptions};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
@@ -237,21 +237,23 @@ impl SingleSubscriberOutputStream {
     pub fn inspect_lines(
         &mut self,
         mut f: impl FnMut(String) -> Next + Send + 'static,
+        options: LineParsingOptions,
     ) -> Inspector {
         let mut receiver = self.take_receiver();
-        impl_inspect_lines!(receiver, f, handle_subscription)
+        impl_inspect_lines!(receiver, f, options, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines_async<Fut>(
         &mut self,
         mut f: impl FnMut(String) -> Fut + Send + 'static,
+        options: LineParsingOptions,
     ) -> Inspector
     where
         Fut: Future<Output = Next> + Send,
     {
         let mut receiver = self.take_receiver();
-        impl_inspect_lines_async!(receiver, f, handle_subscription)
+        impl_inspect_lines_async!(receiver, f, options, handle_subscription)
     }
 }
 
@@ -269,17 +271,6 @@ impl SingleSubscriberOutputStream {
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines<S: Sink>(
-        &mut self,
-        into: S,
-        collect: impl Fn(String, &mut S) -> Next + Send + 'static,
-    ) -> Collector<S> {
-        let sink = Arc::new(RwLock::new(into));
-        let mut receiver = self.take_receiver();
-        impl_collect_lines!(receiver, collect, sink, handle_subscription)
-    }
-
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_async<S, F>(&mut self, into: S, collect: F) -> Collector<S>
     where
         S: Sink,
@@ -291,14 +282,31 @@ impl SingleSubscriberOutputStream {
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_async<S, F>(&mut self, into: S, collect: F) -> Collector<S>
+    pub fn collect_lines<S: Sink>(
+        &mut self,
+        into: S,
+        collect: impl Fn(String, &mut S) -> Next + Send + 'static,
+        options: LineParsingOptions,
+    ) -> Collector<S> {
+        let sink = Arc::new(RwLock::new(into));
+        let mut receiver = self.take_receiver();
+        impl_collect_lines!(receiver, collect, options, sink, handle_subscription)
+    }
+
+    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+    pub fn collect_lines_async<S, F>(
+        &mut self,
+        into: S,
+        collect: F,
+        options: LineParsingOptions,
+    ) -> Collector<S>
     where
         S: Sink,
         F: Fn(String, &mut S) -> AsyncCollectFn<'_> + Send + Sync + 'static,
     {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
-        impl_collect_lines_async!(receiver, collect, sink, handle_subscription)
+        impl_collect_lines_async!(receiver, collect, options, sink, handle_subscription)
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
@@ -307,11 +315,18 @@ impl SingleSubscriberOutputStream {
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_into_vec(&mut self) -> Collector<Vec<String>> {
-        self.collect_lines(Vec::new(), |line, vec| {
-            vec.push(line);
-            Next::Continue
-        })
+    pub fn collect_lines_into_vec(
+        &mut self,
+        options: LineParsingOptions,
+    ) -> Collector<Vec<String>> {
+        self.collect_lines(
+            Vec::new(),
+            |line, vec| {
+                vec.push(line);
+                Next::Continue
+            },
+            options,
+        )
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
@@ -333,15 +348,20 @@ impl SingleSubscriberOutputStream {
     pub fn collect_lines_into_write<W: Sink + AsyncWriteExt + Unpin>(
         &mut self,
         write: W,
+        options: LineParsingOptions,
     ) -> Collector<W> {
-        self.collect_lines_async(write, move |line, write| {
-            Box::pin(async move {
-                if let Err(err) = write.write_all(line.as_bytes()).await {
-                    tracing::warn!("Could not write line to write sink: {err:#?}");
-                };
-                Next::Continue
-            })
-        })
+        self.collect_lines_async(
+            write,
+            move |line, write| {
+                Box::pin(async move {
+                    if let Err(err) = write.write_all(line.as_bytes()).await {
+                        tracing::warn!("Could not write line to write sink: {err:#?}");
+                    };
+                    Next::Continue
+                })
+            },
+            options,
+        )
     }
 
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
@@ -373,17 +393,22 @@ impl SingleSubscriberOutputStream {
         &mut self,
         write: W,
         mapper: impl Fn(String) -> B + Send + Sync + Copy + 'static,
+        options: LineParsingOptions,
     ) -> Collector<W> {
-        self.collect_lines_async(write, move |line, write| {
-            Box::pin(async move {
-                let mapped = mapper(line);
-                let mapped = mapped.as_ref();
-                if let Err(err) = write.write_all(mapped).await {
-                    tracing::warn!("Could not write line to write sink: {err:#?}");
-                };
-                Next::Continue
-            })
-        })
+        self.collect_lines_async(
+            write,
+            move |line, write| {
+                Box::pin(async move {
+                    let mapped = mapper(line);
+                    let mapped = mapped.as_ref();
+                    if let Err(err) = write.write_all(mapped).await {
+                        tracing::warn!("Could not write line to write sink: {err:#?}");
+                    };
+                    Next::Continue
+                })
+            },
+            options,
+        )
     }
 }
 
@@ -392,14 +417,18 @@ impl SingleSubscriberOutputStream {
     pub async fn wait_for_line(
         &mut self,
         predicate: impl Fn(String) -> bool + Send + Sync + 'static,
+        options: LineParsingOptions,
     ) {
-        let inspector = self.inspect_lines(move |line| {
-            if predicate(line) {
-                Next::Break
-            } else {
-                Next::Continue
-            }
-        });
+        let inspector = self.inspect_lines(
+            move |line| {
+                if predicate(line) {
+                    Next::Break
+                } else {
+                    Next::Continue
+                }
+            },
+            options,
+        );
         match inspector.wait().await {
             Ok(()) => {}
             Err(err) => match err {
@@ -413,9 +442,10 @@ impl SingleSubscriberOutputStream {
     pub async fn wait_for_line_with_timeout(
         &mut self,
         predicate: impl Fn(String) -> bool + Send + Sync + 'static,
+        options: LineParsingOptions,
         timeout: Duration,
     ) -> Result<(), Elapsed> {
-        tokio::time::timeout(timeout, self.wait_for_line(predicate)).await
+        tokio::time::timeout(timeout, self.wait_for_line(predicate, options)).await
     }
 }
 
@@ -425,6 +455,7 @@ mod tests {
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, FromStreamOptions, Next};
     use crate::single_subscriber::read_chunked;
+    use crate::LineParsingOptions;
     use assertr::prelude::*;
     use mockall::{automock, predicate};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -480,11 +511,14 @@ mod tests {
             },
         );
 
-        let inspector = os.inspect_lines_async(async |_line| {
-            // Mimic a slow consumer.
-            sleep(Duration::from_millis(100)).await;
-            Next::Continue
-        });
+        let inspector = os.inspect_lines_async(
+            async |_line| {
+                // Mimic a slow consumer.
+                sleep(Duration::from_millis(100)).await;
+                Next::Continue
+            },
+            LineParsingOptions::default(),
+        );
 
         #[rustfmt::skip]
         let producer = tokio::spawn(async move {
@@ -547,10 +581,13 @@ mod tests {
         }
         configure(&mut mock);
 
-        let inspector = os.inspect_lines(move |line| {
-            mock.visit(line);
-            Next::Continue
-        });
+        let inspector = os.inspect_lines(
+            move |line| {
+                mock.visit(line);
+                Next::Continue
+            },
+            LineParsingOptions::default(),
+        );
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
 
@@ -575,17 +612,21 @@ mod tests {
         );
 
         let seen: Vec<String> = Vec::new();
-        let collector = os.collect_lines_async(seen, move |line, seen: &mut Vec<String>| {
-            Box::pin(async move {
-                if line == "break" {
-                    seen.push(line);
-                    Next::Break
-                } else {
-                    seen.push(line);
-                    Next::Continue
-                }
-            })
-        });
+        let collector = os.collect_lines_async(
+            seen,
+            move |line, seen: &mut Vec<String>| {
+                Box::pin(async move {
+                    if line == "break" {
+                        seen.push(line);
+                        Next::Break
+                    } else {
+                        seen.push(line);
+                        Next::Continue
+                    }
+                })
+            },
+            LineParsingOptions::default(),
+        );
 
         let _writer = tokio::spawn(async move {
             write_half.write_all("start\n".as_bytes()).await.unwrap();
@@ -619,10 +660,14 @@ mod tests {
         );
 
         let temp_file = tempfile::tempfile().unwrap();
-        let collector = os.collect_lines(temp_file, |line, temp_file| {
-            writeln!(temp_file, "{}", line).unwrap();
-            Next::Continue
-        });
+        let collector = os.collect_lines(
+            temp_file,
+            |line, temp_file| {
+                writeln!(temp_file, "{}", line).unwrap();
+                Next::Continue
+            },
+            LineParsingOptions::default(),
+        );
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
 
@@ -647,12 +692,16 @@ mod tests {
         );
 
         let temp_file = tempfile::tempfile().unwrap();
-        let collector = os.collect_lines_async(temp_file, |line, temp_file| {
-            Box::pin(async move {
-                writeln!(temp_file, "{}", line).unwrap();
-                Next::Continue
-            })
-        });
+        let collector = os.collect_lines_async(
+            temp_file,
+            |line, temp_file| {
+                Box::pin(async move {
+                    writeln!(temp_file, "{}", line).unwrap();
+                    Next::Continue
+                })
+            },
+            LineParsingOptions::default(),
+        );
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
 
@@ -712,10 +761,10 @@ mod tests {
             FromStreamOptions::default(),
         );
 
-        let _inspector = os.inspect_lines(|_line| Next::Continue);
+        let _inspector = os.inspect_lines(|_line| Next::Continue, Default::default());
 
         // Doesn't matter if we call `inspect_lines` or some other "consuming" function instead.
-        assert_that_panic_by(move || os.inspect_lines(|_line| Next::Continue))
+        assert_that_panic_by(move || os.inspect_lines(|_line| Next::Continue, Default::default()))
             .has_type::<String>()
             .is_equal_to("Receiver not yet to be taken. The SingleSubscriberOutputStream only supports one subscriber, but one was already created.");
     }
