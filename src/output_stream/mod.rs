@@ -410,11 +410,11 @@ mod tests {
         fn run_test_case(
             test_name: &str,
             chunk: &[u8],
-            initial_line_buffer: &str,
-            expected_result: &str,
+            line_buffer_before: &str,
+            line_buffer_after: &str,
             expected_lines: &[&str],
         ) {
-            let mut line_buffer = BytesMut::from(initial_line_buffer);
+            let mut line_buffer = BytesMut::from(line_buffer_before);
             let mut collected_lines: Vec<String> = Vec::new();
 
             let lr = LineReader {
@@ -429,7 +429,7 @@ mod tests {
 
             assert_that(line_buffer)
                 .with_detail_message(format!("Test case: {test_name}"))
-                .is_equal_to(expected_result);
+                .is_equal_to(line_buffer_after);
 
             let expected_lines: Vec<String> =
                 expected_lines.iter().map(|s| s.to_string()).collect();
@@ -443,8 +443,8 @@ mod tests {
         run_test_case(
             "Empty chunk",
             b"",
-            "existing line: ",
-            "existing line: ",
+            "previous: ",
+            "previous: ",
             &[],
         );
 
@@ -452,8 +452,8 @@ mod tests {
         run_test_case(
             "Chunk with no newlines",
             b"no newlines here",
-            "existing line: ",
-            "existing line: no newlines here",
+            "previous: ",
+            "previous: no newlines here",
             &[],
         );
 
@@ -482,31 +482,18 @@ mod tests {
         run_test_case(
             "Initial line with multiple newlines",
             b"continuation\nmore lines\n",
-            "initial part of line: ",
+            "previous: ",
             "",
-            &["initial part of line: continuation", "more lines"],
+            &["previous: continuation", "more lines"],
         );
 
-        // Test case 7: Non-UTF8 data
-        {
-            // This test case needs special handling due to its assertions
-            let chunk = b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n";
-            let mut line_buffer = BytesMut::new();
-            let mut collected_lines = Vec::new();
-
-            let lr = LineReader {
-                chunk,
-                line_buffer: &mut line_buffer,
-                last_line_length: None,
-                options: LineParsingOptions::default(),
-            };
-            for line in lr {
-                collected_lines.push(String::from_utf8_lossy(&line).to_string());
-            }
-
-            assert_that(line_buffer).is_equal_to("");
-            assert_that(collected_lines[0].as_str()).contains("valid utf8");
-            assert_that(collected_lines[0].as_str()).contains("invalid utf8");
-        }
+        // Test case 7: Invalid UTF8 data
+        run_test_case(
+            "Initial line with multiple newlines",
+            b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n",
+            "",
+            "",
+            &["valid utf8�(�� invalid utf8"],
+        );
     }
 }
