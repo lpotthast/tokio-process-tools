@@ -82,6 +82,24 @@ pub enum Next {
     Break,
 }
 
+/// What should happen when a line is too long?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineOverflowBehavior {
+    /// Drop any additional data received after the current line was considered too long until
+    /// the next newline character is observed, which then starts a new line.
+    #[default]
+    DropAdditionalData,
+
+    /// Emit the current line when the maximum allowed length is reached.
+    /// Any additional data received is immediately taken as the content of the next line.
+    ///
+    /// This option really just adds intermediate line breaks to not let any emitted line exceed the
+    /// length limit.
+    ///
+    /// No data is dropped with this behavior.
+    EmitAdditionalAsNewLines,
+}
+
 /// Configuration options for parsing lines from a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineParsingOptions {
@@ -89,14 +107,25 @@ pub struct LineParsingOptions {
     /// When reached, further data won't be appended to the current line.
     /// The line will be emitted in its current state.
     ///
-    /// A value of 0 means no limit (the default).
+    /// A value of `0` means that "no limit" is imposed.
+    ///
+    /// Only set this to `0` when you absolutely trust the input stream! Remember that an observed
+    /// stream maliciously writing endless amounts of data without ever writing a line break
+    /// would starve this system from ever emitting a line and will lead to an infinite amount of
+    /// memory being allocated to hold the line data, letting this process running out of memory!
+    ///
+    /// Defaults to 16 kilobytes.
     pub max_line_length: NumBytes,
+
+    /// What should happen when a line is too long?
+    pub overflow_behavior: LineOverflowBehavior,
 }
 
 impl Default for LineParsingOptions {
     fn default() -> Self {
         Self {
-            max_line_length: NumBytes::zero(),
+            max_line_length: 16.kilobytes(),
+            overflow_behavior: LineOverflowBehavior::default(),
         }
     }
 }
@@ -147,41 +176,109 @@ impl NumBytesExt for usize {
 pub(crate) struct LineReader<'c, 'b> {
     chunk: &'c [u8],
     line_buffer: &'b mut String,
-    options: LineParsingOptions, // TODO: use options
+    options: LineParsingOptions,
+}
+
+impl LineReader<'_, '_> {
+    fn append_to_line_buffer(&mut self, chunk: &[u8]) {
+        self.line_buffer
+            .push_str(String::from_utf8_lossy(chunk).as_ref());
+    }
+
+    fn _take_line(&mut self) -> String {
+        let line = self.line_buffer.clone();
+        // Reset the line buffer and continue with rest of chunk (skip the newline).
+        // Ensure we don't go out of bounds when skipping the newline character.
+        self.line_buffer.clear();
+        self.line_buffer.shrink_to(2048);
+        line
+    }
+
+    fn take_line(&mut self, full_line_buffer: bool) -> String {
+        if full_line_buffer {
+            match self.options.overflow_behavior {
+                LineOverflowBehavior::DropAdditionalData => {
+                    // Drop any additional and return the current (not regularly finished) line.
+                    self.chunk = &[];
+                    self._take_line()
+                }
+                LineOverflowBehavior::EmitAdditionalAsNewLines => {
+                    // Do NOT drop any additional and return the current (not regularly finished)
+                    // line. This will lead to all additional data starting a new line in the
+                    // next iteration.
+                    self._take_line()
+                }
+            }
+        } else {
+            self._take_line()
+        }
+    }
 }
 
 impl Iterator for LineReader<'_, '_> {
     type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Ensure we never go out of bounds with our line buffer.
+        // This also ensures that no-one creates a `LineReader` with a line buffer that is already
+        // too large for our current `options.max_line_length`.
+        assert!(self.line_buffer.len() <= self.options.max_line_length.0);
+
+        // Code would work without this early-return. But this lets us skip a lot of actions on
+        // empty slices.
         if self.chunk.is_empty() {
             return None;
         }
 
-        match self.chunk.iter().position(|b| *b == b'\n') {
+        // Through our assert above, the first operand will always be bigger!
+        let remaining_line_length = self.options.max_line_length.0 - self.line_buffer.len();
+        // The previous iteration might have filled the line buffer completely.
+        // Apply overflow behavior.
+        if remaining_line_length == 0 {
+            return Some(self.take_line(true));
+        }
+
+        // We have space remaining in our line buffer.
+        // Split the chunk into two a usable portion (which would not "overflow" the line buffer)
+        // and the rest.
+        let (usable, rest) = self
+            .chunk
+            .split_at(usize::min(self.chunk.len(), remaining_line_length));
+
+        // Search for the next newline character in the usable portion of our current chunk.
+        match usable.iter().position(|b| *b == b'\n') {
             None => {
-                // No more line breaks - consume the remaining chunk.
-                self.line_buffer
-                    .push_str(String::from_utf8_lossy(self.chunk).as_ref());
-                self.chunk = &[];
-                None
+                // No line break found! Consume the whole usable chunk portion.
+                self.append_to_line_buffer(usable);
+                self.chunk = rest;
+
+                if rest.is_empty() {
+                    // Return None, as we have no more data to process.
+                    // Leftover data in `line_buffer` must be taken care of externally!
+                    None
+                } else {
+                    // Line now full. Would overflow using rest. Return the current line!
+                    assert_eq!(self.line_buffer.len(), self.options.max_line_length.0);
+                    Some(self.take_line(true))
+                }
             }
             Some(pos) => {
                 // Found a line break at `pos` - process the line and continue.
-                let (until_line_break, rest) = self.chunk.split_at(pos);
-                self.line_buffer
-                    .push_str(String::from_utf8_lossy(until_line_break).as_ref());
+                let (usable_until_line_break, _usable_rest) = usable.split_at(pos);
+                self.append_to_line_buffer(usable_until_line_break);
 
-                // Process the completed line.
-                let to_return = self.line_buffer.clone();
+                // We did split our chunk into `let (usable, rest) = ...` earlier.
+                // We then split usable into `let (usable_until_line_break, _usable_rest) = ...`.
+                // We know that `_usable_rest` and `rest` are consecutive in `chunk`!
+                // This is the combination of `_usable_rest` and `rest` expressed through `chunk`
+                // to get to the "real"/"complete" rest of data.
+                let rest = &self.chunk[usable_until_line_break.len()..];
 
-                // Reset line buffer and continue with rest of chunk (skip the newline).
-                // Ensure we don't go out of bounds when skipping the newline character.
-                self.line_buffer.clear();
-                self.line_buffer.shrink_to(2048);
+                // Skip the `\n` byte!
                 self.chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
 
-                Some(to_return)
+                // Return the completed line.
+                Some(self.take_line(false))
             }
         }
     }
@@ -189,8 +286,8 @@ impl Iterator for LineReader<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::LineParsingOptions;
     use crate::output_stream::LineReader;
-    use crate::{LineParsingOptions, NumBytesExt};
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -224,9 +321,7 @@ mod tests {
             let lr = LineReader {
                 chunk,
                 line_buffer: &mut line_buffer,
-                options: LineParsingOptions {
-                    max_line_length: 16.kilobytes(),
-                },
+                options: LineParsingOptions::default(),
             };
             for line in lr {
                 collected_lines.push(line);
@@ -302,9 +397,7 @@ mod tests {
             let lr = LineReader {
                 chunk,
                 line_buffer: &mut line_buffer,
-                options: LineParsingOptions {
-                    max_line_length: 16.kilobytes(),
-                },
+                options: LineParsingOptions::default(),
             };
             for line in lr {
                 collected_lines.push(line);

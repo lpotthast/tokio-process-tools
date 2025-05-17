@@ -403,7 +403,6 @@ pub struct LineConfig {
 #[cfg(test)]
 mod tests {
     use super::read_chunked;
-    use crate::output_stream::NumBytesExt;
     use crate::output_stream::broadcast::BroadcastOutputStream;
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{FromStreamOptions, LineParsingOptions, Next};
@@ -484,9 +483,7 @@ mod tests {
                 sleep(Duration::from_millis(100)).await;
                 Next::Continue
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         #[rustfmt::skip]
@@ -554,9 +551,7 @@ mod tests {
                 mock.visit(line);
                 Next::Continue
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
@@ -594,9 +589,7 @@ mod tests {
                     }
                 })
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         let _writer = tokio::spawn(async move {
@@ -636,9 +629,7 @@ mod tests {
                 writeln!(temp_file, "{}", line).unwrap();
                 Next::Continue
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
@@ -671,9 +662,7 @@ mod tests {
                     Next::Continue
                 })
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();

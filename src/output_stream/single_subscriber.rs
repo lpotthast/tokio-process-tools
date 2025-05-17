@@ -455,7 +455,7 @@ mod tests {
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, FromStreamOptions, Next};
     use crate::single_subscriber::read_chunked;
-    use crate::{LineParsingOptions, NumBytesExt};
+    use crate::LineParsingOptions;
     use assertr::prelude::*;
     use mockall::{automock, predicate};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -517,9 +517,7 @@ mod tests {
                 sleep(Duration::from_millis(100)).await;
                 Next::Continue
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         #[rustfmt::skip]
@@ -588,9 +586,7 @@ mod tests {
                 mock.visit(line);
                 Next::Continue
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
@@ -629,9 +625,7 @@ mod tests {
                     }
                 })
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         let _writer = tokio::spawn(async move {
@@ -672,9 +666,7 @@ mod tests {
                 writeln!(temp_file, "{}", line).unwrap();
                 Next::Continue
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
@@ -708,9 +700,7 @@ mod tests {
                     Next::Continue
                 })
             },
-            LineParsingOptions {
-                max_line_length: 16.kilobytes(),
-            },
+            LineParsingOptions::default(),
         );
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
