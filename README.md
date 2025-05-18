@@ -33,20 +33,29 @@ async fn start_process() {
         ProcessHandle::<BroadcastOutputStream>::spawn("my-process-handle", cmd).unwrap();
 
     // Access the stdout/stderr streams with their respective accessor functions.
-    let stdout_inspector = process.stdout().inspect_lines(|line| {
-        tracing::info!(line, "stdout");
-        Next::Continue
-    });
-    let stderr_inspector = process.stderr().inspect_lines_async(async |line| {
-        tracing::warn!(line, "stderr");
-        Next::Continue
-    });
+    let stdout_inspector = process.stdout().inspect_lines(
+        |line| {
+            tracing::info!(line, "stdout");
+            Next::Continue
+        },
+        LineParsingOptions::default()
+    );
+    let stderr_inspector = process.stderr().inspect_lines_async(
+        async |line| {
+            tracing::warn!(line, "stderr");
+            Next::Continue
+        },
+        LineParsingOptions::default()
+    );
 
     // You can wait for a line fulfilling an assertion. Optionally with a timeout.
     // This is syntactic sugar over an `inspect_lines`.
     process
         .stdout()
-        .wait_for_line(|line| line.contains("started successfully on port 8080"))
+        .wait_for_line(
+            |line| line.contains("started successfully on port 8080"),
+            LineParsingOptions::default()
+        )
         .await;
 
     // Wait for the natural completion of the process (with an optional timeout).
