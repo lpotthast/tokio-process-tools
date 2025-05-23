@@ -442,9 +442,8 @@ mod tests {
                 .is_equal_to(expected_lines);
         }
 
-        // Test case 1: Empty chunk
         run_test_case(
-            "Empty chunk",
+            "Test 1: Empty chunk",
             b"",
             "previous: ",
             "previous: ",
@@ -452,9 +451,8 @@ mod tests {
             LineParsingOptions::default(),
         );
 
-        // Test case 2: Chunk with no newlines
         run_test_case(
-            "Chunk with no newlines",
+            "Test 2: Chunk with no newlines",
             b"no newlines here",
             "previous: ",
             "previous: no newlines here",
@@ -462,9 +460,8 @@ mod tests {
             LineParsingOptions::default(),
         );
 
-        // Test case 3: Single complete line
         run_test_case(
-            "Single complete line",
+            "Test 3: Single complete line",
             b"one line\n",
             "",
             "",
@@ -472,9 +469,8 @@ mod tests {
             LineParsingOptions::default(),
         );
 
-        // Test case 4: Multiple complete lines
         run_test_case(
-            "Multiple complete lines",
+            "Test 4: Multiple complete lines",
             b"first line\nsecond line\nthird line\n",
             "",
             "",
@@ -482,9 +478,8 @@ mod tests {
             LineParsingOptions::default(),
         );
 
-        // Test case 5: Partial line at the end
         run_test_case(
-            "Partial line at the end",
+            "Test 5: Partial line at the end",
             b"complete line\npartial",
             "",
             "partial",
@@ -492,9 +487,8 @@ mod tests {
             LineParsingOptions::default(),
         );
 
-        // Test case 6: Initial line with multiple newlines
         run_test_case(
-            "Initial line with multiple newlines",
+            "Test 6: Initial line with multiple newlines",
             b"continuation\nmore lines\n",
             "previous: ",
             "",
@@ -502,9 +496,8 @@ mod tests {
             LineParsingOptions::default(),
         );
 
-        // Test case 7: Invalid UTF8 data
         run_test_case(
-            "Invalid UTF8 data",
+            "Test 7: Invalid UTF8 data",
             b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n",
             "",
             "",
