@@ -9,7 +9,8 @@ mod terminate_on_drop;
 pub use collector::{Collector, CollectorError, Sink};
 pub use inspector::{Inspector, InspectorError};
 pub use output_stream::{
-    LineParsingOptions, Next, NumBytes, NumBytesExt, OutputStream, broadcast, single_subscriber,
+    LineOverflowBehavior, LineParsingOptions, Next, NumBytes, NumBytesExt, OutputStream, broadcast,
+    single_subscriber,
 };
 pub use process_handle::{ProcessHandle, RunningState, TerminationError};
 pub use terminate_on_drop::TerminateOnDrop;

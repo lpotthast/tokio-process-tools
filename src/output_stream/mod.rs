@@ -1,4 +1,5 @@
 use bytes::{Buf, BytesMut};
+use std::io::BufRead;
 
 pub mod broadcast;
 pub(crate) mod impls;
@@ -131,7 +132,7 @@ impl Default for LineParsingOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NumBytes(usize);
+pub struct NumBytes(pub usize);
 
 impl NumBytes {
     pub fn zero() -> Self {
@@ -212,8 +213,9 @@ impl<'c, 'b> LineReader<'c, 'b> {
         if full_line_buffer {
             match self.options.overflow_behavior {
                 LineOverflowBehavior::DropAdditionalData => {
-                    // Drop any additional and return the current (not regularly finished) line.
-                    self.chunk = &[];
+                    // Drop any additional (until the next newline character!)
+                    // and return the current (not regularly finished) line.
+                    let _ = self.chunk.skip_until(b'\n');
                     self._take_line()
                 }
                 LineOverflowBehavior::EmitAdditionalAsNewLines => {
@@ -313,8 +315,8 @@ impl Iterator for LineReader<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::LineParsingOptions;
     use crate::output_stream::LineReader;
+    use crate::{LineOverflowBehavior, LineParsingOptions, NumBytes};
     use assertr::prelude::*;
     use bytes::{Bytes, BytesMut};
     use std::time::Duration;
@@ -413,6 +415,7 @@ mod tests {
             line_buffer_before: &str,
             line_buffer_after: &str,
             expected_lines: &[&str],
+            options: LineParsingOptions,
         ) {
             let mut line_buffer = BytesMut::from(line_buffer_before);
             let mut collected_lines: Vec<String> = Vec::new();
@@ -421,7 +424,7 @@ mod tests {
                 chunk,
                 line_buffer: &mut line_buffer,
                 last_line_length: None,
-                options: LineParsingOptions::default(),
+                options,
             };
             for line in lr {
                 collected_lines.push(String::from_utf8_lossy(&line).to_string());
@@ -446,6 +449,7 @@ mod tests {
             "previous: ",
             "previous: ",
             &[],
+            LineParsingOptions::default(),
         );
 
         // Test case 2: Chunk with no newlines
@@ -455,10 +459,18 @@ mod tests {
             "previous: ",
             "previous: no newlines here",
             &[],
+            LineParsingOptions::default(),
         );
 
         // Test case 3: Single complete line
-        run_test_case("Single complete line", b"one line\n", "", "", &["one line"]);
+        run_test_case(
+            "Single complete line",
+            b"one line\n",
+            "",
+            "",
+            &["one line"],
+            LineParsingOptions::default(),
+        );
 
         // Test case 4: Multiple complete lines
         run_test_case(
@@ -467,6 +479,7 @@ mod tests {
             "",
             "",
             &["first line", "second line", "third line"],
+            LineParsingOptions::default(),
         );
 
         // Test case 5: Partial line at the end
@@ -476,6 +489,7 @@ mod tests {
             "",
             "partial",
             &["complete line"],
+            LineParsingOptions::default(),
         );
 
         // Test case 6: Initial line with multiple newlines
@@ -485,15 +499,41 @@ mod tests {
             "previous: ",
             "",
             &["previous: continuation", "more lines"],
+            LineParsingOptions::default(),
         );
 
         // Test case 7: Invalid UTF8 data
         run_test_case(
-            "Initial line with multiple newlines",
+            "Invalid UTF8 data",
             b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n",
             "",
             "",
             &["valid utf8�(�� invalid utf8"],
+            LineParsingOptions::default(),
+        );
+
+        run_test_case(
+            "Test 8 - Rest of too long line is dropped",
+            b"123456789\nabcdefghi\n",
+            "",
+            "",
+            &["1234", "abcd"],
+            LineParsingOptions {
+                max_line_length: NumBytes(4), // Only allow lines with 4 ascii chars (or equiv.) max.
+                overflow_behavior: LineOverflowBehavior::DropAdditionalData,
+            },
+        );
+
+        run_test_case(
+            "Test 9 - Rest of too long line is returned as additional lines",
+            b"123456789\nabcdefghi\n",
+            "",
+            "",
+            &["1234", "5678", "9", "abcd", "efgh", "i"],
+            LineParsingOptions {
+                max_line_length: NumBytes(4), // Only allow lines with 4 ascii chars (or equiv.) max.
+                overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
+            },
         );
     }
 }
