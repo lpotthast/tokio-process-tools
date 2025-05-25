@@ -238,7 +238,9 @@ impl Iterator for LineReader<'_, '_> {
         // Ensure we never go out of bounds with our line buffer.
         // This also ensures that no-one creates a `LineReader` with a line buffer that is already
         // too large for our current `options.max_line_length`.
-        assert!(self.line_buffer.len() <= self.options.max_line_length.0);
+        if self.options.max_line_length.0 != 0 {
+            assert!(self.line_buffer.len() <= self.options.max_line_length.0);
+        }
 
         // Note: This will always be seen, even when the processed chunk ends with `\n`, as
         // every iterator must once return `None` to signal that it has finished!
@@ -260,7 +262,12 @@ impl Iterator for LineReader<'_, '_> {
         }
 
         // Through our assert above, the first operand will always be bigger!
-        let remaining_line_length = self.options.max_line_length.0 - self.line_buffer.len();
+        let remaining_line_length = if self.options.max_line_length.0 == 0 {
+            usize::MAX
+        } else {
+            self.options.max_line_length.0 - self.line_buffer.len()
+       };
+
         // The previous iteration might have filled the line buffer completely.
         // Apply overflow behavior.
         if remaining_line_length == 0 {
@@ -525,6 +532,30 @@ mod tests {
             &["1234", "5678", "9", "abcd", "efgh", "i"],
             LineParsingOptions {
                 max_line_length: NumBytes(4), // Only allow lines with 4 ascii chars (or equiv.) max.
+                overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
+            },
+        );
+
+        run_test_case(
+            "Test 10 - max line length of 0 disables line length checks #1",
+            b"123456789\nabcdefghi\n",
+            "",
+            "",
+            &["123456789", "abcdefghi"],
+            LineParsingOptions {
+                max_line_length: NumBytes(0),
+                overflow_behavior: LineOverflowBehavior::DropAdditionalData,
+            },
+        );
+
+        run_test_case(
+            "Test 11 - max line length of 0 disables line length checks #2",
+            b"123456789\nabcdefghi\n",
+            "",
+            "",
+            &["123456789", "abcdefghi"],
+            LineParsingOptions {
+                max_line_length: NumBytes(0),
                 overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
             },
         );
