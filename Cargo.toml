@@ -1,6 +1,6 @@
 [package]
 name = "tokio-process-tools"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 rust-version = "1.85.0"
 repository = "https://github.com/lpotthast/tokio-process-tools"

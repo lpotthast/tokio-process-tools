@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "tokio-process-tools"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "assertr",
  "bytes",
