@@ -266,7 +266,7 @@ impl Iterator for LineReader<'_, '_> {
             usize::MAX
         } else {
             self.options.max_line_length.0 - self.line_buffer.len()
-       };
+        };
 
         // The previous iteration might have filled the line buffer completely.
         // Apply overflow behavior.
@@ -322,13 +322,8 @@ impl Iterator for LineReader<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::output_stream::LineReader;
-    use crate::{LineOverflowBehavior, LineParsingOptions, NumBytes};
-    use assertr::prelude::*;
-    use bytes::{Bytes, BytesMut};
     use std::time::Duration;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
-    use tracing_test::traced_test;
 
     pub(crate) async fn write_test_data(mut write: impl AsyncWrite + Unpin) {
         write.write_all("Cargo.lock\n".as_bytes()).await.unwrap();
@@ -343,39 +338,59 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    #[test]
-    #[traced_test]
-    fn multi_byte_utf_8_characters_are_preserved_even_when_parsing_multiple_one_byte_chunks() {
-        let mut line_buffer = BytesMut::new();
-        let mut collected_lines: Vec<String> = Vec::new();
+    mod line_reader {
+        use crate::output_stream::LineReader;
+        use crate::{LineOverflowBehavior, LineParsingOptions, NumBytes};
+        use assertr::prelude::*;
+        use bytes::{Bytes, BytesMut};
+        use tracing_test::traced_test;
 
-        let data = "❤️❤️❤️\n👍\n";
-        for byte in data.as_bytes() {
-            let lr = LineReader {
-                chunk: &[*byte],
-                line_buffer: &mut line_buffer,
-                last_line_length: None,
-                options: LineParsingOptions::default(),
-            };
-            for line in lr {
-                collected_lines.push(String::from_utf8_lossy(&line).to_string());
+        #[test]
+        #[traced_test]
+        fn multi_byte_utf_8_characters_are_preserved_even_when_parsing_multiple_one_byte_chunks() {
+            let mut line_buffer = BytesMut::new();
+            let mut collected_lines: Vec<String> = Vec::new();
+
+            let data = "❤️❤️❤️\n👍\n";
+            for byte in data.as_bytes() {
+                let lr = LineReader {
+                    chunk: &[*byte],
+                    line_buffer: &mut line_buffer,
+                    last_line_length: None,
+                    options: LineParsingOptions::default(),
+                };
+                for line in lr {
+                    collected_lines.push(String::from_utf8_lossy(&line).to_string());
+                }
             }
+
+            assert_that(collected_lines).contains_exactly(&["❤️❤️❤️", "👍"]);
         }
 
-        assert_that(collected_lines).contains_exactly(&["❤️❤️❤️", "👍"]);
-    }
+        #[test]
+        #[traced_test]
+        fn reclaims_line_buffer_space_before_collecting_new_line() {
+            let mut line_buffer = BytesMut::new();
+            let mut collected_lines: Vec<String> = Vec::new();
+            let mut bytes: Vec<Bytes> = Vec::new();
 
-    #[test]
-    #[traced_test]
-    fn reclaims_line_buffer_space_before_collecting_new_line() {
-        let mut line_buffer = BytesMut::new();
-        let mut collected_lines: Vec<String> = Vec::new();
-        let mut bytes: Vec<Bytes> = Vec::new();
+            let data = "❤️❤️❤️\n❤️❤️❤️\n";
+            for byte in data.as_bytes() {
+                let lr = LineReader {
+                    chunk: &[*byte],
+                    line_buffer: &mut line_buffer,
+                    last_line_length: None,
+                    options: LineParsingOptions::default(),
+                };
+                for line in lr {
+                    collected_lines.push(String::from_utf8_lossy(&line).to_string());
+                    bytes.push(line);
+                }
+            }
 
-        let data = "❤️❤️❤️\n❤️❤️❤️\n";
-        for byte in data.as_bytes() {
+            let data = "❤️❤️❤️\n";
             let lr = LineReader {
-                chunk: &[*byte],
+                chunk: data.as_bytes(),
                 line_buffer: &mut line_buffer,
                 last_line_length: None,
                 options: LineParsingOptions::default(),
@@ -384,40 +399,24 @@ mod tests {
                 collected_lines.push(String::from_utf8_lossy(&line).to_string());
                 bytes.push(line);
             }
+
+            assert_that(collected_lines).contains_exactly(&["❤️❤️❤️", "❤️❤️❤️", "❤️❤️❤️"]);
+
+            logs_assert(|lines: &[&str]| {
+                match lines
+                    .iter()
+                    .filter(|line| line.contains("Could not reclaim 18 bytes of line_buffer space. DO NOT store a yielded line (of type `bytes::Bytes`) long term. If you need to, clone it instead, to prevent the `line_buffer` from growing indefinitely (for any additional line processed). Also, make sure to set an appropriate `options.max_line_length`."))
+                    .count()
+                {
+                    3 => {}
+                    n => return Err(format!("Expected exactly one log, but found {n}")),
+                };
+                Ok(())
+            });
         }
 
-        let data = "❤️❤️❤️\n";
-        let lr = LineReader {
-            chunk: data.as_bytes(),
-            line_buffer: &mut line_buffer,
-            last_line_length: None,
-            options: LineParsingOptions::default(),
-        };
-        for line in lr {
-            collected_lines.push(String::from_utf8_lossy(&line).to_string());
-            bytes.push(line);
-        }
-
-        assert_that(collected_lines).contains_exactly(&["❤️❤️❤️", "❤️❤️❤️", "❤️❤️❤️"]);
-
-        logs_assert(|lines: &[&str]| {
-            match lines
-                .iter()
-                .filter(|line| line.contains("Could not reclaim 18 bytes of line_buffer space. DO NOT store a yielded line (of type `bytes::Bytes`) long term. If you need to, clone it instead, to prevent the `line_buffer` from growing indefinitely (for any additional line processed). Also, make sure to set an appropriate `options.max_line_length`."))
-                .count()
-            {
-                3 => {}
-                n => return Err(format!("Expected exactly one log, but found {n}")),
-            };
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn line_reader() {
         // Helper function to reduce duplication in test cases
         fn run_test_case(
-            test_name: &str,
             chunk: &[u8],
             line_buffer_before: &str,
             line_buffer_after: &str,
@@ -437,127 +436,159 @@ mod tests {
                 collected_lines.push(String::from_utf8_lossy(&line).to_string());
             }
 
-            assert_that(line_buffer)
-                .with_detail_message(format!("Test case: {test_name}"))
-                .is_equal_to(line_buffer_after);
+            assert_that(line_buffer).is_equal_to(line_buffer_after);
 
             let expected_lines: Vec<String> =
                 expected_lines.iter().map(|s| s.to_string()).collect();
 
-            assert_that(collected_lines)
-                .with_detail_message(format!("Test case: {test_name}"))
-                .is_equal_to(expected_lines);
+            assert_that(collected_lines).is_equal_to(expected_lines);
         }
 
-        run_test_case(
-            "Test 1: Empty chunk",
-            b"",
-            "previous: ",
-            "previous: ",
-            &[],
-            LineParsingOptions::default(),
-        );
+        #[test]
+        fn empty_chunk() {
+            run_test_case(
+                b"",
+                "previous: ",
+                "previous: ",
+                &[],
+                LineParsingOptions::default(),
+            );
+        }
 
-        run_test_case(
-            "Test 2: Chunk with no newlines",
-            b"no newlines here",
-            "previous: ",
-            "previous: no newlines here",
-            &[],
-            LineParsingOptions::default(),
-        );
+        #[test]
+        fn chunk_without_any_newlines() {
+            run_test_case(
+                b"no newlines here",
+                "previous: ",
+                "previous: no newlines here",
+                &[],
+                LineParsingOptions::default(),
+            );
+        }
 
-        run_test_case(
-            "Test 3: Single complete line",
-            b"one line\n",
-            "",
-            "",
-            &["one line"],
-            LineParsingOptions::default(),
-        );
+        #[test]
+        fn single_completed_line() {
+            run_test_case(
+                b"one line\n",
+                "",
+                "",
+                &["one line"],
+                LineParsingOptions::default(),
+            );
+        }
 
-        run_test_case(
-            "Test 4: Multiple complete lines",
-            b"first line\nsecond line\nthird line\n",
-            "",
-            "",
-            &["first line", "second line", "third line"],
-            LineParsingOptions::default(),
-        );
+        #[test]
+        fn multiple_completed_lines() {
+            run_test_case(
+                b"first line\nsecond line\nthird line\n",
+                "",
+                "",
+                &["first line", "second line", "third line"],
+                LineParsingOptions::default(),
+            );
+        }
 
-        run_test_case(
-            "Test 5: Partial line at the end",
-            b"complete line\npartial",
-            "",
-            "partial",
-            &["complete line"],
-            LineParsingOptions::default(),
-        );
+        #[test]
+        fn partial_line_at_the_end() {
+            run_test_case(
+                b"complete line\npartial",
+                "",
+                "partial",
+                &["complete line"],
+                LineParsingOptions::default(),
+            );
+        }
 
-        run_test_case(
-            "Test 6: Initial line with multiple newlines",
-            b"continuation\nmore lines\n",
-            "previous: ",
-            "",
-            &["previous: continuation", "more lines"],
-            LineParsingOptions::default(),
-        );
+        #[test]
+        fn initial_line_with_multiple_newlines() {
+            run_test_case(
+                b"continuation\nmore lines\n",
+                "previous: ",
+                "",
+                &["previous: continuation", "more lines"],
+                LineParsingOptions::default(),
+            );
+        }
 
-        run_test_case(
-            "Test 7: Invalid UTF8 data",
-            b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n",
-            "",
-            "",
-            &["valid utf8�(�� invalid utf8"],
-            LineParsingOptions::default(),
-        );
+        #[test]
+        fn invalid_utf8_data() {
+            run_test_case(
+                b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n",
+                "",
+                "",
+                &["valid utf8�(�� invalid utf8"],
+                LineParsingOptions::default(),
+            );
+        }
 
-        run_test_case(
-            "Test 8 - Rest of too long line is dropped",
-            b"123456789\nabcdefghi\n",
-            "",
-            "",
-            &["1234", "abcd"],
-            LineParsingOptions {
-                max_line_length: NumBytes(4), // Only allow lines with 4 ascii chars (or equiv.) max.
-                overflow_behavior: LineOverflowBehavior::DropAdditionalData,
-            },
-        );
+        #[test]
+        fn rest_of_too_long_line_is_dropped() {
+            run_test_case(
+                b"123456789\nabcdefghi\n",
+                "",
+                "",
+                &["1234", "abcd"],
+                LineParsingOptions {
+                    max_line_length: NumBytes(4), // Only allow lines with 4 ascii chars (or equiv.) max.
+                    overflow_behavior: LineOverflowBehavior::DropAdditionalData,
+                },
+            );
+        }
 
-        run_test_case(
-            "Test 9 - Rest of too long line is returned as additional lines",
-            b"123456789\nabcdefghi\n",
-            "",
-            "",
-            &["1234", "5678", "9", "abcd", "efgh", "i"],
-            LineParsingOptions {
-                max_line_length: NumBytes(4), // Only allow lines with 4 ascii chars (or equiv.) max.
-                overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
-            },
-        );
+        #[test]
+        fn rest_of_too_long_line_is_returned_as_additional_lines() {
+            run_test_case(
+                b"123456789\nabcdefghi\n",
+                "",
+                "",
+                &["1234", "5678", "9", "abcd", "efgh", "i"],
+                LineParsingOptions {
+                    max_line_length: NumBytes(4), // Only allow lines with 4 ascii chars (or equiv.) max.
+                    overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
+                },
+            );
+        }
 
-        run_test_case(
-            "Test 10 - max line length of 0 disables line length checks #1",
-            b"123456789\nabcdefghi\n",
-            "",
-            "",
-            &["123456789", "abcdefghi"],
-            LineParsingOptions {
-                max_line_length: NumBytes(0),
-                overflow_behavior: LineOverflowBehavior::DropAdditionalData,
-            },
-        );
+        #[test]
+        fn max_line_length_of_0_disables_line_length_checks_test1() {
+            run_test_case(
+                b"123456789\nabcdefghi\n",
+                "",
+                "",
+                &["123456789", "abcdefghi"],
+                LineParsingOptions {
+                    max_line_length: NumBytes(0),
+                    overflow_behavior: LineOverflowBehavior::DropAdditionalData,
+                },
+            );
+        }
 
-        run_test_case(
-            "Test 11 - max line length of 0 disables line length checks #2",
-            b"123456789\nabcdefghi\n",
-            "",
-            "",
-            &["123456789", "abcdefghi"],
-            LineParsingOptions {
-                max_line_length: NumBytes(0),
-                overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
-            },
-        );
+        #[test]
+        fn max_line_length_of_0_disables_line_length_checks_test2() {
+            run_test_case(
+                b"123456789\nabcdefghi\n",
+                "",
+                "",
+                &["123456789", "abcdefghi"],
+                LineParsingOptions {
+                    max_line_length: NumBytes(0),
+                    overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
+                },
+            );
+        }
+
+        #[test]
+        fn leading_and_trailing_whitespace_is_preserved() {
+            run_test_case(
+                b"   123456789     \n    abcdefghi        \n",
+                "",
+                "",
+                &["   123456789     ", "    abcdefghi        "],
+                LineParsingOptions {
+                    max_line_length: NumBytes(0),
+                    overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
+                },
+            );
+        }
     }
 }
