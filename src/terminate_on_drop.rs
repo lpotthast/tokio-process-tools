@@ -1,6 +1,6 @@
-use crate::process_handle::ProcessHandle;
 use crate::OutputStream;
-use std::ops::Deref;
+use crate::process_handle::ProcessHandle;
+use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
 /// A wrapper that automatically terminates a process when dropped.
@@ -39,6 +39,12 @@ impl<O: OutputStream> Deref for TerminateOnDrop<O> {
 
     fn deref(&self) -> &Self::Target {
         &self.process_handle
+    }
+}
+
+impl<O: OutputStream> DerefMut for TerminateOnDrop<O> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.process_handle
     }
 }
 

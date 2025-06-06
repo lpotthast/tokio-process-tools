@@ -451,11 +451,11 @@ impl SingleSubscriberOutputStream {
 
 #[cfg(test)]
 mod tests {
+    use crate::LineParsingOptions;
     use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, FromStreamOptions, Next};
     use crate::single_subscriber::read_chunked;
-    use crate::LineParsingOptions;
     use assertr::prelude::*;
     use mockall::{automock, predicate};
     use std::io::{Read, Seek, SeekFrom, Write};
