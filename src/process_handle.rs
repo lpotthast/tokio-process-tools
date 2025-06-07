@@ -296,7 +296,10 @@ impl<O: OutputStream> ProcessHandle<O> {
     pub fn is_running(&mut self) -> RunningState {
         match self.child.try_wait() {
             Ok(None) => RunningState::Running,
-            Ok(Some(exit_status)) => RunningState::Terminated(exit_status),
+            Ok(Some(exit_status)) => {
+                self.must_not_be_terminated();
+                RunningState::Terminated(exit_status)
+            }
             Err(err) => RunningState::Uncertain(err),
         }
     }
