@@ -8,13 +8,14 @@ use crate::output_stream::{
     BackpressureControl, Chunk, FromStreamOptions, LineReader, Next, OutputStream,
 };
 use crate::{InspectorError, LineParsingOptions};
+use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 
@@ -245,7 +246,7 @@ impl SingleSubscriberOutputStream {
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines(
         &mut self,
-        mut f: impl FnMut(String) -> Next + Send + 'static,
+        mut f: impl FnMut(Cow<'_, str>) -> Next + Send + 'static,
         options: LineParsingOptions,
     ) -> Inspector {
         let mut receiver = self.take_receiver();
@@ -259,7 +260,7 @@ impl SingleSubscriberOutputStream {
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines_async<Fut>(
         &mut self,
-        mut f: impl FnMut(String) -> Fut + Send + 'static,
+        mut f: impl FnMut(Cow<'_, str>) -> Fut + Send + 'static,
         options: LineParsingOptions,
     ) -> Inspector
     where
@@ -308,7 +309,7 @@ impl SingleSubscriberOutputStream {
     pub fn collect_lines<S: Sink>(
         &mut self,
         into: S,
-        collect: impl Fn(String, &mut S) -> Next + Send + 'static,
+        collect: impl Fn(Cow<'_, str>, &mut S) -> Next + Send + 'static,
         options: LineParsingOptions,
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
@@ -329,7 +330,7 @@ impl SingleSubscriberOutputStream {
     ) -> Collector<S>
     where
         S: Sink,
-        F: Fn(String, &mut S) -> AsyncCollectFn<'_> + Send + Sync + 'static,
+        F: for<'a> Fn(Cow<'a, str>, &'a mut S) -> AsyncCollectFn<'a> + Send + Sync + 'static,
     {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
@@ -351,7 +352,7 @@ impl SingleSubscriberOutputStream {
         self.collect_lines(
             Vec::new(),
             |line, vec| {
-                vec.push(line);
+                vec.push(line.into_owned());
                 Next::Continue
             },
             options,
@@ -425,7 +426,7 @@ impl SingleSubscriberOutputStream {
     >(
         &mut self,
         write: W,
-        mapper: impl Fn(String) -> B + Send + Sync + Copy + 'static,
+        mapper: impl Fn(Cow<'_, str>) -> B + Send + Sync + Copy + 'static,
         options: LineParsingOptions,
     ) -> Collector<W> {
         self.collect_lines_async(
@@ -452,7 +453,7 @@ impl SingleSubscriberOutputStream {
     /// This method blocks until a line is found that satisfies the predicate.
     pub async fn wait_for_line(
         &mut self,
-        predicate: impl Fn(String) -> bool + Send + Sync + 'static,
+        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
     ) {
         let inspector = self.inspect_lines(
@@ -480,7 +481,7 @@ impl SingleSubscriberOutputStream {
     /// Returns `Ok(())` if a matching line is found, or `Err(Elapsed)` if the timeout expires.
     pub async fn wait_for_line_with_timeout(
         &mut self,
-        predicate: impl Fn(String) -> bool + Send + Sync + 'static,
+        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
         timeout: Duration,
     ) -> Result<(), Elapsed> {
@@ -490,11 +491,11 @@ impl SingleSubscriberOutputStream {
 
 #[cfg(test)]
 mod tests {
-    use crate::LineParsingOptions;
     use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, FromStreamOptions, Next};
     use crate::single_subscriber::read_chunked;
+    use crate::LineParsingOptions;
     use assertr::prelude::*;
     use mockall::{automock, predicate};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -551,7 +552,7 @@ mod tests {
         );
 
         let inspector = os.inspect_lines_async(
-            async |_line| {
+            |_line| async move {
                 // Mimic a slow consumer.
                 sleep(Duration::from_millis(100)).await;
                 Next::Continue
@@ -622,7 +623,7 @@ mod tests {
 
         let inspector = os.inspect_lines(
             move |line| {
-                mock.visit(line);
+                mock.visit(line.into_owned());
                 Next::Continue
             },
             LineParsingOptions::default(),
@@ -656,10 +657,10 @@ mod tests {
             move |line, seen: &mut Vec<String>| {
                 Box::pin(async move {
                     if line == "break" {
-                        seen.push(line);
+                        seen.push(line.into_owned());
                         Next::Break
                     } else {
-                        seen.push(line);
+                        seen.push(line.into_owned());
                         Next::Continue
                     }
                 })

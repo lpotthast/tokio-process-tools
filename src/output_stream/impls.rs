@@ -34,8 +34,7 @@ macro_rules! impl_inspect_lines {
                         Some(chunk) => {
                             let lr = LineReader::new(chunk.as_ref(), &mut line_buffer, $options);
                             for line in lr {
-                                // TODO: Pass Cow instead of String.
-                                let line = String::from_utf8_lossy(&line).to_string();
+                                let line = String::from_utf8_lossy(&line);
                                 let next = $f(line);
                                 if next == Next::Break {
                                     break 'outer;
@@ -44,8 +43,7 @@ macro_rules! impl_inspect_lines {
                         }
                         None => {
                             if !line_buffer.is_empty() {
-                                // TODO: Pass Cow instead of String.
-                                $f(String::from_utf8_lossy(&line_buffer).to_string());
+                                $f(String::from_utf8_lossy(&line_buffer));
                             }
                             break 'outer;
                         }
@@ -69,8 +67,7 @@ macro_rules! impl_inspect_lines_async {
                         Some(chunk) => {
                             let lr = LineReader::new(chunk.as_ref(), &mut line_buffer, $options);
                             for line in lr {
-                                // TODO: Pass Cow instead of String.
-                                let line = String::from_utf8_lossy(&line).to_string();
+                                let line = String::from_utf8_lossy(&line);
                                 match $f(line).await {
                                     Next::Continue => {}
                                     Next::Break => break 'outer,
@@ -79,8 +76,7 @@ macro_rules! impl_inspect_lines_async {
                         }
                         None => {
                             if !line_buffer.is_empty() {
-                                // TODO: Pass Cow instead of String.
-                                $f(String::from_utf8_lossy(&line_buffer).to_string());
+                                $f(String::from_utf8_lossy(&line_buffer));
                             }
                             break 'outer;
                         }
@@ -131,8 +127,7 @@ macro_rules! impl_collect_lines {
                             let sink = &mut *write_guard;
                             let lr = LineReader::new(chunk.as_ref(), &mut line_buffer, $options);
                             for line in lr {
-                                // TODO: Pass Cow instead of String.
-                                let line = String::from_utf8_lossy(&line).to_string();
+                                let line = String::from_utf8_lossy(&line);
                                 match $collect(line, sink) {
                                     Next::Continue => {}
                                     Next::Break => break 'outer,
@@ -198,8 +193,7 @@ macro_rules! impl_collect_lines_async {
                             let sink = &mut *write_guard;
                             let lr = LineReader::new(chunk.as_ref(), &mut line_buffer, $options);
                             for line in lr {
-                                // TODO: Pass Cow instead of String.
-                                let line = String::from_utf8_lossy(&line).to_string();
+                                let line = String::from_utf8_lossy(&line);
                                 match $collect(line, sink).await {
                                     Next::Continue => {},
                                     Next::Break => {
@@ -213,7 +207,7 @@ macro_rules! impl_collect_lines_async {
                             if !line_buffer.is_empty() {
                                 let mut write_guard = $sink.write().await;
                                 let sink = &mut *write_guard;
-                                match $collect(String::from_utf8_lossy(&line_buffer).to_string(), sink).await {
+                                match $collect(String::from_utf8_lossy(&line_buffer), sink).await {
                                     Next::Continue | Next::Break => {
                                         /* irrelevant, we always break on EOF */
                                     }
