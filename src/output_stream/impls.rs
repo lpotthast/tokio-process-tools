@@ -194,7 +194,6 @@ macro_rules! impl_collect_lines_async {
                 $handler!('outer, $receiver, term_sig_rx, |maybe_chunk| {
                     match maybe_chunk {
                         Some(chunk) => {
-                            tracing::info!("chunk: {:?}", chunk);
                             let mut write_guard = $sink.write().await;
                             let sink = &mut *write_guard;
                             let lr = LineReader::new(chunk.as_ref(), &mut line_buffer, $options);
@@ -204,12 +203,10 @@ macro_rules! impl_collect_lines_async {
                                 match $collect(line, sink).await {
                                     Next::Continue => {},
                                     Next::Break => {
-                                        tracing::info!("break");
                                         break 'outer
                                     },
                                 }
                             }
-                            tracing::info!("end of  chunk processing");
                         }
                         None => {
                             // EOF reached.

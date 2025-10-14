@@ -6,12 +6,17 @@ use thiserror::Error;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
+/// Errors that can occur when collecting stream data.
 #[derive(Debug, Error)]
 pub enum CollectorError {
+    /// The collector task could not be joined/terminated.
     #[error("The collector task could not be joined/terminated: {0}")]
     TaskJoin(#[source] tokio::task::JoinError),
 }
 
+/// A trait for types that can act as sinks for collected stream data.
+///
+/// This is automatically implemented for any type that is `Debug + Send + Sync + 'static`.
 pub trait Sink: Debug + Send + Sync + 'static {}
 
 impl<T> Sink for T where T: Debug + Send + Sync + 'static {}
