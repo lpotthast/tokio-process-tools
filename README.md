@@ -346,7 +346,7 @@ async fn test_server_responds() {
 
 ```rust ,no_run
 #[tokio::test(flavor = "multi_thread")]
-fn test() {
+async fn test() {
     // ...
 }
 ```
