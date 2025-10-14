@@ -43,8 +43,8 @@ tokio = { version = "1", features = ["process", "sync", "io-util", "rt-multi-thr
 ### Basic: Spawn and Collect Output
 
 ```rust ,no_run
-use tokio_process_tools::*;
 use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
+use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
@@ -66,9 +66,8 @@ async fn main() {
 ### Monitor Output in Real-Time
 
 ```rust ,no_run
-use std::time::Duration;
-use tokio_process_tools::*;
 use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
+use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
@@ -102,9 +101,8 @@ async fn main() {
 Perfect for integration tests or ensuring services are ready:
 
 ```rust ,no_run
-use tokio_process_tools::*;
 use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
-use std::time::Duration;
+use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
@@ -136,8 +134,8 @@ async fn main() {
 ### Multiple Consumers (using BroadcastOutputStream)
 
 ```rust ,no_run
-use tokio_process_tools::*;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
+use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
@@ -186,8 +184,8 @@ async fn main() {
 When you only need one consumer per stream, use `SingleSubscriberOutputStream`:
 
 ```rust ,no_run
-use tokio_process_tools::*;
 use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
+use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
@@ -217,8 +215,8 @@ async fn main() {
 
 ```rust ,no_run
 use std::time::Duration;
-use tokio_process_tools::*;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
+use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
@@ -247,9 +245,8 @@ async fn process_line_in_database(line: &str) {
 ### Timeout with Automatic Termination
 
 ```rust ,no_run
-use tokio_process_tools::*;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
-use std::time::Duration;
+use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
@@ -275,8 +272,8 @@ The `LineParsingOptions` type controls how data is read from stdout/stderr strea
 
 ```rust ,no_run
 use tokio::process::Command;
-use tokio_process_tools::*;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
+use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
@@ -319,8 +316,8 @@ The logic of a graceful termination attempt goes like this:
 Perfect for integration tests:
 
 ```rust ,no_run
-use tokio_process_tools::*;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
+use tokio_process_tools::*;
 
 #[tokio::test]
 async fn test_server_responds() {
@@ -356,7 +353,6 @@ async fn test() {
 ### Automatic Termination on Drop
 
 ```rust ,no_run
-use std::time::Duration;
 use tokio::process::Command;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
 use tokio_process_tools::*;
@@ -384,10 +380,10 @@ use tokio_process_tools::*;
 async fn main() {
     let cmd = Command::new("some-command");
     let process = ProcessHandle::<BroadcastOutputStream>::spawn("cmd", cmd).unwrap();
-    
+
     #[derive(Debug)]
     struct MyCollector {}
-    
+
     impl MyCollector {
         fn process_line(&mut self, line: String) {
             dbg!(line);
@@ -410,10 +406,12 @@ async fn main() {
 
 ### Mapped Output
 
+Transform output before writing into sink supporting the returned by the map closure.
+
 ```rust ,no_run
 use tokio::process::Command;
-use tokio_process_tools::*;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
+use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
@@ -421,8 +419,7 @@ async fn main() {
     let process = ProcessHandle::<BroadcastOutputStream>::spawn("cmd", cmd).unwrap();
 
     let logs = Vec::new();
-    
-    // Transform output before writing
+
     let collector = process.stdout().collect_lines_into_write_mapped(
         logs, // We could also use a file handle here!
         |line| format!("[stdout] {line}\n"),
