@@ -76,10 +76,14 @@ pub enum BackpressureControl {
 
 /// Control flag to indicate whether processing should continue or break.
 ///
-/// Returning `Break` from an `Inspector` will let that inspector stop.
+/// Returning `Break` from an `Inspector`/`Collector` will let that instance stop visiting any
+/// more data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Next {
+    /// Interested in receiving additional data.
     Continue,
+
+    /// Not interested in receiving additional data. Will let the `inspector`/`collector` stop.
     Break,
 }
 

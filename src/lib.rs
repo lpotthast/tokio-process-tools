@@ -1,22 +1,69 @@
+#![warn(missing_docs)]
+
+//! Spawn and control tokio processes.
+//!
+//! - Await natural termination of a process.
+//! - Explicitly terminate a process.
+//! - Safely consume the processes stdout and stderr streams.
+//! - Conveniently collect all streams while waiting for process completion.
+//!
+//! ```
+//! use tokio::process::Command;
+//! use tokio_process_tools::*;
+//! use tokio_process_tools::broadcast::BroadcastOutputStream;
+//! use assertr::prelude::*;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let cmd = Command::new("ls");
+//!     let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("ls", cmd)
+//!         .expect("Failed to spawn `ls` command");
+//!    process.
+//!     let Output {
+//!         status,
+//!         stdout,
+//!         stderr,
+//!     } = process
+//!         .wait_for_completion_with_output(None, LineParsingOptions::default())
+//!         .await
+//!         .unwrap();
+//!     assert_that(status.success()).is_true();
+//!     assert_that(stdout).is_equal_to(&[
+//!         "Cargo.lock",
+//!         "Cargo.toml",
+//!         "LICENSE-APACHE",
+//!         "LICENSE-MIT",
+//!         "README.md",
+//!         "src",
+//!         "target",
+//!     ]);
+//!     assert_that(stderr).is_empty();
+//! }
+//! ```
+
 mod collector;
 mod inspector;
+mod output;
 mod output_stream;
 mod panic_on_drop;
 mod process_handle;
 mod signal;
 mod terminate_on_drop;
 
+/* public exports */
 pub use collector::{Collector, CollectorError, Sink};
 pub use inspector::{Inspector, InspectorError};
+pub use output::Output;
 pub use output_stream::{
     LineOverflowBehavior, LineParsingOptions, Next, NumBytes, NumBytesExt, OutputStream, broadcast,
     single_subscriber,
 };
-pub use process_handle::{ProcessHandle, RunningState, TerminationError};
+pub use process_handle::{ProcessHandle, RunningState, TerminationError, WaitError};
 pub use terminate_on_drop::TerminateOnDrop;
 
 #[cfg(test)]
 mod test {
+    use crate::output::Output;
     use crate::output_stream::broadcast::BroadcastOutputStream;
     use crate::{LineParsingOptions, ProcessHandle, RunningState};
     use assertr::prelude::*;
@@ -28,8 +75,12 @@ mod test {
         let cmd = Command::new("ls");
         let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("ls", cmd)
             .expect("Failed to spawn `ls` command");
-        let (status, stdout, stderr) = process
-            .wait_with_output(LineParsingOptions::default())
+        let Output {
+            status,
+            stdout,
+            stderr,
+        } = process
+            .wait_for_completion_with_output(None, LineParsingOptions::default())
             .await
             .unwrap();
         assert_that(status.success()).is_true();

@@ -21,7 +21,8 @@ use tokio::time::error::Elapsed;
 ///
 /// This is the broadcast variant, allowing for multiple simultaneous consumers with the downside
 /// of inducing memory allocations not required when only one consumer is listening.
-/// For that case, prefer using the `output_stream::single_subscriber::SingleOutputSteam`.
+/// For that case, prefer using the
+/// [crate::output_stream::single_subscriber::SingleSubscriberOutputStream].
 pub struct BroadcastOutputStream {
     /// The task that captured a clone of our `broadcast::Sender` and is now asynchronously
     /// awaiting new output from the underlying stream, sending it to all registered receivers.

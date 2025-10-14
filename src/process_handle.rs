@@ -1,3 +1,4 @@
+use crate::output::Output;
 use crate::output_stream::broadcast::BroadcastOutputStream;
 use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
 use crate::output_stream::{BackpressureControl, FromStreamOptions};
@@ -66,6 +67,9 @@ impl From<RunningState> for bool {
 pub enum WaitError {
     #[error("A general io error occurred")]
     IoError(#[from] io::Error),
+
+    #[error("Could not terminate process")]
+    TerminationError(#[from] TerminationError),
 
     #[error("Collector failed")]
     CollectorFailed(#[from] CollectorError),
@@ -148,18 +152,68 @@ impl ProcessHandle<BroadcastOutputStream> {
         this
     }
 
-    pub async fn wait_with_output(
+    /// Convenience function, waiting for the process to complete using
+    /// [ProcessHandle::wait_for_completion] while collecting both `stdout` and `stderr`
+    /// into individual `Vec<String>` collections using the provided [LineParsingOptions].
+    ///
+    /// You may want to destructure this using:
+    /// ```no_run
+    /// # use tokio_process_tools::*;
+    /// # use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
+    /// # tokio_test::block_on(async {
+    /// # let mut proc = ProcessHandle::<SingleSubscriberOutputStream>::spawn("cmd", tokio::process::Command::new("ls")).unwrap();
+    /// let Output {
+    ///     status,
+    ///     stdout,
+    ///     stderr
+    /// } = proc.wait_for_completion_with_output(None, LineParsingOptions::default()).await.unwrap();
+    /// # });
+    /// ```
+    pub async fn wait_for_completion_with_output(
         &mut self,
+        timeout: Option<Duration>,
         options: LineParsingOptions,
-    ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
-        let out_collector = self.std_out_stream.collect_lines_into_vec(options);
-        let err_collector = self.std_err_stream.collect_lines_into_vec(options);
+    ) -> Result<Output, WaitError> {
+        let out_collector = self.stdout().collect_lines_into_vec(options);
+        let err_collector = self.stderr().collect_lines_into_vec(options);
 
-        let status = self.wait().await?;
-        let std_out = out_collector.cancel().await?;
-        let std_err = err_collector.cancel().await?;
+        let status = self.wait_for_completion(timeout).await?;
 
-        Ok((status, std_out, std_err))
+        let stdout = out_collector.wait().await?;
+        let stderr = err_collector.wait().await?;
+
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Convenience function, waiting for the process to complete using
+    /// [ProcessHandle::wait_for_completion_or_terminate] while collecting both `stdout` and `stderr`
+    /// into individual `Vec<String>` collections using the provided [LineParsingOptions].
+    pub async fn wait_for_completion_with_output_or_terminate(
+        &mut self,
+        wait_timeout: Duration,
+        interrupt_timeout: Duration,
+        terminate_timeout: Duration,
+        options: LineParsingOptions,
+    ) -> Result<Output, WaitError> {
+        let out_collector = self.stdout().collect_lines_into_vec(options);
+        let err_collector = self.stderr().collect_lines_into_vec(options);
+
+        let status = self
+            .wait_for_completion_or_terminate(wait_timeout, interrupt_timeout, terminate_timeout)
+            .await?;
+
+        let stdout = out_collector.wait().await?;
+        let stderr = err_collector.wait().await?;
+
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
     }
 }
 
@@ -233,18 +287,68 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
         this
     }
 
-    pub async fn wait_with_output(
+    /// Convenience function, waiting for the process to complete using
+    /// [ProcessHandle::wait_for_completion] while collecting both `stdout` and `stderr`
+    /// into individual `Vec<String>` collections using the provided [LineParsingOptions].
+    ///
+    /// You may want to destructure this using:
+    /// ```no_run
+    /// # use tokio_process_tools::*;
+    /// # use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
+    /// # tokio_test::block_on(async {
+    /// # let mut proc = ProcessHandle::<SingleSubscriberOutputStream>::spawn("cmd", tokio::process::Command::new("ls")).unwrap();
+    /// let Output {
+    ///     status,
+    ///     stdout,
+    ///     stderr
+    /// } = proc.wait_for_completion_with_output(None, LineParsingOptions::default()).await.unwrap();
+    /// # });
+    /// ```
+    pub async fn wait_for_completion_with_output(
         &mut self,
+        timeout: Option<Duration>,
         options: LineParsingOptions,
-    ) -> Result<(ExitStatus, Vec<String>, Vec<String>), WaitError> {
-        let out_collector = self.std_out_stream.collect_lines_into_vec(options);
-        let err_collector = self.std_err_stream.collect_lines_into_vec(options);
+    ) -> Result<Output, WaitError> {
+        let out_collector = self.stdout_mut().collect_lines_into_vec(options);
+        let err_collector = self.stderr_mut().collect_lines_into_vec(options);
 
-        let status = self.wait().await?;
-        let std_out = out_collector.cancel().await?;
-        let std_err = err_collector.cancel().await?;
+        let status = self.wait_for_completion(timeout).await?;
 
-        Ok((status, std_out, std_err))
+        let stdout = out_collector.wait().await?;
+        let stderr = err_collector.wait().await?;
+
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Convenience function, waiting for the process to complete using
+    /// [ProcessHandle::wait_for_completion_or_terminate] while collecting both `stdout` and `stderr`
+    /// into individual `Vec<String>` collections using the provided [LineParsingOptions].
+    pub async fn wait_for_completion_with_output_or_terminate(
+        &mut self,
+        wait_timeout: Duration,
+        interrupt_timeout: Duration,
+        terminate_timeout: Duration,
+        options: LineParsingOptions,
+    ) -> Result<Output, WaitError> {
+        let out_collector = self.stdout_mut().collect_lines_into_vec(options);
+        let err_collector = self.stderr_mut().collect_lines_into_vec(options);
+
+        let status = self
+            .wait_for_completion_or_terminate(wait_timeout, interrupt_timeout, terminate_timeout)
+            .await?;
+
+        let stdout = out_collector.wait().await?;
+        let stderr = err_collector.wait().await?;
+
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
     }
 }
 
@@ -307,6 +411,7 @@ impl<O: OutputStream> ProcessHandle<O> {
     pub fn stdout(&self) -> &O {
         &self.std_out_stream
     }
+
     pub fn stdout_mut(&mut self) -> &mut O {
         &mut self.std_out_stream
     }
@@ -337,11 +442,11 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// after calling this method, a panic will occur with a descriptive message
     /// to inform about the incorrect usage.
     pub fn must_be_terminated(&mut self) {
-        self.panic_on_drop = Some(PanicOnDrop {
-            resource_name: "ProcessHandle".into(),
-            details: "Call `terminate()` before the type is dropped!".into(),
-            armed: true,
-        });
+        self.panic_on_drop = Some(PanicOnDrop::new(
+            "tokio_process_tools::ProcessHandle",
+            "The process was not terminated.",
+            "Call `wait_for_completion` or `terminate` before the type is dropped!",
+        ));
     }
 
     pub fn must_not_be_terminated(&mut self) {
@@ -383,13 +488,18 @@ impl<O: OutputStream> ProcessHandle<O> {
 
     /// Terminates this process by sending a `SIGINT`, `SIGTERM` or even a `SIGKILL` if the process
     /// doesn't run to completion after receiving any of the first two signals.
+    ///
+    /// This handle can be dropped safely after this call returned, no matter the outcome.
+    /// We accept that in extremely rare cases, failed `SIGKILL`, a rogue process may be left over.
     pub async fn terminate(
         &mut self,
         interrupt_timeout: Duration,
         terminate_timeout: Duration,
     ) -> Result<ExitStatus, TerminationError> {
-        // Whether or not this function will ultimately succeed, we tried to terminate the process.
-        // Dropping this handle should not create any on-drop error anymore.
+        // Whether or not this function will ultimately succeed, we tried our best to terminate
+        // this process.
+        // Dropping this handle should not create any on-drop panic anymore.
+        // We accept that in extremely rare cases, failed `kill`, a rogue process may be left over.
         self.must_not_be_terminated();
 
         self.send_interrupt_signal()
@@ -467,13 +577,16 @@ impl<O: OutputStream> ProcessHandle<O> {
         }
     }
 
+    /// Forces the process to exit. Most users should call [ProcessHandle::terminate] instead.
+    ///
+    /// This is equivalent to sending a SIGKILL on unix platforms followed by wait.
     pub async fn kill(&mut self) -> io::Result<()> {
         self.child.kill().await
     }
 
     /// Successfully awaiting the completion of the process will unset the
     /// "must be terminated" setting, as a successfully awaited process is already terminated.
-    /// Dropping this `ProcessHandle` after calling `wait` should never lead to a
+    /// Dropping this `ProcessHandle` after successfully calling `wait` should never lead to a
     /// "must be terminated" panic being raised.
     async fn wait(&mut self) -> io::Result<ExitStatus> {
         match self.child.wait().await {
@@ -486,6 +599,15 @@ impl<O: OutputStream> ProcessHandle<O> {
     }
 
     /// Wait for this process to run to completion. Within `timeout`, if set, or unbound otherwise.
+    ///
+    /// If the timeout is reached before the process terminated, an error is returned but the
+    /// process remains untouched / keeps running.
+    /// Use [ProcessHandle::wait_for_completion_or_terminate] if you want immediate termination.
+    ///
+    /// This does not provide the processes output. You can take a look at the convenience function
+    /// [ProcessHandle::<BroadcastOutputStream>::wait_for_completion_with_output] to see
+    /// how the [ProcessHandle::stdout] and [ProcessHandle::stderr] streams (also available in
+    /// *_mut variants) can be used to inspect / watch over / capture the processes output.
     pub async fn wait_for_completion(
         &mut self,
         timeout: Option<Duration>,
@@ -499,6 +621,13 @@ impl<O: OutputStream> ProcessHandle<O> {
         }
     }
 
+    /// Wait for this process to run to completion within `timeout`.
+    ///
+    /// If the timeout is reached before the process terminated normally, external termination of
+    /// the process is forced through [ProcessHandle::terminate].
+    ///
+    /// Note that this function may return `Ok` even though the timeout was reached, carrying the
+    /// exit status received after sending a termination signal!
     pub async fn wait_for_completion_or_terminate(
         &mut self,
         wait_timeout: Duration,
