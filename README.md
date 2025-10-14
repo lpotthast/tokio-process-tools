@@ -2,8 +2,6 @@
 
 A powerful library for spawning and managing processes in the Tokio runtime with advanced output handling capabilities.
 
-## Why?
-
 When working with child processes in async Rust, you often need to:
 
 - **Monitor output in real-time** without blocking
@@ -44,13 +42,13 @@ tokio = { version = "1", features = ["process", "sync", "io-util", "rt-multi-thr
 
 ### Basic: Spawn and Collect Output
 
-```rust
+```rust ,no_run
 use tokio_process_tools::*;
 use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
 
 #[tokio::main]
 async fn main() {
-    let cmd = tokio::process::Command::new("ls");
+    let mut cmd = tokio::process::Command::new("ls");
     let mut process = ProcessHandle::<SingleSubscriberOutputStream>::spawn("ls", cmd)
         .expect("Failed to spawn command");
 
@@ -67,22 +65,22 @@ async fn main() {
 
 ### Monitor Output in Real-Time
 
-```rust
+```rust ,no_run
+use std::time::Duration;
 use tokio_process_tools::*;
 use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
 
 #[tokio::main]
 async fn main() {
-    let cmd = tokio::process::Command::new("tail")
-        .arg("-f")
-        .arg("/var/log/app.log");
+    let mut cmd = tokio::process::Command::new("tail");
+    cmd.arg("-f").arg("/var/log/app.log");
 
     let mut process = ProcessHandle::<SingleSubscriberOutputStream>::spawn("tail", cmd).unwrap();
 
     // Inspect output in real-time
-    let _stdout_monitor = process.stdout().inspect_lines(
+    let _stdout_monitor = process.stdout_mut().inspect_lines(
         |line| {
-            println!("LOG: {}", line);
+            println!("stdout: {line}");
             Next::Continue
         },
         LineParsingOptions::default()
@@ -103,18 +101,18 @@ async fn main() {
 
 Perfect for integration tests or ensuring services are ready:
 
-```rust
+```rust ,no_run
 use tokio_process_tools::*;
 use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    let cmd = tokio::process::Command::new("my-web-server");
+    let mut cmd = tokio::process::Command::new("my-web-server");
     let mut process = ProcessHandle::<SingleSubscriberOutputStream>::spawn("server", cmd).unwrap();
 
     // Wait for the server to be ready
-    match process.stdout().wait_for_line_with_timeout(
+    match process.stdout_mut().wait_for_line_with_timeout(
         |line| line.contains("Server listening on"),
         LineParsingOptions::default(),
         Duration::from_secs(30),
@@ -137,13 +135,13 @@ async fn main() {
 
 ### Multiple Consumers (using BroadcastOutputStream)
 
-```rust
+```rust ,no_run
 use tokio_process_tools::*;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
 
 #[tokio::main]
 async fn main() {
-    let cmd = tokio::process::Command::new("long-running-process");
+    let mut cmd = tokio::process::Command::new("long-running-process");
     let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("process", cmd).unwrap();
 
     // Consumer 1: Log to console
@@ -187,14 +185,14 @@ async fn main() {
 
 When you only need one consumer per stream, use `SingleSubscriberOutputStream`:
 
-```rust
+```rust ,no_run
 use tokio_process_tools::*;
 use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
 
 #[tokio::main]
 async fn main() {
-    let cmd = tokio::process::Command::new("cargo")
-        .arg("build");
+    let mut cmd = tokio::process::Command::new("cargo");
+    cmd.arg("build");
 
     let mut process = ProcessHandle::<SingleSubscriberOutputStream>::spawn("cargo", cmd).unwrap();
 
@@ -217,13 +215,14 @@ async fn main() {
 
 ### Async Output Processing
 
-```rust
+```rust ,no_run
+use std::time::Duration;
 use tokio_process_tools::*;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
 
 #[tokio::main]
 async fn main() {
-    let cmd = tokio::process::Command::new("data-processor");
+    let mut cmd = tokio::process::Command::new("data-processor");
     let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("processor", cmd).unwrap();
 
     // Process output asynchronously (e.g., send to database)
@@ -247,14 +246,14 @@ async fn process_line_in_database(line: &str) {
 
 ### Timeout with Automatic Termination
 
-```rust
+```rust ,no_run
 use tokio_process_tools::*;
 use tokio_process_tools::broadcast::BroadcastOutputStream;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    let cmd = tokio::process::Command::new("potentially-hanging-process");
+    let mut cmd = tokio::process::Command::new("potentially-hanging-process");
     let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("process", cmd).unwrap();
 
     // Automatically terminate if it takes too long
@@ -272,21 +271,25 @@ async fn main() {
 
 ### Custom Line Parsing
 
-```rust
+The `LineParsingOptions` type controls how data is read from stdout/stderr streams.
+
+```rust ,no_run
+use tokio::process::Command;
 use tokio_process_tools::*;
+use tokio_process_tools::broadcast::BroadcastOutputStream;
 
-// Configure line parsing behavior
-let options = LineParsingOptions {
-max_line_length: 1.megabytes(),  // Protect against memory exhaustion
-overflow_behavior: LineOverflowBehavior::DropAdditionalData,
-};
-
-// Use with any method that takes LineParsingOptions
-let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("cmd", cmd).unwrap();
-process.stdout().wait_for_line(
-| line| line.contains("Ready"),
-options,
-).await;
+#[tokio::main]
+async fn main() {
+    let mut cmd = Command::new("some-command");
+    let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("cmd", cmd).unwrap();
+    process.stdout().wait_for_line(
+        |line| line.contains("Ready"),
+        LineParsingOptions {
+            max_line_length: 1.megabytes(),  // Protect against memory exhaustion
+            overflow_behavior: LineOverflowBehavior::DropAdditionalData,
+        },
+    ).await;
+}
 ```
 
 ## Stream Types: Which to Choose?
@@ -305,24 +308,20 @@ options,
 
 ## Graceful Termination
 
-The library implements a graceful termination strategy:
+The logic of a graceful termination attempt goes like this:
 
-1. Send **SIGINT** (Ctrl+C equivalent) - wait for graceful shutdown
-2. If still running, send **SIGTERM** - request termination
-3. If still running, send **SIGKILL** - force termination
-
-```rust
-process.terminate(
-Duration::from_secs(5),   // SIGINT timeout
-Duration::from_secs(10),  // SIGTERM timeout
-).await?;
-```
+1. Send **SIGINT** (Ctrl+C equivalent) - wait for shutdown
+2. If still running, send **SIGTERM** - wait for shutdown
+3. If still running, send **SIGKILL** - wait for shutdown
 
 ## Testing with tokio-process-tools
 
 Perfect for integration tests:
 
-```rust
+```rust ,no_run
+use tokio_process_tools::*;
+use tokio_process_tools::broadcast::BroadcastOutputStream;
+
 #[tokio::test]
 async fn test_server_responds() {
     let cmd = tokio::process::Command::new("./target/debug/my-server");
@@ -345,52 +344,91 @@ async fn test_server_responds() {
 
 **Note**: If using `TerminateOnDrop`, tests must use:
 
-```rust
+```rust ,no_run
 #[tokio::test(flavor = "multi_thread")]
+fn test() {
+    // ...
+}
 ```
 
 ## Advanced Features
 
 ### Automatic Termination on Drop
 
-```rust
+```rust ,no_run
+use std::time::Duration;
+use tokio::process::Command;
+use tokio_process_tools::broadcast::BroadcastOutputStream;
 use tokio_process_tools::*;
 
-let process = ProcessHandle::<BroadcastOutputStream>::spawn("cmd", cmd)
-.unwrap()
-.terminate_on_drop(Duration::from_secs(3), Duration::from_secs(5));
+#[tokio::main]
+async fn main() {
+    let cmd = Command::new("some-command");
+    let process = ProcessHandle::<BroadcastOutputStream>::spawn("cmd", cmd)
+        .unwrap()
+        .terminate_on_drop(Duration::from_secs(3), Duration::from_secs(5));
 
-// Process automatically terminated when dropped
-// Requires multi-threaded runtime!
+    // Process is automatically terminated when dropped.
+    // Requires a multithreaded runtime!
+}
 ```
 
 ### Custom Collectors
 
-```rust
+```rust ,no_run
+use tokio::process::Command;
+use tokio_process_tools::broadcast::BroadcastOutputStream;
 use tokio_process_tools::*;
 
-// Collect into any type implementing the Sink trait
-let custom_collector = process.stdout().collect_lines(
-MyCustomStruct::new(),
-| line, custom| {
-custom.process_line(line);
-Next::Continue
-},
-LineParsingOptions::default ()
-);
+#[tokio::main]
+async fn main() {
+    let cmd = Command::new("some-command");
+    let process = ProcessHandle::<BroadcastOutputStream>::spawn("cmd", cmd).unwrap();
+    
+    #[derive(Debug)]
+    struct MyCollector {}
+    
+    impl MyCollector {
+        fn process_line(&mut self, line: String) {
+            dbg!(line);
+        }
+    }
 
-let result = custom_collector.wait().await.unwrap();
+    // Collect into any type implementing the Sink trait
+    let custom_collector = process.stdout().collect_lines(
+        MyCollector {},
+        |line, custom| {
+            custom.process_line(line);
+            Next::Continue
+        },
+        LineParsingOptions::default()
+    );
+
+    let result = custom_collector.wait().await.unwrap();
+}
 ```
 
 ### Mapped Output
 
-```rust
-// Transform output before writing
-let collector = process.stdout().collect_lines_into_write_mapped(
-log_file,
-| line| format!("[{}] {}\n", chrono::Utc::now(), line),
-LineParsingOptions::default ()
-);
+```rust ,no_run
+use tokio::process::Command;
+use tokio_process_tools::*;
+use tokio_process_tools::broadcast::BroadcastOutputStream;
+
+#[tokio::main]
+async fn main() {
+    let cmd = Command::new("some-command");
+    let process = ProcessHandle::<BroadcastOutputStream>::spawn("cmd", cmd).unwrap();
+
+    let logs = Vec::new();
+    
+    // Transform output before writing
+    let collector = process.stdout().collect_lines_into_write_mapped(
+        logs, // We could also use a file handle here!
+        |line| format!("[stdout] {line}\n"),
+        LineParsingOptions::default()
+    );
+}
 ```
 
 ## Platform Support

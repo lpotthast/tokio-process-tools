@@ -1,46 +1,8 @@
 #![warn(missing_docs)]
 
-//! Spawn and control tokio processes.
 //!
-//! - Await natural termination of a process.
-//! - Explicitly terminate a process.
-//! - Safely consume the processes stdout and stderr streams.
-//! - Conveniently collect all streams while waiting for process completion.
+#![doc = include_str!("../README.md")]
 //!
-//! ```
-//! use tokio::process::Command;
-//! use tokio_process_tools::*;
-//! use tokio_process_tools::broadcast::BroadcastOutputStream;
-//! use assertr::prelude::*;
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     let cmd = Command::new("ls");
-//!     let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("ls", cmd)
-//!         .expect("Failed to spawn `ls` command");
-//!
-//!     let Output {
-//!         status,
-//!         stdout,
-//!         stderr,
-//!     } = process
-//!         .wait_for_completion_with_output(None, LineParsingOptions::default())
-//!         .await
-//!         .unwrap();
-//!
-//!     assert_that(status.success()).is_true();
-//!     assert_that(stdout).is_equal_to(&[
-//!         "Cargo.lock",
-//!         "Cargo.toml",
-//!         "LICENSE-APACHE",
-//!         "LICENSE-MIT",
-//!         "README.md",
-//!         "src",
-//!         "target",
-//!     ]);
-//!     assert_that(stderr).is_empty();
-//! }
-//! ```
 
 mod collector;
 mod inspector;
