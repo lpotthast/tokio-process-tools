@@ -13,20 +13,28 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Child;
 
+/// Errors that can occur when terminating a process.
 #[derive(Debug, Error)]
 pub enum TerminationError {
+    /// Failed to send a signal to the process.
     #[error("Failed to send '{signal}' signal to process: {source}")]
     SignallingFailed {
+        /// The underlying IO error.
         source: io::Error,
+        /// The signal that could not be sent.
         signal: &'static str,
     },
 
+    /// Failed to terminate the process after trying all signals (SIGINT, SIGTERM, SIGKILL).
     #[error(
         "Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}"
     )]
     TerminationFailed {
+        /// Error from waiting after sending SIGINT.
         not_terminated_after_sigint: io::Error,
+        /// Error from waiting after sending SIGTERM.
         not_terminated_after_sigterm: io::Error,
+        /// Error from waiting after sending SIGKILL.
         not_terminated_after_sigkill: io::Error,
     },
 }
@@ -45,6 +53,7 @@ pub enum RunningState {
 }
 
 impl RunningState {
+    /// Returns `true` if the process is running, `false` otherwise.
     pub fn as_bool(&self) -> bool {
         match self {
             RunningState::Running => true,
@@ -65,16 +74,27 @@ impl From<RunningState> for bool {
 /// Errors that can occur when waiting for process output.
 #[derive(Debug, Error)]
 pub enum WaitError {
+    /// A general IO error occurred.
     #[error("A general io error occurred")]
     IoError(#[from] io::Error),
 
-    #[error("Could not terminate process")]
+    /// Could not terminate the process.
+    #[error("Could not terminate the process")]
     TerminationError(#[from] TerminationError),
 
-    #[error("Collector failed")]
+    /// Collector failed to collect output.
+    #[error("Collector failed to collect output")]
     CollectorFailed(#[from] CollectorError),
 }
 
+/// A handle to a spawned process with captured stdout/stderr streams.
+///
+/// This type provides methods for waiting on process completion, terminating the process,
+/// and accessing its output streams. By default, processes must be explicitly waited on
+/// or terminated before being dropped (see [`ProcessHandle::must_be_terminated`]).
+///
+/// If applicable, a process handle can be wrapped in a [`TerminateOnDrop`] to be terminated
+/// automatically upon being dropped. Note that this requires a multi-threaded runtime!
 #[derive(Debug)]
 pub struct ProcessHandle<O: OutputStream> {
     pub(crate) name: Cow<'static, str>,
@@ -85,6 +105,9 @@ pub struct ProcessHandle<O: OutputStream> {
 }
 
 impl ProcessHandle<BroadcastOutputStream> {
+    /// Spawns a new process with broadcast output streams.
+    ///
+    /// Uses a default channel capacity of 128 for both stdout and stderr.
     pub fn spawn(
         name: impl Into<Cow<'static, str>>,
         cmd: tokio::process::Command,
@@ -92,6 +115,7 @@ impl ProcessHandle<BroadcastOutputStream> {
         Self::spawn_with_capacity(name, cmd, 128, 128)
     }
 
+    /// Spawns a new process with broadcast output streams and custom channel capacities.
     pub fn spawn_with_capacity(
         name: impl Into<Cow<'static, str>>,
         mut cmd: tokio::process::Command,
@@ -218,6 +242,9 @@ impl ProcessHandle<BroadcastOutputStream> {
 }
 
 impl ProcessHandle<SingleSubscriberOutputStream> {
+    /// Spawns a new process with single subscriber output streams.
+    ///
+    /// Uses a default channel capacity of 128 for both stdout and stderr.
     pub fn spawn(
         name: impl Into<Cow<'static, str>>,
         cmd: tokio::process::Command,
@@ -225,6 +252,7 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
         Self::spawn_with_capacity(name, cmd, 128, 128)
     }
 
+    /// Spawns a new process with single subscriber output streams and custom channel capacities.
     pub fn spawn_with_capacity(
         name: impl Into<Cow<'static, str>>,
         mut cmd: tokio::process::Command,
@@ -392,10 +420,18 @@ impl<O: OutputStream> ProcessHandle<O> {
             .kill_on_drop(true)
     }
 
+    /// Returns the OS process ID if the process hasn't exited yet.
+    ///
+    /// Once this process has been polled to completion this will return None.
     pub fn id(&self) -> Option<u32> {
         self.child.id()
     }
 
+    /// Checks if the process is currently running.
+    ///
+    /// Returns [`RunningState::Running`] if the process is still running,
+    /// [`RunningState::Terminated`] if it has exited, or [`RunningState::Uncertain`]
+    /// if the state could not be determined.
     //noinspection RsSelfConvention
     pub fn is_running(&mut self) -> RunningState {
         match self.child.try_wait() {
@@ -408,18 +444,22 @@ impl<O: OutputStream> ProcessHandle<O> {
         }
     }
 
+    /// Returns a reference to the stdout stream.
     pub fn stdout(&self) -> &O {
         &self.std_out_stream
     }
 
+    /// Returns a mutable reference to the stdout stream.
     pub fn stdout_mut(&mut self) -> &mut O {
         &mut self.std_out_stream
     }
 
+    /// Returns a reference to the stderr stream.
     pub fn stderr(&self) -> &O {
         &self.std_err_stream
     }
 
+    /// Returns a mutable reference to the stderr stream.
     pub fn stderr_mut(&mut self) -> &mut O {
         &mut self.std_err_stream
     }
@@ -449,12 +489,17 @@ impl<O: OutputStream> ProcessHandle<O> {
         ));
     }
 
+    /// Disables the panic-on-drop safeguard, allowing the spawned process to be kept running
+    /// uncontrolled in the background, while this handle can safely be dropped.
     pub fn must_not_be_terminated(&mut self) {
         if let Some(mut it) = self.panic_on_drop.take() {
             it.defuse()
         }
     }
 
+    /// Wrap this process handle in a `TerminateOnDrop` instance, terminating the controlled process
+    /// automatically when this handle is dropped.
+    ///
     /// **SAFETY: This only works when your code is running in a multithreaded tokio runtime!**
     ///
     /// Prefer manual termination of the process or awaiting it and relying on the (automatically

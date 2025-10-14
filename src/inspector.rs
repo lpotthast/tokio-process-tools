@@ -2,8 +2,10 @@ use thiserror::Error;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
+/// Errors that can occur when inspecting stream data.
 #[derive(Debug, Error)]
 pub enum InspectorError {
+    /// The inspector task could not be joined/terminated.
     #[error("The inspector task could not be joined/terminated: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
 }

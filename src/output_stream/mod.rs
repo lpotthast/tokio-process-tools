@@ -1,8 +1,12 @@
 use bytes::{Buf, BytesMut};
 use std::io::BufRead;
 
+/// Broadcast output stream implementation supporting multiple concurrent consumers.
 pub mod broadcast;
+
 pub(crate) mod impls;
+
+/// Single subscriber output stream implementation for efficient single-consumer scenarios.
 pub mod single_subscriber;
 
 /// We support the following implementations:
@@ -50,7 +54,7 @@ impl Default for FromStreamOptions {
 /// complete logical unit with defined boundaries within a protocol or format. This we do not have
 /// here.
 ///
-/// Note: If the underlying stream is of lower buffer size, chunks of length `chunk_size` may
+/// Note: If the underlying stream is of lower buffer size, chunks of full `chunk_size` length may
 /// never be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Chunk(bytes::Bytes);
@@ -135,20 +139,33 @@ impl Default for LineParsingOptions {
     }
 }
 
+/// A wrapper type representing a number of bytes.
+///
+/// Use the [`NumBytesExt`] trait to conveniently create instances:
+/// ```
+/// use tokio_process_tools::NumBytesExt;
+/// let kb = 16.kilobytes();
+/// let mb = 2.megabytes();
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NumBytes(pub usize);
 
 impl NumBytes {
+    /// Creates a NumBytes value of zero.
     pub fn zero() -> Self {
         Self(0)
     }
 }
 
+/// Extension trait providing convenience-functions for creation of [`NumBytes`] of certain sizes.
 pub trait NumBytesExt {
+    /// Interprets the value as literal bytes.
     fn bytes(self) -> NumBytes;
 
+    /// Interprets the value as kilobytes (value * 1024).
     fn kilobytes(self) -> NumBytes;
 
+    /// Interprets the value as megabytes (value * 1024 * 1024).
     fn megabytes(self) -> NumBytes;
 }
 

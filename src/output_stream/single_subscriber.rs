@@ -175,6 +175,7 @@ async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
 }
 
 impl SingleSubscriberOutputStream {
+    /// Creates a new single subscriber output stream from an async read stream.
     pub fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
         stream: S,
         backpressure_control: BackpressureControl,
@@ -227,12 +228,20 @@ macro_rules! handle_subscription {
 
 // Impls for inspecting the output of the stream.
 impl SingleSubscriberOutputStream {
+    /// Inspects chunks of output from the stream without storing them.
+    ///
+    /// The provided closure is called for each chunk of data. Return [`Next::Continue`] to keep
+    /// processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_chunks(&mut self, f: impl Fn(Chunk) -> Next + Send + 'static) -> Inspector {
         let mut receiver = self.take_receiver();
         impl_inspect_chunks!(receiver, f, handle_subscription)
     }
 
+    /// Inspects lines of output from the stream without storing them.
+    ///
+    /// The provided closure is called for each line. Return [`Next::Continue`] to keep
+    /// processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines(
         &mut self,
@@ -243,6 +252,10 @@ impl SingleSubscriberOutputStream {
         impl_inspect_lines!(receiver, f, options, handle_subscription)
     }
 
+    /// Inspects lines of output from the stream without storing them, using an async closure.
+    ///
+    /// The provided async closure is called for each line. Return [`Next::Continue`] to keep
+    /// processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines_async<Fut>(
         &mut self,
@@ -259,6 +272,9 @@ impl SingleSubscriberOutputStream {
 
 // Impls for collecting the output of the stream.
 impl SingleSubscriberOutputStream {
+    /// Collects chunks from the stream into a sink.
+    ///
+    /// The provided closure is called for each chunk, with mutable access to the sink.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks<S: Sink>(
         &mut self,
@@ -270,6 +286,9 @@ impl SingleSubscriberOutputStream {
         impl_collect_chunks!(receiver, collect, sink, handle_subscription)
     }
 
+    /// Collects chunks from the stream into a sink using an async closure.
+    ///
+    /// The provided async closure is called for each chunk, with mutable access to the sink.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_async<S, F>(&mut self, into: S, collect: F) -> Collector<S>
     where
@@ -281,6 +300,10 @@ impl SingleSubscriberOutputStream {
         impl_collect_chunks_async!(receiver, collect, sink, handle_subscription)
     }
 
+    /// Collects lines from the stream into a sink.
+    ///
+    /// The provided closure is called for each line, with mutable access to the sink.
+    /// Return [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines<S: Sink>(
         &mut self,
@@ -293,6 +316,10 @@ impl SingleSubscriberOutputStream {
         impl_collect_lines!(receiver, collect, options, sink, handle_subscription)
     }
 
+    /// Collects lines from the stream into a sink using an async closure.
+    ///
+    /// The provided async closure is called for each line, with mutable access to the sink.
+    /// Return [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_async<S, F>(
         &mut self,
@@ -309,11 +336,13 @@ impl SingleSubscriberOutputStream {
         impl_collect_lines_async!(receiver, collect, options, sink, handle_subscription)
     }
 
+    /// Convenience method to collect all chunks into a `Vec<u8>`.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_into_vec(&mut self) -> Collector<Vec<u8>> {
         self.collect_chunks(Vec::new(), |chunk, vec| vec.extend(chunk.as_ref()))
     }
 
+    /// Convenience method to collect all lines into a `Vec<String>`.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_into_vec(
         &mut self,
@@ -329,6 +358,7 @@ impl SingleSubscriberOutputStream {
         )
     }
 
+    /// Collects chunks into an async writer.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_into_write<W: Sink + AsyncWriteExt + Unpin>(
         &mut self,
@@ -344,6 +374,7 @@ impl SingleSubscriberOutputStream {
         })
     }
 
+    /// Collects lines into an async writer.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_into_write<W: Sink + AsyncWriteExt + Unpin>(
         &mut self,
@@ -364,6 +395,7 @@ impl SingleSubscriberOutputStream {
         )
     }
 
+    /// Collects chunks into an async writer after mapping them with the provided function.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_into_write_mapped<
         W: Sink + AsyncWriteExt + Unpin,
@@ -385,6 +417,7 @@ impl SingleSubscriberOutputStream {
         })
     }
 
+    /// Collects lines into an async writer after mapping them with the provided function.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_into_write_mapped<
         W: Sink + AsyncWriteExt + Unpin,
@@ -414,6 +447,9 @@ impl SingleSubscriberOutputStream {
 
 // Impls for waiting for a specific line of output.
 impl SingleSubscriberOutputStream {
+    /// Waits for a line that matches the given predicate.
+    ///
+    /// This method blocks until a line is found that satisfies the predicate.
     pub async fn wait_for_line(
         &mut self,
         predicate: impl Fn(String) -> bool + Send + Sync + 'static,
@@ -439,6 +475,9 @@ impl SingleSubscriberOutputStream {
         };
     }
 
+    /// Waits for a line that matches the given predicate, with a timeout.
+    ///
+    /// Returns `Ok(())` if a matching line is found, or `Err(Elapsed)` if the timeout expires.
     pub async fn wait_for_line_with_timeout(
         &mut self,
         predicate: impl Fn(String) -> bool + Send + Sync + 'static,

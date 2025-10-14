@@ -18,7 +18,7 @@
 //!     let cmd = Command::new("ls");
 //!     let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("ls", cmd)
 //!         .expect("Failed to spawn `ls` command");
-//!    process.
+//!
 //!     let Output {
 //!         status,
 //!         stdout,
@@ -27,6 +27,7 @@
 //!         .wait_for_completion_with_output(None, LineParsingOptions::default())
 //!         .await
 //!         .unwrap();
+//!
 //!     assert_that(status.success()).is_true();
 //!     assert_that(stdout).is_equal_to(&[
 //!         "Cargo.lock",
