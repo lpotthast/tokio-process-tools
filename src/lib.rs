@@ -4,6 +4,7 @@
 #![doc = include_str!("../README.md")]
 //!
 
+mod async_drop;
 mod collector;
 mod inspector;
 mod output;
