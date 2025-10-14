@@ -535,7 +535,7 @@ mod tests {
         while let Some(Some(chunk)) = rx.recv().await {
             chunks.push(String::from_utf8_lossy(chunk.as_ref()).to_string());
         }
-        assert_that(chunks).contains_exactly(&["he", "ll", "o ", "wo", "rl", "d"]);
+        assert_that(chunks).contains_exactly(["he", "ll", "o ", "wo", "rl", "d"]);
     }
 
     #[tokio::test]
@@ -564,7 +564,7 @@ mod tests {
         let producer = tokio::spawn(async move {
             for count in 1..=15 {
                 write_half
-                    .write(format!("{count}\n").as_bytes())
+                    .write_all(format!("{count}\n").as_bytes())
                     .await
                     .unwrap();
                 sleep(Duration::from_millis(25)).await;
@@ -684,7 +684,7 @@ mod tests {
 
         let seen = collector.wait().await.unwrap();
 
-        assert_that(seen).contains_exactly(&["start", "break"]);
+        assert_that(seen).contains_exactly(["start", "break"]);
     }
 
     #[tokio::test]
