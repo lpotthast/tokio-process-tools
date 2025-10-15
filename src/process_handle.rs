@@ -13,6 +13,15 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Child;
 
+/// Default channel capacity for stdout and stderr streams.
+const DEFAULT_CHANNEL_CAPACITY: usize = 128;
+
+/// Maximum time to wait for process termination after sending SIGKILL.
+///
+/// This is a safety timeout since SIGKILL should terminate processes immediately,
+/// but there are rare cases where even SIGKILL may not work.
+const SIGKILL_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Errors that can occur when terminating a process.
 #[derive(Debug, Error)]
 pub enum TerminationError {
@@ -112,7 +121,12 @@ impl ProcessHandle<BroadcastOutputStream> {
         name: impl Into<Cow<'static, str>>,
         cmd: tokio::process::Command,
     ) -> io::Result<ProcessHandle<BroadcastOutputStream>> {
-        Self::spawn_with_capacity(name, cmd, 128, 128)
+        Self::spawn_with_capacity(
+            name,
+            cmd,
+            DEFAULT_CHANNEL_CAPACITY,
+            DEFAULT_CHANNEL_CAPACITY,
+        )
     }
 
     /// Spawns a new process with broadcast output streams and custom channel capacities.
@@ -249,7 +263,12 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
         name: impl Into<Cow<'static, str>>,
         cmd: tokio::process::Command,
     ) -> io::Result<Self> {
-        Self::spawn_with_capacity(name, cmd, 128, 128)
+        Self::spawn_with_capacity(
+            name,
+            cmd,
+            DEFAULT_CHANNEL_CAPACITY,
+            DEFAULT_CHANNEL_CAPACITY,
+        )
     }
 
     /// Spawns a new process with single subscriber output streams and custom channel capacities.
@@ -384,7 +403,7 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// On Windows, you can only send `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` to process groups,
     /// which works more like `killpg`. Sending to the current process ID will likely trigger
     /// undefined behavior of sending the event to every process that's attached to the console,
-    /// i.e. sending the event to group ID 0. Therefore, we need to create a new process group
+    /// i.e. sending the event to group ID 0. Therefore, we create a new process group
     /// for the child process we are about to spawn.
     ///
     /// See: https://stackoverflow.com/questions/44124338/trying-to-implement-signal-ctrl-c-event-in-python3-6
@@ -393,14 +412,8 @@ impl<O: OutputStream> ProcessHandle<O> {
     ) -> &mut tokio::process::Command {
         #[cfg(windows)]
         {
-            use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
-
-            let flag = if self.graceful_exit {
-                CREATE_NEW_PROCESS_GROUP.0
-            } else {
-                0
-            };
-            command.creation_flags(flag)
+            use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP)
         }
         #[cfg(not(windows))]
         {
@@ -517,14 +530,14 @@ impl<O: OutputStream> ProcessHandle<O> {
         }
     }
 
-    /// Manually sed a `SIGINT` on unix or equivalent on Windows to this process.
+    /// Manually send a `SIGINT` on unix or equivalent on Windows to this process.
     ///
     /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
     pub fn send_interrupt_signal(&mut self) -> Result<(), io::Error> {
         signal::send_interrupt(&self.child)
     }
 
-    /// Manually sed a `SIGTERM` on unix or equivalent on Windows to this process.
+    /// Manually send a `SIGTERM` on unix or equivalent on Windows to this process.
     ///
     /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
     pub fn send_terminate_signal(&mut self) -> Result<(), io::Error> {
@@ -584,9 +597,9 @@ impl<O: OutputStream> ProcessHandle<O> {
                                 // a SIGKILL does not / cannot / will not kill a process.
                                 // Something must have gone horribly wrong then...
                                 // But: We do not want to wait indefinitely in case this happens
-                                // and therefore wait (at max) for a fixed three seconds after any
+                                // and therefore wait (at max) for a fixed duration after any
                                 // SIGKILL event.
-                                match self.wait_for_completion(Some(Duration::from_secs(3))).await {
+                                match self.wait_for_completion(Some(SIGKILL_WAIT_TIMEOUT)).await {
                                     Ok(exit_status) => Ok(exit_status),
                                     Err(not_terminated_after_sigkill) => {
                                         // Unlikely. See the note above.

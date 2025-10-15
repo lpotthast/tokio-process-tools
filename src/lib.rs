@@ -4,6 +4,7 @@
 #![doc = include_str!("../README.md")]
 //!
 
+mod async_drop;
 mod collector;
 mod inspector;
 mod output;
@@ -47,7 +48,7 @@ mod test {
             .await
             .unwrap();
         assert_that(status.success()).is_true();
-        assert_that(stdout).is_equal_to(&[
+        assert_that(stdout).is_equal_to([
             "Cargo.lock",
             "Cargo.toml",
             "LICENSE-APACHE",

@@ -31,7 +31,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.6"
+tokio-process-tools = "0.7"
 tokio = { version = "1", features = ["process", "sync", "io-util", "rt-multi-thread", "time"] }
 ```
 
@@ -183,7 +183,7 @@ async fn main() {
         Vec::new(),
         |line, vec| {
             if line.contains("ERROR") {
-                vec.push(line);
+                vec.push(line.into_owned());
             }
             Next::Continue
         },
@@ -246,10 +246,13 @@ async fn main() {
 
     // Process output asynchronously (e.g., send to database)
     let _processor = process.stdout().inspect_lines_async(
-        async |line| {
-            // Simulate async processing
-            process_line_in_database(&line).await;
-            Next::Continue
+        |line| {
+            let line = line.into_owned();
+            async move {
+                // Simulate async processing
+                process_line_in_database(&line).await;
+                Next::Continue
+            }
         },
         LineParsingOptions::default()
     );
@@ -288,7 +291,7 @@ async fn main() {
     let custom_collector = process.stdout().collect_lines(
         MyCollector {},
         |line, custom| {
-            custom.process_line(line);
+            custom.process_line(line.into_owned());
             Next::Continue
         },
         LineParsingOptions::default()
