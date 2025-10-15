@@ -29,6 +29,12 @@ pub use process::{AutoName, AutoNameSettings, Process, ProcessName};
 pub use process_handle::{ProcessHandle, RunningState};
 pub use terminate_on_drop::TerminateOnDrop;
 
+#[allow(dead_code)]
+trait SendSync: Send + Sync {}
+impl SendSync for broadcast::BroadcastOutputStream {}
+impl SendSync for single_subscriber::SingleSubscriberOutputStream {}
+impl<O: OutputStream + SendSync> SendSync for ProcessHandle<O> {}
+
 #[cfg(test)]
 mod test {
     use crate::output::Output;
