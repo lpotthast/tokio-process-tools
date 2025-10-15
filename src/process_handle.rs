@@ -319,8 +319,8 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
         timeout: Option<Duration>,
         options: LineParsingOptions,
     ) -> Result<Output, WaitError> {
-        let out_collector = self.stdout_mut().collect_lines_into_vec(options);
-        let err_collector = self.stderr_mut().collect_lines_into_vec(options);
+        let out_collector = self.stdout().collect_lines_into_vec(options);
+        let err_collector = self.stderr().collect_lines_into_vec(options);
 
         let status = self.wait_for_completion(timeout).await?;
 
@@ -344,8 +344,8 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
         terminate_timeout: Duration,
         options: LineParsingOptions,
     ) -> Result<Output, WaitError> {
-        let out_collector = self.stdout_mut().collect_lines_into_vec(options);
-        let err_collector = self.stderr_mut().collect_lines_into_vec(options);
+        let out_collector = self.stdout().collect_lines_into_vec(options);
+        let err_collector = self.stderr().collect_lines_into_vec(options);
 
         let status = self
             .wait_for_completion_or_terminate(wait_timeout, interrupt_timeout, terminate_timeout)
@@ -421,23 +421,21 @@ impl<O: OutputStream> ProcessHandle<O> {
     }
 
     /// Returns a reference to the stdout stream.
+    ///
+    /// For `BroadcastOutputStream`, this allows creating multiple concurrent consumers.
+    /// For `SingleSubscriberOutputStream`, only one consumer can be created (subsequent
+    /// attempts will panic with a helpful error message).
     pub fn stdout(&self) -> &O {
         &self.std_out_stream
     }
 
-    /// Returns a mutable reference to the stdout stream.
-    pub fn stdout_mut(&mut self) -> &mut O {
-        &mut self.std_out_stream
-    }
-
     /// Returns a reference to the stderr stream.
+    ///
+    /// For `BroadcastOutputStream`, this allows creating multiple concurrent consumers.
+    /// For `SingleSubscriberOutputStream`, only one consumer can be created (subsequent
+    /// attempts will panic with a helpful error message).
     pub fn stderr(&self) -> &O {
         &self.std_err_stream
-    }
-
-    /// Returns a mutable reference to the stderr stream.
-    pub fn stderr_mut(&mut self) -> &mut O {
-        &mut self.std_err_stream
     }
 
     /// Sets a panic-on-drop mechanism for this `ProcessHandle`.

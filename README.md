@@ -91,18 +91,16 @@ When spawning a process, you choose the stream type explicitly by calling either
 ### Single Subscriber (`.spawn_single_subscriber()`)
 
 - ✅ More efficient (lower memory, no cloning)
-- ✅ Single consumer only
 - ✅ Configurable backpressure handling
+- ⚠️ **Only one consumer allowed** - creating a second inspector/collector will panic
 - 💡 **Use when**: You only need one way to consume output (e.g., just collecting OR just monitoring)
-- ☝️Requires `.stdout_mut()` and `.stderr_mut()` for interaction with streams.
 
 ### Broadcast (`.spawn_broadcast()`)
 
 - ✅ Multiple concurrent consumers
 - ✅ Great for logging + collecting + monitoring simultaneously
-- ℹ️ Slightly higher runtime costs
+- ⚠️ Slightly higher runtime costs
 - 💡 **Use when**: You need multiple operations on the same stream (e.g., log to console AND save to file)
-- ☝️Uses `.stdout()` and `.stderr()` for interaction with streams.
 
 ## Output Handling
 
@@ -123,7 +121,7 @@ async fn main() {
         .unwrap();
 
     // Inspect output in real-time
-    let _stdout_monitor = process.stdout_mut().inspect_lines(
+    let _stdout_monitor = process.stdout().inspect_lines(
         |line| {
             println!("stdout: {line}");
             Next::Continue
@@ -159,7 +157,7 @@ async fn main() {
         .unwrap();
 
     // Wait for the server to be ready
-    match process.stdout_mut().wait_for_line_with_timeout(
+    match process.stdout().wait_for_line_with_timeout(
         |line| line.contains("Server listening on"),
         LineParsingOptions::default(),
         Duration::from_secs(30),
@@ -415,7 +413,7 @@ use tokio_process_tools::*;
 #[tokio::main]
 async fn main() {
     let mut cmd = Command::new("some-command");
-    let mut process = Process::new(cmd)
+    let process = Process::new(cmd)
         .spawn_broadcast()
         .unwrap();
     process.stdout().wait_for_line(
