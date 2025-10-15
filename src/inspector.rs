@@ -6,11 +6,18 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Error)]
 pub enum InspectorError {
     /// The inspector task could not be joined/terminated.
-    #[error("The inspector task could not be joined/terminated: {0}")]
-    TaskJoin(#[from] tokio::task::JoinError),
+    #[error("Failed to join/terminate the inspector task over stream '{stream_name}': {source}")]
+    TaskJoin {
+        /// The name of the stream this inspector operates on.
+        stream_name: &'static str,
+
+        /// The source error.
+        #[source]
+        source: tokio::task::JoinError,
+    },
 }
 
-/// A collector for stream data, inspecting it chunk by chunk.
+/// An inspector for stream data, inspecting it chunk by chunk.
 ///
 /// See the `inspect_*` functions on `BroadcastOutputStream` and `SingleOutputStream`.
 ///
@@ -18,9 +25,12 @@ pub enum InspectorError {
 /// - `wait()`, which waits for the collection task to complete.
 /// - `cancel()`, which sends a termination signal and then waits for the collection task to complete.
 ///
-/// If not cleaned up, the termination signal will be sent when dropping this collector,
+/// If not cleaned up, the termination signal will be sent when dropping this inspector,
 /// but the task will be aborted (forceful, not waiting for its regular completion).
 pub struct Inspector {
+    /// The name of the stream this inspector operates on.
+    pub(crate) stream_name: &'static str,
+
     pub(crate) task: Option<JoinHandle<()>>,
     pub(crate) task_termination_sender: Option<Sender<()>>,
 }
@@ -51,7 +61,10 @@ impl Inspector {
             .take()
             .expect("`task` to be present.")
             .await
-            .map_err(InspectorError::TaskJoin);
+            .map_err(|err| InspectorError::TaskJoin {
+                stream_name: self.stream_name,
+                source: err,
+            });
 
         // Drop the termination sender, we don't need it. Task is now terminated.
         drop(tts);

@@ -1,11 +1,11 @@
 //! Builder API for spawning processes with explicit stream type selection.
 
+use crate::error::SpawnError;
 use crate::output_stream::broadcast::BroadcastOutputStream;
 use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
 use crate::output_stream::{DEFAULT_CHANNEL_CAPACITY, DEFAULT_CHUNK_SIZE};
 use crate::{NumBytes, ProcessHandle};
 use std::borrow::Cow;
-use std::io;
 
 /// Controls how the process name is automatically generated when not explicitly provided.
 ///
@@ -190,7 +190,7 @@ impl From<AutoName> for ProcessName {
 /// # Examples
 ///
 /// ```no_run
-/// use tokio_process_tools::Process;
+/// use tokio_process_tools::*;
 /// use tokio::process::Command;
 ///
 /// # tokio_test::block_on(async {
@@ -209,7 +209,7 @@ impl From<AutoName> for ProcessName {
 ///     .stdout_capacity(512)
 ///     .stderr_capacity(512)
 ///     .spawn_broadcast()?;
-/// # Ok::<_, std::io::Error>(())
+/// # Ok::<_, SpawnError>(())
 /// # });
 /// ```
 pub struct Process {
@@ -230,13 +230,13 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::Process;
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
     /// let process = Process::new(Command::new("ls"))
     ///     .spawn_broadcast()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn new(cmd: tokio::process::Command) -> Self {
@@ -258,7 +258,7 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::{Process, ProcessName, AutoName, AutoNameSettings};
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
@@ -273,7 +273,7 @@ impl Process {
     /// let process = Process::new(cmd)
     ///     .name(ProcessName::Auto(AutoName::Using(AutoNameSettings::program_with_args())))
     ///     .spawn_broadcast()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn name(mut self, name: impl Into<ProcessName>) -> Self {
@@ -288,7 +288,7 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::Process;
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
@@ -302,7 +302,7 @@ impl Process {
     /// let process = Process::new(Command::new("worker"))
     ///     .with_name(format!("worker-{id}"))
     ///     .spawn_single_subscriber()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn with_name(self, name: impl Into<Cow<'static, str>>) -> Self {
@@ -316,7 +316,7 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::{AutoName, AutoNameSettings, Process};
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
@@ -327,7 +327,7 @@ impl Process {
     /// let process = Process::new(cmd)
     ///     .with_auto_name(AutoName::Using(AutoNameSettings::program_with_env_and_args()))
     ///     .spawn_broadcast()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn with_auto_name(self, mode: AutoName) -> Self {
@@ -342,14 +342,14 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::{NumBytesExt, Process};
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
     /// let process = Process::new(Command::new("server"))
     ///     .stdout_chunk_size(32.kilobytes())
     ///     .spawn_broadcast()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn stdout_chunk_size(mut self, chunk_size: NumBytes) -> Self {
@@ -365,14 +365,14 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::{Process, NumBytesExt};
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
     /// let process = Process::new(Command::new("server"))
     ///     .stderr_chunk_size(32.kilobytes())
     ///     .spawn_broadcast()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn stderr_chunk_size(mut self, chunk_size: NumBytes) -> Self {
@@ -389,14 +389,14 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::{Process, NumBytesExt};
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
     /// let process = Process::new(Command::new("server"))
     ///     .chunk_sizes(32.kilobytes())
     ///     .spawn_broadcast()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn chunk_sizes(mut self, chunk_size: NumBytes) -> Self {
@@ -413,14 +413,14 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::Process;
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
     /// let process = Process::new(Command::new("server"))
     ///     .stdout_capacity(512)
     ///     .spawn_broadcast()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn stdout_capacity(mut self, capacity: usize) -> Self {
@@ -436,14 +436,14 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::Process;
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
     /// let process = Process::new(Command::new("server"))
     ///     .stderr_capacity(256)
     ///     .spawn_broadcast()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn stderr_capacity(mut self, capacity: usize) -> Self {
@@ -459,14 +459,14 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::Process;
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
     /// let process = Process::new(Command::new("server"))
     ///     .capacities(256)
     ///     .spawn_broadcast()?;
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn capacities(mut self, capacity: usize) -> Self {
@@ -495,7 +495,7 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::Process;
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
@@ -509,10 +509,10 @@ impl Process {
     /// }, Default::default());
     ///
     /// let _collector = process.stdout().collect_lines_into_vec(Default::default());
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
-    pub fn spawn_broadcast(self) -> io::Result<ProcessHandle<BroadcastOutputStream>> {
+    pub fn spawn_broadcast(self) -> Result<ProcessHandle<BroadcastOutputStream>, SpawnError> {
         let name = self.generate_name();
         ProcessHandle::<BroadcastOutputStream>::spawn_with_capacity(
             name,
@@ -533,7 +533,7 @@ impl Process {
     /// # Examples
     ///
     /// ```no_run
-    /// use tokio_process_tools::Process;
+    /// use tokio_process_tools::*;
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
@@ -542,12 +542,12 @@ impl Process {
     ///
     /// // Only one consumer allowed
     /// let collector = process.stdout_mut().collect_lines_into_vec(Default::default());
-    /// # Ok::<_, std::io::Error>(())
+    /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
     pub fn spawn_single_subscriber(
         self,
-    ) -> io::Result<ProcessHandle<SingleSubscriberOutputStream>> {
+    ) -> Result<ProcessHandle<SingleSubscriberOutputStream>, SpawnError> {
         let name = self.generate_name();
         ProcessHandle::<SingleSubscriberOutputStream>::spawn_with_capacity(
             name,

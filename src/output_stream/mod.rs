@@ -20,13 +20,15 @@ pub mod single_subscriber;
 /// - [broadcast::BroadcastOutputStream]
 /// - [single_subscriber::SingleSubscriberOutputStream]
 pub trait OutputStream {
-
     /// The maximum size of every chunk read by the backing `stream_reader`.
     fn chunk_size(&self) -> NumBytes;
 
-
     /// The number of chunks held by the underlying async channel.
     fn channel_capacity(&self) -> usize;
+
+    /// Type of stream. Can be "stdout" or "stderr". But we do not guarantee this output.
+    /// It should only be used for logging/debugging.
+    fn name(&self) -> &'static str;
 }
 
 /// NOTE: The maximum possible memory consumption is: `chunk_size * channel_capacity`.
