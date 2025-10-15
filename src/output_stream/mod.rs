@@ -1,6 +1,12 @@
 use bytes::{Buf, BytesMut};
 use std::io::BufRead;
 
+/// Default chunk size read from the source stream. 16 kilobytes.
+pub const DEFAULT_CHUNK_SIZE: NumBytes = NumBytes(16 * 1024); // 16 kb
+
+/// Default channel capacity for stdout and stderr streams. 128 slots.
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 128;
+
 /// Broadcast output stream implementation supporting multiple concurrent consumers.
 pub mod broadcast;
 
@@ -13,7 +19,15 @@ pub mod single_subscriber;
 ///
 /// - [broadcast::BroadcastOutputStream]
 /// - [single_subscriber::SingleSubscriberOutputStream]
-pub trait OutputStream {}
+pub trait OutputStream {
+
+    /// The maximum size of every chunk read by the backing `stream_reader`.
+    fn chunk_size(&self) -> NumBytes;
+
+
+    /// The number of chunks held by the underlying async channel.
+    fn channel_capacity(&self) -> usize;
+}
 
 /// NOTE: The maximum possible memory consumption is: `chunk_size * channel_capacity`.
 /// Although reaching that level requires:
@@ -23,7 +37,7 @@ pub struct FromStreamOptions {
     /// The size of an individual chunk read from the read buffer in bytes.
     ///
     /// default: 16 * 1024 // 16 kb
-    pub chunk_size: usize,
+    pub chunk_size: NumBytes,
 
     /// The number of chunks held by the underlying async channel.
     ///
@@ -38,8 +52,8 @@ pub struct FromStreamOptions {
 impl Default for FromStreamOptions {
     fn default() -> Self {
         Self {
-            chunk_size: 16 * 1024, // 16 kb
-            channel_capacity: 128, // => 16 kb * 128 = 2 mb (max memory usage consumption)
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY, // => 16 kb * 128 = 2 mb (max memory usage consumption)
         }
     }
 }
@@ -148,12 +162,17 @@ impl Default for LineParsingOptions {
 /// let mb = 2.megabytes();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NumBytes(pub usize);
+pub struct NumBytes(usize);
 
 impl NumBytes {
     /// Creates a NumBytes value of zero.
     pub fn zero() -> Self {
         Self(0)
+    }
+
+    /// The amount of bytes represented by this instance.
+    pub fn bytes(&self) -> usize {
+        self.0
     }
 }
 
@@ -361,7 +380,7 @@ mod tests {
 
     mod line_reader {
         use crate::output_stream::LineReader;
-        use crate::{LineOverflowBehavior, LineParsingOptions, NumBytes};
+        use crate::{LineOverflowBehavior, LineParsingOptions, NumBytes, NumBytesExt};
         use assertr::prelude::*;
         use bytes::{Bytes, BytesMut};
         use tracing_test::traced_test;
@@ -550,7 +569,7 @@ mod tests {
                 "",
                 &["1234", "abcd"],
                 LineParsingOptions {
-                    max_line_length: NumBytes(4), // Only allow lines with 4 ascii chars (or equiv.) max.
+                    max_line_length: 4.bytes(), // Only allow lines with 4 ascii chars (or equiv.) max.
                     overflow_behavior: LineOverflowBehavior::DropAdditionalData,
                 },
             );
@@ -564,7 +583,7 @@ mod tests {
                 "",
                 &["1234", "5678", "9", "abcd", "efgh", "i"],
                 LineParsingOptions {
-                    max_line_length: NumBytes(4), // Only allow lines with 4 ascii chars (or equiv.) max.
+                    max_line_length: 4.bytes(), // Only allow lines with 4 ascii chars (or equiv.) max.
                     overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
                 },
             );
@@ -578,7 +597,7 @@ mod tests {
                 "",
                 &["123456789", "abcdefghi"],
                 LineParsingOptions {
-                    max_line_length: NumBytes(0),
+                    max_line_length: NumBytes::zero(),
                     overflow_behavior: LineOverflowBehavior::DropAdditionalData,
                 },
             );
@@ -592,7 +611,7 @@ mod tests {
                 "",
                 &["123456789", "abcdefghi"],
                 LineParsingOptions {
-                    max_line_length: NumBytes(0),
+                    max_line_length: NumBytes::zero(),
                     overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
                 },
             );
@@ -606,7 +625,7 @@ mod tests {
                 "",
                 &["   123456789     ", "    abcdefghi        "],
                 LineParsingOptions {
-                    max_line_length: NumBytes(0),
+                    max_line_length: NumBytes::zero(),
                     overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
                 },
             );

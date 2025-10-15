@@ -1,4 +1,4 @@
-use crate::InspectorError;
+use crate::{InspectorError, NumBytes};
 use crate::collector::{AsyncCollectFn, Collector, Sink};
 use crate::inspector::Inspector;
 use crate::output_stream::impls::{
@@ -33,9 +33,22 @@ pub struct BroadcastOutputStream {
     /// the channel.
     /// New subscribers can be created from this sender.
     sender: broadcast::Sender<Option<Chunk>>,
+
+    /// The maximum size of every chunk read by the backing `stream_reader`.
+    chunk_size: NumBytes,
+
+    max_channel_capacity: usize,
 }
 
-impl OutputStream for BroadcastOutputStream {}
+impl OutputStream for BroadcastOutputStream {
+    fn chunk_size(&self) -> NumBytes {
+        self.chunk_size
+    }
+
+    fn channel_capacity(&self) -> usize {
+        self.max_channel_capacity
+    }
+}
 
 impl Drop for BroadcastOutputStream {
     fn drop(&mut self) {
@@ -60,7 +73,7 @@ impl Debug for BroadcastOutputStream {
 /// Once chunks were handled by all active receivers, the space of the chunk is reclaimed and reused.
 async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
     mut read: B,
-    chunk_size: usize,
+    chunk_size: NumBytes,
     sender: broadcast::Sender<Option<Chunk>>,
 ) {
     let send_chunk = move |chunk: Option<Chunk>| {
@@ -84,9 +97,9 @@ async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
     };
 
     // A BytesMut may grow when used in a `read_buf` call.
-    let mut buf = bytes::BytesMut::with_capacity(chunk_size);
+    let mut buf = bytes::BytesMut::with_capacity(chunk_size.bytes());
     loop {
-        let _ = buf.try_reclaim(chunk_size);
+        let _ = buf.try_reclaim(chunk_size.bytes());
         match read.read_buf(&mut buf).await {
             Ok(bytes_read) => {
                 let is_eof = bytes_read == 0;
@@ -98,7 +111,7 @@ async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
                             // Split of at least `chunk_size` bytes and send it, even if we were
                             // able to read more than `chunk_size` bytes.
                             // We could have read more
-                            let split_to = usize::min(chunk_size, buf.len());
+                            let split_to = usize::min(chunk_size.bytes(), buf.len());
                             // Splitting off bytes reduces the remaining capacity of our BytesMut.
                             // It might have now reached a capacity of 0. But this is fine!
                             // The next usage of it in `read_buf` will not return `0`, as you may
@@ -134,6 +147,8 @@ impl BroadcastOutputStream {
         BroadcastOutputStream {
             stream_reader,
             sender,
+            chunk_size: options.chunk_size,
+            max_channel_capacity: options.channel_capacity
         }
     }
 
@@ -458,6 +473,7 @@ mod tests {
     use tokio::sync::broadcast;
     use tokio::time::sleep;
     use tracing_test::traced_test;
+    use crate::NumBytesExt;
 
     #[tokio::test]
     #[traced_test]
@@ -475,7 +491,7 @@ mod tests {
         write_half.write_all(b"hello world").await.unwrap();
         write_half.flush().await.unwrap();
 
-        let stream_reader = tokio::spawn(read_chunked(read_half, 2, tx));
+        let stream_reader = tokio::spawn(read_chunked(read_half, 2.bytes(), tx));
 
         drop(write_half); // This closes the stream and should let stream_reader terminate.
         stream_reader.await.unwrap();
@@ -493,7 +509,7 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let (tx, mut rx) = broadcast::channel(10);
 
-        let stream_reader = tokio::spawn(read_chunked(read_half, 2, tx));
+        let stream_reader = tokio::spawn(read_chunked(read_half, 2.bytes(), tx));
 
         drop(write_half); // This closes the stream and should let stream_reader terminate.
         stream_reader.await.unwrap();
@@ -610,7 +626,7 @@ mod tests {
         let os = BroadcastOutputStream::from_stream(
             read_half,
             FromStreamOptions {
-                chunk_size: 32,
+                chunk_size: 32.bytes(),
                 ..Default::default()
             },
         );
@@ -688,7 +704,7 @@ mod tests {
         let os = BroadcastOutputStream::from_stream(
             read_half,
             FromStreamOptions {
-                chunk_size: 32,
+                chunk_size: 32.bytes(),
                 ..Default::default()
             },
         );
@@ -722,7 +738,7 @@ mod tests {
         let os = BroadcastOutputStream::from_stream(
             read_half,
             FromStreamOptions {
-                chunk_size: 32,
+                chunk_size: 32.bytes(),
                 ..Default::default()
             },
         );
@@ -763,7 +779,7 @@ mod tests {
             FromStreamOptions {
                 // Big enough to hold any individual test write that we perform.
                 // Actual chunks will be smaller.
-                chunk_size: 64,
+                chunk_size: 32.bytes(),
                 channel_capacity: 2,
             },
         );

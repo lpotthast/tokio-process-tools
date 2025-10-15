@@ -7,7 +7,7 @@ use crate::output_stream::impls::{
 use crate::output_stream::{
     BackpressureControl, Chunk, FromStreamOptions, LineReader, Next, OutputStream,
 };
-use crate::{InspectorError, LineParsingOptions};
+use crate::{InspectorError, LineParsingOptions, NumBytes};
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 
@@ -33,9 +33,20 @@ pub struct SingleSubscriberOutputStream {
     /// The receiver is wrapped in an `Option` so that we can take it out of it and move it
     /// into an inspector or collector task.
     receiver: Option<mpsc::Receiver<Option<Chunk>>>,
+
+    /// The maximum size of every chunk read by the backing `stream_reader`.
+    chunk_size: NumBytes,
 }
 
-impl OutputStream for SingleSubscriberOutputStream {}
+impl OutputStream for SingleSubscriberOutputStream {
+    fn chunk_size(&self) -> NumBytes {
+        self.chunk_size
+    }
+
+    fn channel_capacity(&self) -> usize {
+        self.receiver.as_ref().expect("present").max_capacity()
+    }
+}
 
 impl Drop for SingleSubscriberOutputStream {
     fn drop(&mut self) {
@@ -60,7 +71,7 @@ impl Debug for SingleSubscriberOutputStream {
 /// Once chunks were handled by all active receivers, the space of the chunk is reclaimed and reused.
 async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
     mut read: R,
-    chunk_size: usize,
+    chunk_size: NumBytes,
     sender: mpsc::Sender<Option<Chunk>>,
     backpressure_control: BackpressureControl,
 ) {
@@ -113,10 +124,10 @@ async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
     }
 
     // NOTE: buf may grow when required!
-    let mut buf = bytes::BytesMut::with_capacity(chunk_size);
+    let mut buf = bytes::BytesMut::with_capacity(chunk_size.bytes());
     let mut lagged: usize = 0;
     loop {
-        let _ = buf.try_reclaim(chunk_size);
+        let _ = buf.try_reclaim(chunk_size.bytes());
         match read.read_buf(&mut buf).await {
             Ok(bytes_read) => {
                 let is_eof = bytes_read == 0;
@@ -138,7 +149,7 @@ async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
                     },
                     false => {
                         while !buf.is_empty() {
-                            let split_to = usize::min(chunk_size, buf.len());
+                            let split_to = usize::min(chunk_size.bytes(), buf.len());
 
                             match backpressure_control {
                                 BackpressureControl::DropLatestIncomingIfBufferFull => {
@@ -194,6 +205,7 @@ impl SingleSubscriberOutputStream {
         SingleSubscriberOutputStream {
             stream_reader,
             receiver: Some(rx_stdout),
+            chunk_size: options.chunk_size,
         }
     }
 
@@ -495,7 +507,7 @@ mod tests {
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, FromStreamOptions, Next};
     use crate::single_subscriber::read_chunked;
-    use crate::LineParsingOptions;
+    use crate::{LineParsingOptions, NumBytesExt};
     use assertr::prelude::*;
     use mockall::{automock, predicate};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -523,7 +535,7 @@ mod tests {
 
         let stream_reader = tokio::spawn(read_chunked(
             read_half,
-            2,
+            2.bytes(),
             tx,
             BackpressureControl::DropLatestIncomingIfBufferFull,
         ));
@@ -646,7 +658,7 @@ mod tests {
             read_half,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
-                chunk_size: 32,
+                chunk_size: 32.bytes(),
                 ..Default::default()
             },
         );
@@ -726,7 +738,7 @@ mod tests {
             read_half,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
-                chunk_size: 32,
+                chunk_size: 32.bytes(),
                 ..Default::default()
             },
         );
@@ -761,7 +773,7 @@ mod tests {
             read_half,
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
-                chunk_size: 32,
+                chunk_size: 32.bytes(),
                 ..Default::default()
             },
         );
