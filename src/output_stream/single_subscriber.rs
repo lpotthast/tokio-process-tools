@@ -9,8 +9,8 @@ use crate::output_stream::{
     BackpressureControl, Chunk, FromStreamOptions, LineReader, Next, OutputStream,
 };
 use crate::{InspectorError, LineParsingOptions, NumBytes};
+use atomic_take::AtomicTake;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ pub struct SingleSubscriberOutputStream {
     /// This enables `&self` methods while tracking if the receiver has been taken.
     /// Once taken by a consumer, attempting to create another consumer will panic with a clear
     /// message, stating that a broadcast subscriber should be used instead.
-    receiver: Cell<Option<mpsc::Receiver<Option<Chunk>>>>,
+    receiver: AtomicTake<mpsc::Receiver<Option<Chunk>>>,
 
     /// The maximum size of every chunk read by the backing `stream_reader`.
     chunk_size: NumBytes,
@@ -219,7 +219,7 @@ impl SingleSubscriberOutputStream {
 
         SingleSubscriberOutputStream {
             stream_reader,
-            receiver: Cell::new(Some(rx_stdout)),
+            receiver: AtomicTake::new(rx_stdout),
             chunk_size: options.chunk_size,
             max_channel_capacity: options.channel_capacity,
             name: stream_name,
