@@ -385,7 +385,7 @@ mod tests {
                 }
             }
 
-            assert_that(collected_lines).contains_exactly(&["❤️❤️❤️", "👍"]);
+            assert_that(collected_lines).contains_exactly(["❤️❤️❤️", "👍"]);
         }
 
         #[test]
@@ -421,7 +421,7 @@ mod tests {
                 bytes.push(line);
             }
 
-            assert_that(collected_lines).contains_exactly(&["❤️❤️❤️", "❤️❤️❤️", "❤️❤️❤️"]);
+            assert_that(collected_lines).contains_exactly(["❤️❤️❤️", "❤️❤️❤️", "❤️❤️❤️"]);
 
             logs_assert(|lines: &[&str]| {
                 match lines
