@@ -31,7 +31,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.6"
+tokio-process-tools = "0.7"
 tokio = { version = "1", features = ["process", "sync", "io-util", "rt-multi-thread", "time"] }
 ```
 
