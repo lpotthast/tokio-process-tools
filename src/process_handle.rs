@@ -384,7 +384,7 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// On Windows, you can only send `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` to process groups,
     /// which works more like `killpg`. Sending to the current process ID will likely trigger
     /// undefined behavior of sending the event to every process that's attached to the console,
-    /// i.e. sending the event to group ID 0. Therefore, we need to create a new process group
+    /// i.e. sending the event to group ID 0. Therefore, we create a new process group
     /// for the child process we are about to spawn.
     ///
     /// See: https://stackoverflow.com/questions/44124338/trying-to-implement-signal-ctrl-c-event-in-python3-6
@@ -393,14 +393,8 @@ impl<O: OutputStream> ProcessHandle<O> {
     ) -> &mut tokio::process::Command {
         #[cfg(windows)]
         {
-            use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
-
-            let flag = if self.graceful_exit {
-                CREATE_NEW_PROCESS_GROUP.0
-            } else {
-                0
-            };
-            command.creation_flags(flag)
+            use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP)
         }
         #[cfg(not(windows))]
         {
