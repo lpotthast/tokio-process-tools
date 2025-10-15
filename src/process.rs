@@ -537,11 +537,11 @@ impl Process {
     /// use tokio::process::Command;
     ///
     /// # tokio_test::block_on(async {
-    /// let mut process = Process::new(Command::new("ls"))
+    /// let process = Process::new(Command::new("ls"))
     ///     .spawn_single_subscriber()?;
     ///
     /// // Only one consumer allowed
-    /// let collector = process.stdout_mut().collect_lines_into_vec(Default::default());
+    /// let collector = process.stdout().collect_lines_into_vec(Default::default());
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```

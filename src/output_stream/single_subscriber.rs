@@ -10,6 +10,7 @@ use crate::output_stream::{
 };
 use crate::{InspectorError, LineParsingOptions, NumBytes};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
@@ -30,12 +31,18 @@ pub struct SingleSubscriberOutputStream {
     /// new output from the underlying stream, sending it to our registered receiver (if present).
     stream_reader: JoinHandle<()>,
 
-    /// The receiver is wrapped in an `Option` so that we can take it out of it and move it
-    /// into an inspector or collector task.
-    receiver: Option<mpsc::Receiver<Option<Chunk>>>,
+    /// The receiver is wrapped in a `Cell<Option<>>` to allow interior mutability and to take the
+    /// receiver out and move it into an inspector or collector task.
+    /// This enables `&self` methods while tracking if the receiver has been taken.
+    /// Once taken by a consumer, attempting to create another consumer will panic with a clear
+    /// message, stating that a broadcast subscriber should be used instead.
+    receiver: Cell<Option<mpsc::Receiver<Option<Chunk>>>>,
 
     /// The maximum size of every chunk read by the backing `stream_reader`.
     chunk_size: NumBytes,
+
+    /// The maximum capacity of the channel caching the chunks before being processed.
+    max_channel_capacity: usize,
 
     /// Name of this stream.
     name: &'static str,
@@ -47,7 +54,7 @@ impl OutputStream for SingleSubscriberOutputStream {
     }
 
     fn channel_capacity(&self) -> usize {
-        self.receiver.as_ref().expect("present").max_capacity()
+        self.max_channel_capacity
     }
 
     fn name(&self) -> &'static str {
@@ -212,14 +219,22 @@ impl SingleSubscriberOutputStream {
 
         SingleSubscriberOutputStream {
             stream_reader,
-            receiver: Some(rx_stdout),
+            receiver: Cell::new(Some(rx_stdout)),
             chunk_size: options.chunk_size,
+            max_channel_capacity: options.channel_capacity,
             name: stream_name,
         }
     }
 
-    fn take_receiver(&mut self) -> mpsc::Receiver<Option<Chunk>> {
-        self.receiver.take().expect("Receiver not yet to be taken. The SingleSubscriberOutputStream only supports one subscriber, but one was already created.")
+    fn take_receiver(&self) -> mpsc::Receiver<Option<Chunk>> {
+        self.receiver.take().unwrap_or_else(|| {
+            panic!(
+                "Cannot create multiple consumers on SingleSubscriberOutputStream (stream: '{}'). \
+                Only one inspector or collector can be active at a time. \
+                Use .spawn_broadcast() instead of .spawn_single_subscriber() to support multiple consumers.",
+                self.name
+            )
+        })
     }
 }
 
@@ -255,7 +270,7 @@ impl SingleSubscriberOutputStream {
     /// The provided closure is called for each chunk of data. Return [`Next::Continue`] to keep
     /// processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_chunks(&mut self, f: impl Fn(Chunk) -> Next + Send + 'static) -> Inspector {
+    pub fn inspect_chunks(&self, f: impl Fn(Chunk) -> Next + Send + 'static) -> Inspector {
         let mut receiver = self.take_receiver();
         impl_inspect_chunks!(self.name(), receiver, f, handle_subscription)
     }
@@ -266,7 +281,7 @@ impl SingleSubscriberOutputStream {
     /// processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines(
-        &mut self,
+        &self,
         mut f: impl FnMut(Cow<'_, str>) -> Next + Send + 'static,
         options: LineParsingOptions,
     ) -> Inspector {
@@ -280,7 +295,7 @@ impl SingleSubscriberOutputStream {
     /// processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_lines_async<Fut>(
-        &mut self,
+        &self,
         mut f: impl FnMut(Cow<'_, str>) -> Fut + Send + 'static,
         options: LineParsingOptions,
     ) -> Inspector
@@ -299,7 +314,7 @@ impl SingleSubscriberOutputStream {
     /// The provided closure is called for each chunk, with mutable access to the sink.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks<S: Sink>(
-        &mut self,
+        &self,
         into: S,
         collect: impl Fn(Chunk, &mut S) + Send + 'static,
     ) -> Collector<S> {
@@ -312,7 +327,7 @@ impl SingleSubscriberOutputStream {
     ///
     /// The provided async closure is called for each chunk, with mutable access to the sink.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_async<S, F>(&mut self, into: S, collect: F) -> Collector<S>
+    pub fn collect_chunks_async<S, F>(&self, into: S, collect: F) -> Collector<S>
     where
         S: Sink,
         F: Fn(Chunk, &mut S) -> AsyncCollectFn<'_> + Send + 'static,
@@ -328,7 +343,7 @@ impl SingleSubscriberOutputStream {
     /// Return [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines<S: Sink>(
-        &mut self,
+        &self,
         into: S,
         collect: impl Fn(Cow<'_, str>, &mut S) -> Next + Send + 'static,
         options: LineParsingOptions,
@@ -351,7 +366,7 @@ impl SingleSubscriberOutputStream {
     /// Return [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_async<S, F>(
-        &mut self,
+        &self,
         into: S,
         collect: F,
         options: LineParsingOptions,
@@ -374,16 +389,13 @@ impl SingleSubscriberOutputStream {
 
     /// Convenience method to collect all chunks into a `Vec<u8>`.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_into_vec(&mut self) -> Collector<Vec<u8>> {
+    pub fn collect_chunks_into_vec(&self) -> Collector<Vec<u8>> {
         self.collect_chunks(Vec::new(), |chunk, vec| vec.extend(chunk.as_ref()))
     }
 
     /// Convenience method to collect all lines into a `Vec<String>`.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_into_vec(
-        &mut self,
-        options: LineParsingOptions,
-    ) -> Collector<Vec<String>> {
+    pub fn collect_lines_into_vec(&self, options: LineParsingOptions) -> Collector<Vec<String>> {
         self.collect_lines(
             Vec::new(),
             |line, vec| {
@@ -397,7 +409,7 @@ impl SingleSubscriberOutputStream {
     /// Collects chunks into an async writer.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_into_write<W: Sink + AsyncWriteExt + Unpin>(
-        &mut self,
+        &self,
         write: W,
     ) -> Collector<W> {
         self.collect_chunks_async(write, move |chunk, write| {
@@ -413,7 +425,7 @@ impl SingleSubscriberOutputStream {
     /// Collects lines into an async writer.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_into_write<W: Sink + AsyncWriteExt + Unpin>(
-        &mut self,
+        &self,
         write: W,
         options: LineParsingOptions,
     ) -> Collector<W> {
@@ -437,7 +449,7 @@ impl SingleSubscriberOutputStream {
         W: Sink + AsyncWriteExt + Unpin,
         B: AsRef<[u8]> + Send,
     >(
-        &mut self,
+        &self,
         write: W,
         mapper: impl Fn(Chunk) -> B + Send + Sync + Copy + 'static,
     ) -> Collector<W> {
@@ -459,7 +471,7 @@ impl SingleSubscriberOutputStream {
         W: Sink + AsyncWriteExt + Unpin,
         B: AsRef<[u8]> + Send,
     >(
-        &mut self,
+        &self,
         write: W,
         mapper: impl Fn(Cow<'_, str>) -> B + Send + Sync + Copy + 'static,
         options: LineParsingOptions,
@@ -487,7 +499,7 @@ impl SingleSubscriberOutputStream {
     ///
     /// This method blocks until a line is found that satisfies the predicate.
     pub async fn wait_for_line(
-        &mut self,
+        &self,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
     ) -> Result<(), InspectorError> {
@@ -508,7 +520,7 @@ impl SingleSubscriberOutputStream {
     ///
     /// Returns `Ok(())` if a matching line is found, or `Err(OutputError::Timeout)` if the timeout expires.
     pub async fn wait_for_line_with_timeout(
-        &mut self,
+        &self,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
         timeout: Duration,
@@ -576,7 +588,7 @@ mod tests {
     #[traced_test]
     async fn handles_backpressure_by_dropping_newer_chunks_after_channel_buffer_filled_up() {
         let (read_half, mut write_half) = tokio::io::duplex(64);
-        let mut os = SingleSubscriberOutputStream::from_stream(
+        let os = SingleSubscriberOutputStream::from_stream(
             read_half,
             "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
@@ -634,7 +646,7 @@ mod tests {
     #[tokio::test]
     async fn inspect_lines() {
         let (read_half, write_half) = tokio::io::duplex(64);
-        let mut os = SingleSubscriberOutputStream::from_stream(
+        let os = SingleSubscriberOutputStream::from_stream(
             read_half,
             "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
@@ -678,7 +690,7 @@ mod tests {
     #[traced_test]
     async fn inspect_lines_async() {
         let (read_half, mut write_half) = tokio::io::duplex(64);
-        let mut os = SingleSubscriberOutputStream::from_stream(
+        let os = SingleSubscriberOutputStream::from_stream(
             read_half,
             "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
@@ -727,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn collect_lines_to_file() {
         let (read_half, write_half) = tokio::io::duplex(64);
-        let mut os = SingleSubscriberOutputStream::from_stream(
+        let os = SingleSubscriberOutputStream::from_stream(
             read_half,
             "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
@@ -760,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn collect_lines_async_to_file() {
         let (read_half, write_half) = tokio::io::duplex(64);
-        let mut os = SingleSubscriberOutputStream::from_stream(
+        let os = SingleSubscriberOutputStream::from_stream(
             read_half,
             "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
@@ -796,7 +808,7 @@ mod tests {
     #[traced_test]
     async fn collect_chunks_into_write_mapped() {
         let (read_half, write_half) = tokio::io::duplex(64);
-        let mut os = SingleSubscriberOutputStream::from_stream(
+        let os = SingleSubscriberOutputStream::from_stream(
             read_half,
             "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
@@ -835,7 +847,7 @@ mod tests {
     #[traced_test]
     async fn multiple_subscribers_are_not_possible() {
         let (read_half, _write_half) = tokio::io::duplex(64);
-        let mut os = SingleSubscriberOutputStream::from_stream(
+        let os = SingleSubscriberOutputStream::from_stream(
             read_half,
             "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
@@ -847,6 +859,6 @@ mod tests {
         // Doesn't matter if we call `inspect_lines` or some other "consuming" function instead.
         assert_that_panic_by(move || os.inspect_lines(|_line| Next::Continue, Default::default()))
             .has_type::<String>()
-            .is_equal_to("Receiver not yet to be taken. The SingleSubscriberOutputStream only supports one subscriber, but one was already created.");
+            .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'custom'). Only one inspector or collector can be active at a time. Use .spawn_broadcast() instead of .spawn_single_subscriber() to support multiple consumers.");
     }
 }

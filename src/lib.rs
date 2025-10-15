@@ -32,7 +32,7 @@ pub use terminate_on_drop::TerminateOnDrop;
 #[cfg(test)]
 mod test {
     use crate::output::Output;
-    use crate::{LineParsingOptions, Process, RunningState};
+    use crate::{LineParsingOptions, Next, Process, RunningState};
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::process::Command;
@@ -62,6 +62,28 @@ mod test {
             "target",
         ]);
         assert_that(stderr).is_empty();
+    }
+
+    #[tokio::test]
+    async fn single_subscriber_panics_on_multiple_consumers() {
+        let mut process = Process::new(Command::new("ls"))
+            .name("ls")
+            .spawn_single_subscriber()
+            .expect("Failed to spawn `ls` command");
+
+        let _inspector = process
+            .stdout()
+            .inspect_lines(|_line| Next::Continue, LineParsingOptions::default());
+
+        assert_that_panic_by(|| {
+            let _inspector = process
+                .stdout()
+                .inspect_lines(|_line| Next::Continue, LineParsingOptions::default());
+        })
+        .has_type::<String>()
+        .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'stdout'). Only one inspector or collector can be active at a time. Use .spawn_broadcast() instead of .spawn_single_subscriber() to support multiple consumers.");
+
+        process.wait_for_completion(None).await.unwrap();
     }
 
     #[tokio::test]
