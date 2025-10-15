@@ -10,8 +10,15 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Error)]
 pub enum CollectorError {
     /// The collector task could not be joined/terminated.
-    #[error("The collector task could not be joined/terminated: {0}")]
-    TaskJoin(#[source] tokio::task::JoinError),
+    #[error("Failed to join/terminate the collector task over stream '{stream_name}': {source}")]
+    TaskJoin {
+        /// The name of the stream this collector operates on.
+        stream_name: &'static str,
+
+        /// The source error.
+        #[source]
+        source: tokio::task::JoinError,
+    },
 }
 
 /// A trait for types that can act as sinks for collected stream data.
@@ -38,6 +45,9 @@ pub type AsyncCollectFn<'a> = Pin<Box<dyn Future<Output = Next> + Send + 'a>>;
 /// If not cleaned up, the termination signal will be sent when dropping this collector,
 /// but the task will be aborted (forceful, not waiting for its regular completion).
 pub struct Collector<S: Sink> {
+    /// The name of the stream this collector operates on.
+    pub(crate) stream_name: &'static str,
+
     pub(crate) task: Option<JoinHandle<S>>,
     pub(crate) task_termination_sender: Option<Sender<()>>,
 }
@@ -68,7 +78,10 @@ impl<S: Sink> Collector<S> {
             .take()
             .expect("`task` to be present.")
             .await
-            .map_err(CollectorError::TaskJoin);
+            .map_err(|err| CollectorError::TaskJoin {
+                stream_name: self.stream_name,
+                source: err,
+            });
 
         // Drop the termination sender, we don't need it. Task is now terminated.
         drop(tts);

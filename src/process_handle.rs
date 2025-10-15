@@ -1,49 +1,26 @@
+use crate::error::{SpawnError, TerminationError, WaitError};
 use crate::output::Output;
 use crate::output_stream::broadcast::BroadcastOutputStream;
 use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
 use crate::output_stream::{BackpressureControl, FromStreamOptions};
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{CollectorError, LineParsingOptions, NumBytes, OutputStream, signal};
+use crate::{LineParsingOptions, NumBytes, OutputStream, signal};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
-use thiserror::Error;
 use tokio::process::Child;
+
+const STDOUT_STREAM_NAME: &str = "stdout";
+const STDERR_STREAM_NAME: &str = "stderr";
 
 /// Maximum time to wait for process termination after sending SIGKILL.
 ///
 /// This is a safety timeout since SIGKILL should terminate processes immediately,
 /// but there are rare cases where even SIGKILL may not work.
 const SIGKILL_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Errors that can occur when terminating a process.
-#[derive(Debug, Error)]
-pub enum TerminationError {
-    /// Failed to send a signal to the process.
-    #[error("Failed to send '{signal}' signal to process: {source}")]
-    SignallingFailed {
-        /// The underlying IO error.
-        source: io::Error,
-        /// The signal that could not be sent.
-        signal: &'static str,
-    },
-
-    /// Failed to terminate the process after trying all signals (SIGINT, SIGTERM, SIGKILL).
-    #[error(
-        "Failed to terminate process. Graceful SIGINT termination failure: {not_terminated_after_sigint}. Graceful SIGTERM termination failure: {not_terminated_after_sigterm}. Forceful termination failure: {not_terminated_after_sigkill}"
-    )]
-    TerminationFailed {
-        /// Error from waiting after sending SIGINT.
-        not_terminated_after_sigint: io::Error,
-        /// Error from waiting after sending SIGTERM.
-        not_terminated_after_sigterm: io::Error,
-        /// Error from waiting after sending SIGKILL.
-        not_terminated_after_sigkill: io::Error,
-    },
-}
 
 /// Represents the running state of a process.
 #[derive(Debug)]
@@ -77,22 +54,6 @@ impl From<RunningState> for bool {
     }
 }
 
-/// Errors that can occur when waiting for process output.
-#[derive(Debug, Error)]
-pub enum WaitError {
-    /// A general IO error occurred.
-    #[error("A general io error occurred")]
-    IoError(#[from] io::Error),
-
-    /// Could not terminate the process.
-    #[error("Could not terminate the process")]
-    TerminationError(#[from] TerminationError),
-
-    /// Collector failed to collect output.
-    #[error("Collector failed to collect output")]
-    CollectorFailed(#[from] CollectorError),
-}
-
 /// A handle to a spawned process with captured stdout/stderr streams.
 ///
 /// This type provides methods for waiting on process completion, terminating the process,
@@ -122,17 +83,24 @@ impl ProcessHandle<BroadcastOutputStream> {
         stderr_chunk_size: NumBytes,
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
-    ) -> io::Result<ProcessHandle<BroadcastOutputStream>> {
-        Self::prepare_command(&mut cmd).spawn().map(|child| {
-            Self::new_from_child_with_piped_io_and_capacity(
-                name,
-                child,
-                stdout_chunk_size,
-                stderr_chunk_size,
-                stdout_channel_capacity,
-                stderr_channel_capacity,
-            )
-        })
+    ) -> Result<ProcessHandle<BroadcastOutputStream>, SpawnError> {
+        let process_name = name.into();
+        Self::prepare_command(&mut cmd)
+            .spawn()
+            .map(|child| {
+                Self::new_from_child_with_piped_io_and_capacity(
+                    process_name.clone(),
+                    child,
+                    stdout_chunk_size,
+                    stderr_chunk_size,
+                    stdout_channel_capacity,
+                    stderr_channel_capacity,
+                )
+            })
+            .map_err(|source| SpawnError::SpawnFailed {
+                process_name,
+                source,
+            })
     }
 
     fn new_from_child_with_piped_io_and_capacity(
@@ -156,6 +124,7 @@ impl ProcessHandle<BroadcastOutputStream> {
             child,
             BroadcastOutputStream::from_stream(
                 stdout,
+                "stdout",
                 FromStreamOptions {
                     chunk_size: stdout_chunk_size,
                     channel_capacity: stdout_channel_capacity,
@@ -163,6 +132,7 @@ impl ProcessHandle<BroadcastOutputStream> {
             ),
             BroadcastOutputStream::from_stream(
                 stderr,
+                STDERR_STREAM_NAME,
                 FromStreamOptions {
                     chunk_size: stderr_chunk_size,
                     channel_capacity: stderr_channel_capacity,
@@ -258,17 +228,24 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
         stderr_chunk_size: NumBytes,
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
-    ) -> io::Result<Self> {
-        Self::prepare_command(&mut cmd).spawn().map(|child| {
-            Self::new_from_child_with_piped_io_and_capacity(
-                name,
-                child,
-                stdout_chunk_size,
-                stderr_chunk_size,
-                stdout_channel_capacity,
-                stderr_channel_capacity,
-            )
-        })
+    ) -> Result<Self, SpawnError> {
+        let process_name = name.into();
+        Self::prepare_command(&mut cmd)
+            .spawn()
+            .map(|child| {
+                Self::new_from_child_with_piped_io_and_capacity(
+                    process_name.clone(),
+                    child,
+                    stdout_chunk_size,
+                    stderr_chunk_size,
+                    stdout_channel_capacity,
+                    stderr_channel_capacity,
+                )
+            })
+            .map_err(|source| SpawnError::SpawnFailed {
+                process_name,
+                source,
+            })
     }
 
     fn new_from_child_with_piped_io_and_capacity(
@@ -292,6 +269,7 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
             child,
             SingleSubscriberOutputStream::from_stream(
                 stdout,
+                STDOUT_STREAM_NAME,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
                 FromStreamOptions {
                     chunk_size: stdout_chunk_size,
@@ -300,6 +278,7 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
             ),
             SingleSubscriberOutputStream::from_stream(
                 stderr,
+                STDERR_STREAM_NAME,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
                 FromStreamOptions {
                     chunk_size: stderr_chunk_size,
@@ -546,6 +525,7 @@ impl<O: OutputStream> ProcessHandle<O> {
 
         self.send_interrupt_signal()
             .map_err(|err| TerminationError::SignallingFailed {
+                process_name: self.name.clone(),
                 source: err,
                 signal: "SIGINT",
             })?;
@@ -561,6 +541,7 @@ impl<O: OutputStream> ProcessHandle<O> {
 
                 self.send_terminate_signal()
                     .map_err(|err| TerminationError::SignallingFailed {
+                        process_name: self.name.clone(),
                         source: err,
                         signal: "SIGTERM",
                     })?;
@@ -592,24 +573,29 @@ impl<O: OutputStream> ProcessHandle<O> {
                                             self.name
                                         );
                                         Err(TerminationError::TerminationFailed {
-                                            not_terminated_after_sigint,
-                                            not_terminated_after_sigterm,
-                                            not_terminated_after_sigkill,
+                                            process_name: self.name.clone(),
+                                            sigint_error: not_terminated_after_sigint.to_string(),
+                                            sigterm_error: not_terminated_after_sigterm.to_string(),
+                                            sigkill_error: io::Error::new(
+                                                io::ErrorKind::TimedOut,
+                                                not_terminated_after_sigkill.to_string(),
+                                            ),
                                         })
                                     }
                                 }
                             }
-                            Err(not_terminated_after_sigkill) => {
+                            Err(kill_error) => {
                                 tracing::error!(
                                     process = %self.name,
-                                    error = %not_terminated_after_sigkill,
+                                    error = %kill_error,
                                     "Forceful shutdown using SIGKILL (or equivalent on current platform) failed. Process may still be running. Manual intervention required!"
                                 );
 
                                 Err(TerminationError::TerminationFailed {
-                                    not_terminated_after_sigint,
-                                    not_terminated_after_sigterm,
-                                    not_terminated_after_sigkill,
+                                    process_name: self.name.clone(),
+                                    sigint_error: not_terminated_after_sigint.to_string(),
+                                    sigterm_error: not_terminated_after_sigterm.to_string(),
+                                    sigkill_error: kill_error,
                                 })
                             }
                         }
@@ -653,13 +639,25 @@ impl<O: OutputStream> ProcessHandle<O> {
     pub async fn wait_for_completion(
         &mut self,
         timeout: Option<Duration>,
-    ) -> io::Result<ExitStatus> {
+    ) -> Result<ExitStatus, WaitError> {
         match timeout {
-            None => self.wait().await,
-            Some(timeout) => match tokio::time::timeout(timeout, self.wait()).await {
-                Ok(exit_status) => exit_status,
-                Err(err) => Err(err.into()),
-            },
+            None => self.wait().await.map_err(|source| WaitError::IoError {
+                process_name: self.name.clone(),
+                source,
+            }),
+            Some(timeout_duration) => {
+                match tokio::time::timeout(timeout_duration, self.wait()).await {
+                    Ok(Ok(exit_status)) => Ok(exit_status),
+                    Ok(Err(source)) => Err(WaitError::IoError {
+                        process_name: self.name.clone(),
+                        source,
+                    }),
+                    Err(_elapsed) => Err(WaitError::Timeout {
+                        process_name: self.name.clone(),
+                        timeout: timeout_duration,
+                    }),
+                }
+            }
         }
     }
 

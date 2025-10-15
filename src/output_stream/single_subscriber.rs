@@ -1,4 +1,5 @@
 use crate::collector::{AsyncCollectFn, Collector, Sink};
+use crate::error::OutputError;
 use crate::inspector::Inspector;
 use crate::output_stream::impls::{
     impl_collect_chunks, impl_collect_chunks_async, impl_collect_lines, impl_collect_lines_async,
@@ -17,7 +18,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::error::Elapsed;
 
 /// The output stream from a process. Either representing stdout or stderr.
 ///
@@ -36,6 +36,9 @@ pub struct SingleSubscriberOutputStream {
 
     /// The maximum size of every chunk read by the backing `stream_reader`.
     chunk_size: NumBytes,
+
+    /// Name of this stream.
+    name: &'static str,
 }
 
 impl OutputStream for SingleSubscriberOutputStream {
@@ -45,6 +48,10 @@ impl OutputStream for SingleSubscriberOutputStream {
 
     fn channel_capacity(&self) -> usize {
         self.receiver.as_ref().expect("present").max_capacity()
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
     }
 }
 
@@ -190,6 +197,7 @@ impl SingleSubscriberOutputStream {
     /// Creates a new single subscriber output stream from an async read stream.
     pub fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
         stream: S,
+        stream_name: &'static str,
         backpressure_control: BackpressureControl,
         options: FromStreamOptions,
     ) -> SingleSubscriberOutputStream {
@@ -206,6 +214,7 @@ impl SingleSubscriberOutputStream {
             stream_reader,
             receiver: Some(rx_stdout),
             chunk_size: options.chunk_size,
+            name: stream_name,
         }
     }
 
@@ -248,7 +257,7 @@ impl SingleSubscriberOutputStream {
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_chunks(&mut self, f: impl Fn(Chunk) -> Next + Send + 'static) -> Inspector {
         let mut receiver = self.take_receiver();
-        impl_inspect_chunks!(receiver, f, handle_subscription)
+        impl_inspect_chunks!(self.name(), receiver, f, handle_subscription)
     }
 
     /// Inspects lines of output from the stream without storing them.
@@ -262,7 +271,7 @@ impl SingleSubscriberOutputStream {
         options: LineParsingOptions,
     ) -> Inspector {
         let mut receiver = self.take_receiver();
-        impl_inspect_lines!(receiver, f, options, handle_subscription)
+        impl_inspect_lines!(self.name(), receiver, f, options, handle_subscription)
     }
 
     /// Inspects lines of output from the stream without storing them, using an async closure.
@@ -279,7 +288,7 @@ impl SingleSubscriberOutputStream {
         Fut: Future<Output = Next> + Send,
     {
         let mut receiver = self.take_receiver();
-        impl_inspect_lines_async!(receiver, f, options, handle_subscription)
+        impl_inspect_lines_async!(self.name(), receiver, f, options, handle_subscription)
     }
 }
 
@@ -296,7 +305,7 @@ impl SingleSubscriberOutputStream {
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
-        impl_collect_chunks!(receiver, collect, sink, handle_subscription)
+        impl_collect_chunks!(self.name(), receiver, collect, sink, handle_subscription)
     }
 
     /// Collects chunks from the stream into a sink using an async closure.
@@ -310,7 +319,7 @@ impl SingleSubscriberOutputStream {
     {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
-        impl_collect_chunks_async!(receiver, collect, sink, handle_subscription)
+        impl_collect_chunks_async!(self.name(), receiver, collect, sink, handle_subscription)
     }
 
     /// Collects lines from the stream into a sink.
@@ -326,7 +335,14 @@ impl SingleSubscriberOutputStream {
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
-        impl_collect_lines!(receiver, collect, options, sink, handle_subscription)
+        impl_collect_lines!(
+            self.name(),
+            receiver,
+            collect,
+            options,
+            sink,
+            handle_subscription
+        )
     }
 
     /// Collects lines from the stream into a sink using an async closure.
@@ -346,7 +362,14 @@ impl SingleSubscriberOutputStream {
     {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
-        impl_collect_lines_async!(receiver, collect, options, sink, handle_subscription)
+        impl_collect_lines_async!(
+            self.name(),
+            receiver,
+            collect,
+            options,
+            sink,
+            handle_subscription
+        )
     }
 
     /// Convenience method to collect all chunks into a `Vec<u8>`.
@@ -467,7 +490,7 @@ impl SingleSubscriberOutputStream {
         &mut self,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
-    ) {
+    ) -> Result<(), InspectorError> {
         let inspector = self.inspect_lines(
             move |line| {
                 if predicate(line) {
@@ -478,26 +501,25 @@ impl SingleSubscriberOutputStream {
             },
             options,
         );
-        match inspector.wait().await {
-            Ok(()) => {}
-            Err(err) => match err {
-                InspectorError::TaskJoin(join_error) => {
-                    panic!("Inspector task join error: {join_error:#?}");
-                }
-            },
-        };
+        inspector.wait().await
     }
 
     /// Waits for a line that matches the given predicate, with a timeout.
     ///
-    /// Returns `Ok(())` if a matching line is found, or `Err(Elapsed)` if the timeout expires.
+    /// Returns `Ok(())` if a matching line is found, or `Err(OutputError::Timeout)` if the timeout expires.
     pub async fn wait_for_line_with_timeout(
         &mut self,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
         timeout: Duration,
-    ) -> Result<(), Elapsed> {
-        tokio::time::timeout(timeout, self.wait_for_line(predicate, options)).await
+    ) -> Result<(), OutputError> {
+        tokio::time::timeout(timeout, self.wait_for_line(predicate, options))
+            .await
+            .map_err(|_elapsed| OutputError::Timeout {
+                stream_name: self.name(),
+                timeout,
+            })
+            .and_then(|res| res.map_err(OutputError::InspectorFailed))
     }
 }
 
@@ -556,6 +578,7 @@ mod tests {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
+            "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 channel_capacity: 2,
@@ -613,6 +636,7 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
+            "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions::default(),
         );
@@ -656,6 +680,7 @@ mod tests {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
+            "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 chunk_size: 32.bytes(),
@@ -704,6 +729,7 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
+            "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 channel_capacity: 32,
@@ -736,6 +762,7 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
+            "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 chunk_size: 32.bytes(),
@@ -771,6 +798,7 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
+            "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions {
                 chunk_size: 32.bytes(),
@@ -809,6 +837,7 @@ mod tests {
         let (read_half, _write_half) = tokio::io::duplex(64);
         let mut os = SingleSubscriberOutputStream::from_stream(
             read_half,
+            "custom",
             BackpressureControl::DropLatestIncomingIfBufferFull,
             FromStreamOptions::default(),
         );

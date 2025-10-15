@@ -1,5 +1,5 @@
-use crate::{InspectorError, NumBytes};
 use crate::collector::{AsyncCollectFn, Collector, Sink};
+use crate::error::OutputError;
 use crate::inspector::Inspector;
 use crate::output_stream::impls::{
     impl_collect_chunks, impl_collect_chunks_async, impl_collect_lines, impl_collect_lines_async,
@@ -7,6 +7,7 @@ use crate::output_stream::impls::{
 };
 use crate::output_stream::{Chunk, FromStreamOptions, LineReader, Next};
 use crate::output_stream::{LineParsingOptions, OutputStream};
+use crate::{InspectorError, NumBytes};
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -16,7 +17,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
-use tokio::time::error::Elapsed;
 
 /// The output stream from a process. Either representing stdout or stderr.
 ///
@@ -37,7 +37,11 @@ pub struct BroadcastOutputStream {
     /// The maximum size of every chunk read by the backing `stream_reader`.
     chunk_size: NumBytes,
 
+    /// The maximum capacity of the channel caching the chunks before being processed.
     max_channel_capacity: usize,
+
+    /// Name of this stream.
+    name: &'static str,
 }
 
 impl OutputStream for BroadcastOutputStream {
@@ -47,6 +51,10 @@ impl OutputStream for BroadcastOutputStream {
 
     fn channel_capacity(&self) -> usize {
         self.max_channel_capacity
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
     }
 }
 
@@ -137,6 +145,7 @@ async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
 impl BroadcastOutputStream {
     pub(crate) fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
         stream: S,
+        stream_name: &'static str,
         options: FromStreamOptions,
     ) -> BroadcastOutputStream {
         let (sender, receiver) = broadcast::channel::<Option<Chunk>>(options.channel_capacity);
@@ -148,7 +157,8 @@ impl BroadcastOutputStream {
             stream_reader,
             sender,
             chunk_size: options.chunk_size,
-            max_channel_capacity: options.channel_capacity
+            max_channel_capacity: options.channel_capacity,
+            name: stream_name,
         }
     }
 
@@ -195,7 +205,7 @@ impl BroadcastOutputStream {
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
     pub fn inspect_chunks(&self, mut f: impl FnMut(Chunk) -> Next + Send + 'static) -> Inspector {
         let mut receiver = self.subscribe();
-        impl_inspect_chunks!(receiver, f, handle_subscription)
+        impl_inspect_chunks!(self.name(), receiver, f, handle_subscription)
     }
 
     /// Inspects lines of output from the stream without storing them.
@@ -209,7 +219,7 @@ impl BroadcastOutputStream {
         options: LineParsingOptions,
     ) -> Inspector {
         let mut receiver = self.subscribe();
-        impl_inspect_lines!(receiver, f, options, handle_subscription)
+        impl_inspect_lines!(self.name(), receiver, f, options, handle_subscription)
     }
 
     /// Inspects lines of output from the stream without storing them, using an async closure.
@@ -226,7 +236,7 @@ impl BroadcastOutputStream {
         Fut: Future<Output = Next> + Send,
     {
         let mut receiver = self.subscribe();
-        impl_inspect_lines_async!(receiver, f, options, handle_subscription)
+        impl_inspect_lines_async!(self.name(), receiver, f, options, handle_subscription)
     }
 }
 
@@ -243,7 +253,7 @@ impl BroadcastOutputStream {
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.subscribe();
-        impl_collect_chunks!(receiver, collect, sink, handle_subscription)
+        impl_collect_chunks!(self.name(), receiver, collect, sink, handle_subscription)
     }
 
     /// Collects chunks from the stream into a sink using an async closure.
@@ -257,7 +267,7 @@ impl BroadcastOutputStream {
     {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.subscribe();
-        impl_collect_chunks_async!(receiver, collect, sink, handle_subscription)
+        impl_collect_chunks_async!(self.name(), receiver, collect, sink, handle_subscription)
     }
 
     /// Collects lines from the stream into a sink.
@@ -273,7 +283,14 @@ impl BroadcastOutputStream {
     ) -> Collector<S> {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.subscribe();
-        impl_collect_lines!(receiver, collect, options, sink, handle_subscription)
+        impl_collect_lines!(
+            self.name(),
+            receiver,
+            collect,
+            options,
+            sink,
+            handle_subscription
+        )
     }
 
     /// Collects lines from the stream into a sink using an async closure.
@@ -293,7 +310,14 @@ impl BroadcastOutputStream {
     {
         let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.subscribe();
-        impl_collect_lines_async!(receiver, collect, options, sink, handle_subscription)
+        impl_collect_lines_async!(
+            self.name(),
+            receiver,
+            collect,
+            options,
+            sink,
+            handle_subscription
+        )
     }
 
     /// Convenience method to collect all chunks into a `Vec<u8>`.
@@ -411,7 +435,7 @@ impl BroadcastOutputStream {
         &self,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
-    ) {
+    ) -> Result<(), InspectorError> {
         let inspector = self.inspect_lines(
             move |line| {
                 if predicate(line) {
@@ -422,26 +446,25 @@ impl BroadcastOutputStream {
             },
             options,
         );
-        match inspector.wait().await {
-            Ok(()) => {}
-            Err(err) => match err {
-                InspectorError::TaskJoin(join_error) => {
-                    panic!("Inspector task join error: {join_error:#?}");
-                }
-            },
-        };
+        inspector.wait().await
     }
 
     /// Waits for a line that matches the given predicate, with a timeout.
     ///
-    /// Returns `Ok(())` if a matching line is found, or `Err(Elapsed)` if the timeout expires.
+    /// Returns `Ok(())` if a matching line is found, or `Err(OutputError::Timeout)` if the timeout expires.
     pub async fn wait_for_line_with_timeout(
         &self,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
         timeout: Duration,
-    ) -> Result<(), Elapsed> {
-        tokio::time::timeout(timeout, self.wait_for_line(predicate, options)).await
+    ) -> Result<(), OutputError> {
+        tokio::time::timeout(timeout, self.wait_for_line(predicate, options))
+            .await
+            .map_err(|_elapsed| OutputError::Timeout {
+                stream_name: self.name(),
+                timeout,
+            })
+            .and_then(|res| res.map_err(OutputError::InspectorFailed))
     }
 }
 
@@ -458,6 +481,7 @@ pub struct LineConfig {
 #[cfg(test)]
 mod tests {
     use super::read_chunked;
+    use crate::NumBytesExt;
     use crate::output_stream::broadcast::BroadcastOutputStream;
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{FromStreamOptions, LineParsingOptions, Next};
@@ -473,7 +497,6 @@ mod tests {
     use tokio::sync::broadcast;
     use tokio::time::sleep;
     use tracing_test::traced_test;
-    use crate::NumBytesExt;
 
     #[tokio::test]
     #[traced_test]
@@ -527,6 +550,7 @@ mod tests {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(
             read_half,
+            "custom",
             FromStreamOptions {
                 channel_capacity: 2,
                 ..Default::default()
@@ -584,7 +608,8 @@ mod tests {
     #[tokio::test]
     async fn inspect_lines() {
         let (read_half, write_half) = tokio::io::duplex(64);
-        let os = BroadcastOutputStream::from_stream(read_half, FromStreamOptions::default());
+        let os =
+            BroadcastOutputStream::from_stream(read_half, "custom", FromStreamOptions::default());
 
         #[automock]
         trait LineVisitor {
@@ -625,6 +650,7 @@ mod tests {
         let (read_half, mut write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(
             read_half,
+            "custom",
             FromStreamOptions {
                 chunk_size: 32.bytes(),
                 ..Default::default()
@@ -672,6 +698,7 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(
             read_half,
+            "custom",
             FromStreamOptions {
                 channel_capacity: 32,
                 ..Default::default()
@@ -703,6 +730,7 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(
             read_half,
+            "custom",
             FromStreamOptions {
                 chunk_size: 32.bytes(),
                 ..Default::default()
@@ -737,6 +765,7 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let os = BroadcastOutputStream::from_stream(
             read_half,
+            "custom",
             FromStreamOptions {
                 chunk_size: 32.bytes(),
                 ..Default::default()
@@ -776,6 +805,7 @@ mod tests {
 
         let os = BroadcastOutputStream::from_stream(
             read_half,
+            "custom",
             FromStreamOptions {
                 // Big enough to hold any individual test write that we perform.
                 // Actual chunks will be smaller.

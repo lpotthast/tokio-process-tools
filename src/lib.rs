@@ -6,6 +6,7 @@
 
 mod async_drop;
 mod collector;
+mod error;
 mod inspector;
 mod output;
 mod output_stream;
@@ -17,6 +18,7 @@ mod terminate_on_drop;
 
 /* public exports */
 pub use collector::{Collector, CollectorError, Sink};
+pub use error::{OutputError, SpawnError, TerminationError, WaitError};
 pub use inspector::{Inspector, InspectorError};
 pub use output::Output;
 pub use output_stream::{
@@ -24,7 +26,7 @@ pub use output_stream::{
     NumBytes, NumBytesExt, OutputStream, broadcast, single_subscriber,
 };
 pub use process::{AutoName, AutoNameSettings, Process, ProcessName};
-pub use process_handle::{ProcessHandle, RunningState, TerminationError, WaitError};
+pub use process_handle::{ProcessHandle, RunningState};
 pub use terminate_on_drop::TerminateOnDrop;
 
 #[cfg(test)]
