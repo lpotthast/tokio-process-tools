@@ -4,7 +4,7 @@ use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
 use crate::output_stream::{BackpressureControl, FromStreamOptions};
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
-use crate::{CollectorError, LineParsingOptions, OutputStream, signal};
+use crate::{CollectorError, LineParsingOptions, NumBytes, OutputStream, signal};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
@@ -12,9 +12,6 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Child;
-
-/// Default channel capacity for stdout and stderr streams.
-const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 
 /// Maximum time to wait for process termination after sending SIGKILL.
 ///
@@ -114,25 +111,15 @@ pub struct ProcessHandle<O: OutputStream> {
 }
 
 impl ProcessHandle<BroadcastOutputStream> {
-    /// Spawns a new process with broadcast output streams.
-    ///
-    /// Uses a default channel capacity of 128 for both stdout and stderr.
-    pub fn spawn(
-        name: impl Into<Cow<'static, str>>,
-        cmd: tokio::process::Command,
-    ) -> io::Result<ProcessHandle<BroadcastOutputStream>> {
-        Self::spawn_with_capacity(
-            name,
-            cmd,
-            DEFAULT_CHANNEL_CAPACITY,
-            DEFAULT_CHANNEL_CAPACITY,
-        )
-    }
-
     /// Spawns a new process with broadcast output streams and custom channel capacities.
-    pub fn spawn_with_capacity(
+    ///
+    /// This method is intended for internal use by the `Process` builder.
+    /// Users should use `Process::new(cmd).spawn_broadcast()` instead.
+    pub(crate) fn spawn_with_capacity(
         name: impl Into<Cow<'static, str>>,
         mut cmd: tokio::process::Command,
+        stdout_chunk_size: NumBytes,
+        stderr_chunk_size: NumBytes,
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
     ) -> io::Result<ProcessHandle<BroadcastOutputStream>> {
@@ -140,6 +127,8 @@ impl ProcessHandle<BroadcastOutputStream> {
             Self::new_from_child_with_piped_io_and_capacity(
                 name,
                 child,
+                stdout_chunk_size,
+                stderr_chunk_size,
                 stdout_channel_capacity,
                 stderr_channel_capacity,
             )
@@ -149,6 +138,8 @@ impl ProcessHandle<BroadcastOutputStream> {
     fn new_from_child_with_piped_io_and_capacity(
         name: impl Into<Cow<'static, str>>,
         mut child: Child,
+        stdout_chunk_size: NumBytes,
+        stderr_chunk_size: NumBytes,
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
     ) -> ProcessHandle<BroadcastOutputStream> {
@@ -166,15 +157,15 @@ impl ProcessHandle<BroadcastOutputStream> {
             BroadcastOutputStream::from_stream(
                 stdout,
                 FromStreamOptions {
+                    chunk_size: stdout_chunk_size,
                     channel_capacity: stdout_channel_capacity,
-                    ..Default::default()
                 },
             ),
             BroadcastOutputStream::from_stream(
                 stderr,
                 FromStreamOptions {
+                    chunk_size: stderr_chunk_size,
                     channel_capacity: stderr_channel_capacity,
-                    ..Default::default()
                 },
             ),
         );
@@ -196,10 +187,10 @@ impl ProcessHandle<BroadcastOutputStream> {
     ///
     /// You may want to destructure this using:
     /// ```no_run
+    /// # use tokio::process::Command;
     /// # use tokio_process_tools::*;
-    /// # use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
     /// # tokio_test::block_on(async {
-    /// # let mut proc = ProcessHandle::<SingleSubscriberOutputStream>::spawn("cmd", tokio::process::Command::new("ls")).unwrap();
+    /// # let mut proc = Process::new(Command::new("ls")).spawn_broadcast().unwrap();
     /// let Output {
     ///     status,
     ///     stdout,
@@ -256,25 +247,15 @@ impl ProcessHandle<BroadcastOutputStream> {
 }
 
 impl ProcessHandle<SingleSubscriberOutputStream> {
-    /// Spawns a new process with single subscriber output streams.
-    ///
-    /// Uses a default channel capacity of 128 for both stdout and stderr.
-    pub fn spawn(
-        name: impl Into<Cow<'static, str>>,
-        cmd: tokio::process::Command,
-    ) -> io::Result<Self> {
-        Self::spawn_with_capacity(
-            name,
-            cmd,
-            DEFAULT_CHANNEL_CAPACITY,
-            DEFAULT_CHANNEL_CAPACITY,
-        )
-    }
-
     /// Spawns a new process with single subscriber output streams and custom channel capacities.
-    pub fn spawn_with_capacity(
+    ///
+    /// This method is intended for internal use by the `Process` builder.
+    /// Users should use `Process::new(cmd).spawn_single_subscriber()` instead.
+    pub(crate) fn spawn_with_capacity(
         name: impl Into<Cow<'static, str>>,
         mut cmd: tokio::process::Command,
+        stdout_chunk_size: NumBytes,
+        stderr_chunk_size: NumBytes,
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
     ) -> io::Result<Self> {
@@ -282,6 +263,8 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
             Self::new_from_child_with_piped_io_and_capacity(
                 name,
                 child,
+                stdout_chunk_size,
+                stderr_chunk_size,
                 stdout_channel_capacity,
                 stderr_channel_capacity,
             )
@@ -291,6 +274,8 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
     fn new_from_child_with_piped_io_and_capacity(
         name: impl Into<Cow<'static, str>>,
         mut child: Child,
+        stdout_chunk_size: NumBytes,
+        stderr_chunk_size: NumBytes,
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
     ) -> Self {
@@ -309,16 +294,16 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
                 stdout,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
                 FromStreamOptions {
+                    chunk_size: stdout_chunk_size,
                     channel_capacity: stdout_channel_capacity,
-                    ..Default::default()
                 },
             ),
             SingleSubscriberOutputStream::from_stream(
                 stderr,
                 BackpressureControl::DropLatestIncomingIfBufferFull,
                 FromStreamOptions {
+                    chunk_size: stderr_chunk_size,
                     channel_capacity: stderr_channel_capacity,
-                    ..Default::default()
                 },
             ),
         );
@@ -341,9 +326,8 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
     /// You may want to destructure this using:
     /// ```no_run
     /// # use tokio_process_tools::*;
-    /// # use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
     /// # tokio_test::block_on(async {
-    /// # let mut proc = ProcessHandle::<SingleSubscriberOutputStream>::spawn("cmd", tokio::process::Command::new("ls")).unwrap();
+    /// # let mut proc = Process::new(tokio::process::Command::new("ls")).spawn_broadcast().unwrap();
     /// let Output {
     ///     status,
     ///     stdout,
@@ -716,7 +700,10 @@ mod tests {
         cmd.arg("5");
 
         let started_at = jiff::Zoned::now();
-        let mut handle = ProcessHandle::<BroadcastOutputStream>::spawn("sleep", cmd).unwrap();
+        let mut handle = crate::Process::new(cmd)
+            .name("sleep")
+            .spawn_broadcast()
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let exit_status = handle
             .terminate(Duration::from_secs(1), Duration::from_secs(1))

@@ -10,6 +10,7 @@ mod inspector;
 mod output;
 mod output_stream;
 mod panic_on_drop;
+mod process;
 mod process_handle;
 mod signal;
 mod terminate_on_drop;
@@ -19,25 +20,26 @@ pub use collector::{Collector, CollectorError, Sink};
 pub use inspector::{Inspector, InspectorError};
 pub use output::Output;
 pub use output_stream::{
-    LineOverflowBehavior, LineParsingOptions, Next, NumBytes, NumBytesExt, OutputStream, broadcast,
-    single_subscriber,
+    DEFAULT_CHANNEL_CAPACITY, DEFAULT_CHUNK_SIZE, LineOverflowBehavior, LineParsingOptions, Next,
+    NumBytes, NumBytesExt, OutputStream, broadcast, single_subscriber,
 };
+pub use process::{AutoName, AutoNameSettings, Process, ProcessName};
 pub use process_handle::{ProcessHandle, RunningState, TerminationError, WaitError};
 pub use terminate_on_drop::TerminateOnDrop;
 
 #[cfg(test)]
 mod test {
     use crate::output::Output;
-    use crate::output_stream::broadcast::BroadcastOutputStream;
-    use crate::{LineParsingOptions, ProcessHandle, RunningState};
+    use crate::{LineParsingOptions, Process, RunningState};
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::process::Command;
 
     #[tokio::test]
     async fn wait_with_output() {
-        let cmd = Command::new("ls");
-        let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("ls", cmd)
+        let mut process = Process::new(Command::new("ls"))
+            .name("ls")
+            .spawn_broadcast()
             .expect("Failed to spawn `ls` command");
         let Output {
             status,
@@ -64,7 +66,9 @@ mod test {
     async fn is_running() {
         let mut cmd = Command::new("sleep");
         cmd.arg("1");
-        let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("sleep", cmd)
+        let mut process = Process::new(cmd)
+            .name("sleep")
+            .spawn_broadcast()
             .expect("Failed to spawn `sleep` command");
 
         match process.is_running() {
@@ -97,7 +101,9 @@ mod test {
     async fn terminate() {
         let mut cmd = Command::new("sleep");
         cmd.arg("1000");
-        let mut process = ProcessHandle::<BroadcastOutputStream>::spawn("sleep", cmd)
+        let mut process = Process::new(cmd)
+            .name("sleep")
+            .spawn_broadcast()
             .expect("Failed to spawn `sleep` command");
         process
             .terminate(Duration::from_secs(1), Duration::from_secs(1))
