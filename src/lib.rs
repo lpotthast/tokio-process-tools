@@ -26,7 +26,7 @@ pub use output_stream::{
     NumBytes, NumBytesExt, OutputStream, broadcast, single_subscriber,
 };
 pub use process::{AutoName, AutoNameSettings, Process, ProcessName};
-pub use process_handle::{ProcessHandle, RunningState};
+pub use process_handle::{ProcessHandle, RunningState, Stdin};
 pub use terminate_on_drop::TerminateOnDrop;
 
 #[allow(dead_code)]

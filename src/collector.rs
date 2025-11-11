@@ -67,6 +67,22 @@ impl<S: Sink> Collector<S> {
     /// 3. The first `Next::Break` is observed.
     ///
     /// If none of these may occur in your case, this could/will hang forever!
+    ///
+    /// The stdout/stderr streams naturally close when the process is terminated, so `wait`ing
+    /// on a collector after termination is fine:
+    ///
+    /// ```rust, no_run
+    /// # async fn test() {
+    /// # use std::time::Duration;
+    /// # use tokio_process_tools::{LineParsingOptions, Process};
+    ///
+    /// # let cmd = tokio::process::Command::new("ls");
+    /// let mut process = Process::new(cmd).spawn_broadcast().unwrap();
+    /// let collector = process.stdout().collect_lines_into_vec(LineParsingOptions::default());
+    /// process.terminate(Duration::from_secs(1), Duration::from_secs(1)).await.unwrap();
+    /// let collected = collector.wait().await.unwrap(); // This will return immediately.
+    /// # }
+    /// ```
     pub async fn wait(mut self) -> Result<S, CollectorError> {
         // Take the `task_termination_sender`. Let's make sure nobody can ever interfere with us
         // waiting here. DO NOT drop it, or the task will terminate (at least if it also takes the

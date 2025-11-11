@@ -1,6 +1,6 @@
 [package]
 name = "tokio-process-tools"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 rust-version = "1.85.0"
 repository = "https://github.com/lpotthast/tokio-process-tools"
@@ -27,8 +27,8 @@ nix = { version = "0.30.1", default-features = false, features = ["signal", "pro
 windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Console"] }
 
 [dev-dependencies]
-assertr = "0.4.0"
-jiff = "0.2.15"
+assertr = "0.4.2"
+jiff = "0.2.16"
 mockall = "0.13.1"
 tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["fs"] }

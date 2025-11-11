@@ -6,9 +6,10 @@ When working with child processes in async Rust, you often need to:
 
 - **Monitor output in real-time** without blocking
 - **Wait for specific log messages** before proceeding
-- **Gracefully terminate** processes with proper signal handling
 - **Collect output** for later analysis
 - **Handle multiple concurrent consumers** of the same stream
+- **Write input data to processes** programmatically
+- **Gracefully terminate** processes with proper signal handling
 - **Prevent spawned processes from leaking**, not being terminated properly
 
 `tokio-process-tools` tries to make all of this simple and ergonomic.
@@ -19,6 +20,7 @@ When working with child processes in async Rust, you often need to:
 - 🔍 **Pattern Matching** - Wait for specific output before continuing execution
 - 🎯 **Flexible Collection** - Gather output into vectors, files, or custom sinks
 - 🔄 **Multiple Consumers** - Support for both single and broadcast (multi-consumer) stream consumption
+- 📝 **Programmatic Process Input** - Write data to the processes stdin stream, close it when done
 - ⚡ **Graceful Termination** - Automatic signal escalation (SIGINT → SIGTERM → SIGKILL)
 - 🛡️ **Collection Safety** - Fine-grained control over buffers used when collecting stdout/stderr streams
 - 🛡️ **Resource Safety** - Panic-on-drop guards ensure processes are properly cleaned up
@@ -228,6 +230,108 @@ async fn main() {
 }
 ```
 
+## Input Handling (stdin)
+
+### Writing to Process stdin
+
+Process stdin is always (and automatically) configured as piped, allowing you to write data to processes
+programmatically:
+
+```rust ,no_run
+use std::time::Duration;
+use tokio_process_tools::*;
+use tokio::process::Command;
+use tokio::io::AsyncWriteExt;
+
+#[tokio::main]
+async fn main() {
+    let mut cmd = Command::new("cat");
+    let mut process = Process::new(cmd)
+        .spawn_broadcast()
+        .unwrap();
+
+    // Write data to stdin.
+    if let Some(stdin) = process.stdin().as_mut() {
+        stdin.write_all(b"Hello, process!\n").await.unwrap();
+        stdin.write_all(b"More input data\n").await.unwrap();
+        stdin.flush().await.unwrap();
+    }
+
+    // Close stdin to signal EOF.
+    process.stdin().close();
+
+    // Collect output.
+    let output = process
+        .wait_for_completion_with_output(
+            Some(Duration::from_secs(2)),
+            LineParsingOptions::default()
+        )
+        .await
+        .unwrap();
+
+    println!("Output: {:?}", output.stdout);
+}
+```
+
+### Interactive Process Communication
+
+Send commands to interactive programs and wait for responses:
+
+```rust ,no_run
+use assertr::prelude::*;
+use tokio_process_tools::*;
+use tokio::process::Command;
+use tokio::io::AsyncWriteExt;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() {
+    let mut cmd = Command::new("python3");
+    cmd.arg("-i"); // Interactive mode.
+
+    let mut process = Process::new(cmd).spawn_broadcast().unwrap();
+
+    // Monitor output.
+    let collector = process
+        .stdout()
+        .collect_lines_into_vec(LineParsingOptions::default());
+
+    // Send command to Python.
+    if let Some(stdin) = process.stdin().as_mut() {
+        stdin
+            .write_all(b"print('Hello from Python')\n")
+            .await
+            .unwrap();
+        stdin.flush().await.unwrap();
+    }
+
+    // Wait a bit for output.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // We can either:
+    // - not close stdin and manually `terminate` the process or
+    // - close stdin, and wait for the process to naturally terminate (which python3 will).
+    process.stdin().close();
+    process
+        .wait_for_completion(Some(Duration::from_secs(1)))
+        .await
+        .unwrap();
+
+    let collected = collector.wait().await.unwrap();
+    assert_that(&collected).has_length(1);
+    assert_that(collected[0].as_str()).is_equal_to("Hello from Python");
+}
+```
+
+### Key Points about stdin handling
+
+- **Always Piped**: stdin is automatically configured as `Stdio::piped()` for all processes, only allowing controlled
+  input.
+- **Writing**: `stdin().as_mut()` directly exposes tokio's `ChildStdin` type allowing writes using the `AsyncWriteExt`
+  trait methods, like `write_all()` and `flush()`.
+- **Closing**: Call `stdin().close()` to let the process receive an EOF signal on its stdin stream and allowing no
+  further writes.
+
 ## Advanced Processing
 
 ### Configuring Buffer Sizes
@@ -257,7 +361,7 @@ async fn main() {
         .stderr_chunk_size(4.kilobytes())
         // Or set both at once.
         .chunk_sizes(32.kilobytes())
-        
+
         // Configure channel capacities (how many chunks can be buffered).
         .stdout_capacity(64)
         .stderr_capacity(64)

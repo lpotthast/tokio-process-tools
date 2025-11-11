@@ -11,7 +11,7 @@ use std::fmt::Debug;
 use std::io;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
-use tokio::process::Child;
+use tokio::process::{Child, ChildStdin};
 
 const STDOUT_STREAM_NAME: &str = "stdout";
 const STDERR_STREAM_NAME: &str = "stderr";
@@ -21,6 +21,42 @@ const STDERR_STREAM_NAME: &str = "stderr";
 /// This is a safety timeout since SIGKILL should terminate processes immediately,
 /// but there are rare cases where even SIGKILL may not work.
 const SIGKILL_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Represents the stdin stream of a child process.
+///
+/// stdin is always configured as piped, so it starts as `Open` with a [`ChildStdin`] handle
+/// that can be used to write data to the process. It can be explicitly closed by calling
+/// [`Stdin::close`], after which it transitions to the `Closed` state.
+#[derive(Debug)]
+pub enum Stdin {
+    /// stdin is open and available for writing.
+    Open(ChildStdin),
+    /// stdin has been closed.
+    Closed,
+}
+
+impl Stdin {
+    /// Returns `true` if stdin is open and available for writing.
+    pub fn is_open(&self) -> bool {
+        matches!(self, Stdin::Open(_))
+    }
+
+    /// Returns a mutable reference to the underlying [`ChildStdin`] if open, or `None` if closed.
+    pub fn as_mut(&mut self) -> Option<&mut ChildStdin> {
+        match self {
+            Stdin::Open(stdin) => Some(stdin),
+            Stdin::Closed => None,
+        }
+    }
+
+    /// Closes stdin by dropping the underlying [`ChildStdin`] handle.
+    ///
+    /// This sends `EOF` to the child process. After calling this method, this stdin
+    /// will be in the `Closed` state and no further writes will be possible.
+    pub fn close(&mut self) {
+        *self = Stdin::Closed;
+    }
+}
 
 /// Represents the running state of a process.
 #[derive(Debug)]
@@ -66,6 +102,7 @@ impl From<RunningState> for bool {
 pub struct ProcessHandle<O: OutputStream> {
     pub(crate) name: Cow<'static, str>,
     child: Child,
+    std_in: Stdin,
     std_out_stream: O,
     std_err_stream: O,
     panic_on_drop: Option<PanicOnDrop>,
@@ -111,6 +148,10 @@ impl ProcessHandle<BroadcastOutputStream> {
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
     ) -> ProcessHandle<BroadcastOutputStream> {
+        let std_in = match child.stdin.take() {
+            Some(stdin) => Stdin::Open(stdin),
+            None => Stdin::Closed,
+        };
         let stdout = child
             .stdout
             .take()
@@ -120,29 +161,27 @@ impl ProcessHandle<BroadcastOutputStream> {
             .take()
             .expect("Child process stderr wasn't captured");
 
-        let (child, std_out_stream, std_err_stream) = (
-            child,
-            BroadcastOutputStream::from_stream(
-                stdout,
-                "stdout",
-                FromStreamOptions {
-                    chunk_size: stdout_chunk_size,
-                    channel_capacity: stdout_channel_capacity,
-                },
-            ),
-            BroadcastOutputStream::from_stream(
-                stderr,
-                STDERR_STREAM_NAME,
-                FromStreamOptions {
-                    chunk_size: stderr_chunk_size,
-                    channel_capacity: stderr_channel_capacity,
-                },
-            ),
+        let std_out_stream = BroadcastOutputStream::from_stream(
+            stdout,
+            STDOUT_STREAM_NAME,
+            FromStreamOptions {
+                chunk_size: stdout_chunk_size,
+                channel_capacity: stdout_channel_capacity,
+            },
+        );
+        let std_err_stream = BroadcastOutputStream::from_stream(
+            stderr,
+            STDERR_STREAM_NAME,
+            FromStreamOptions {
+                chunk_size: stderr_chunk_size,
+                channel_capacity: stderr_channel_capacity,
+            },
         );
 
         let mut this = ProcessHandle {
             name: name.into(),
             child,
+            std_in,
             std_out_stream,
             std_err_stream,
             panic_on_drop: None,
@@ -256,6 +295,10 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
     ) -> Self {
+        let std_in = match child.stdin.take() {
+            Some(stdin) => Stdin::Open(stdin),
+            None => Stdin::Closed,
+        };
         let stdout = child
             .stdout
             .take()
@@ -265,31 +308,29 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
             .take()
             .expect("Child process stderr wasn't captured");
 
-        let (child, std_out_stream, std_err_stream) = (
-            child,
-            SingleSubscriberOutputStream::from_stream(
-                stdout,
-                STDOUT_STREAM_NAME,
-                BackpressureControl::DropLatestIncomingIfBufferFull,
-                FromStreamOptions {
-                    chunk_size: stdout_chunk_size,
-                    channel_capacity: stdout_channel_capacity,
-                },
-            ),
-            SingleSubscriberOutputStream::from_stream(
-                stderr,
-                STDERR_STREAM_NAME,
-                BackpressureControl::DropLatestIncomingIfBufferFull,
-                FromStreamOptions {
-                    chunk_size: stderr_chunk_size,
-                    channel_capacity: stderr_channel_capacity,
-                },
-            ),
+        let std_out_stream = SingleSubscriberOutputStream::from_stream(
+            stdout,
+            STDOUT_STREAM_NAME,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions {
+                chunk_size: stdout_chunk_size,
+                channel_capacity: stdout_channel_capacity,
+            },
+        );
+        let std_err_stream = SingleSubscriberOutputStream::from_stream(
+            stderr,
+            STDERR_STREAM_NAME,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions {
+                chunk_size: stderr_chunk_size,
+                channel_capacity: stderr_channel_capacity,
+            },
         );
 
         let mut this = ProcessHandle {
             name: name.into(),
             child,
+            std_in,
             std_out_stream,
             std_err_stream,
             panic_on_drop: None,
@@ -386,6 +427,7 @@ impl<O: OutputStream> ProcessHandle<O> {
 
     fn prepare_command(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
         Self::prepare_platform_specifics(command)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // It is much too easy to leave dangling resources here and there.
@@ -418,6 +460,37 @@ impl<O: OutputStream> ProcessHandle<O> {
             }
             Err(err) => RunningState::Uncertain(err),
         }
+    }
+
+    /// Returns a mutable reference to the (potentially already closed) stdin stream.
+    ///
+    /// Use this to write data to the child process's stdin. The stdin stream implements
+    /// [`tokio::io::AsyncWrite`], allowing you to use methods like `write_all()` and `flush()`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use tokio::process::Command;
+    /// # use tokio_process_tools::*;
+    /// # use tokio::io::AsyncWriteExt;
+    /// # tokio_test::block_on(async {
+    /// // Whether we `spawn_broadcast` or `spawn_single_subscriber` does not make a difference here.
+    /// let mut process = Process::new(Command::new("cat"))
+    ///     .spawn_broadcast()
+    ///     .unwrap();
+    ///
+    /// // Write to stdin.
+    /// if let Some(stdin) = process.stdin().as_mut() {
+    ///     stdin.write_all(b"Hello, process!\n").await.unwrap();
+    ///     stdin.flush().await.unwrap();
+    /// }
+    ///
+    /// // Close stdin to signal EOF.
+    /// process.stdin().close();
+    /// # });
+    /// ```
+    pub fn stdin(&mut self) -> &mut Stdin {
+        &mut self.std_in
     }
 
     /// Returns a reference to the stdout stream.
@@ -689,6 +762,7 @@ impl<O: OutputStream> ProcessHandle<O> {
 mod tests {
     use super::*;
     use assertr::prelude::*;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn test_termination() {
@@ -715,5 +789,133 @@ mod tests {
 
         // When terminated, we do not get an exit code (unix).
         assert_that(exit_status.code()).is_none();
+    }
+
+    #[tokio::test]
+    async fn test_stdin_write_and_read() {
+        let cmd = tokio::process::Command::new("cat");
+        let mut process = crate::Process::new(cmd)
+            .name("cat")
+            .spawn_broadcast()
+            .unwrap();
+
+        // Verify stdin starts as open.
+        assert_that(process.stdin().is_open()).is_true();
+
+        // Write to stdin.
+        let test_data = b"Hello from stdin!\n";
+        if let Some(stdin) = process.stdin().as_mut() {
+            stdin.write_all(test_data).await.unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        // Close stdin to signal EOF.
+        process.stdin().close();
+        assert_that(process.stdin().is_open()).is_false();
+
+        // Collect stdout.
+        let output = process
+            .wait_for_completion_with_output(
+                Some(Duration::from_secs(2)),
+                LineParsingOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_that(output.status.success()).is_true();
+        assert_that(&output.stdout).has_length(1);
+        assert_that(output.stdout[0].as_str()).is_equal_to("Hello from stdin!");
+    }
+
+    #[tokio::test]
+    async fn test_stdin_close_sends_eof() {
+        // Use `cat` which will exit when stdin is closed.
+        let cmd = tokio::process::Command::new("cat");
+        let mut process = crate::Process::new(cmd)
+            .name("cat")
+            .spawn_broadcast()
+            .unwrap();
+
+        // Close stdin immediately without writing.
+        process.stdin().close();
+        assert_that(process.stdin().is_open()).is_false();
+
+        // Process should terminate since it receives EOF.
+        let status = process
+            .wait_for_completion(Some(Duration::from_secs(2)))
+            .await
+            .unwrap();
+
+        assert_that(status.success()).is_true();
+    }
+
+    #[tokio::test]
+    async fn test_stdin_multiple_writes() {
+        let cmd = tokio::process::Command::new("cat");
+        let mut process = crate::Process::new(cmd)
+            .name("cat")
+            .spawn_broadcast()
+            .unwrap();
+
+        // Write multiple lines.
+        if let Some(stdin) = process.stdin().as_mut() {
+            stdin.write_all(b"Line 1\n").await.unwrap();
+            stdin.write_all(b"Line 2\n").await.unwrap();
+            stdin.write_all(b"Line 3\n").await.unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        process.stdin().close();
+
+        let output = process
+            .wait_for_completion_with_output(
+                Some(Duration::from_secs(2)),
+                LineParsingOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_that(&output.stdout).has_length(3);
+        assert_that(output.stdout[0].as_str()).is_equal_to("Line 1");
+        assert_that(output.stdout[1].as_str()).is_equal_to("Line 2");
+        assert_that(output.stdout[2].as_str()).is_equal_to("Line 3");
+    }
+
+    #[tokio::test]
+    async fn test_python_command_dispatch() {
+        let mut cmd = tokio::process::Command::new("python3");
+        cmd.arg("-i"); // Interactive mode.
+
+        let mut process = crate::Process::new(cmd).spawn_broadcast().unwrap();
+
+        // Monitor output.
+        let collector = process
+            .stdout()
+            .collect_lines_into_vec(LineParsingOptions::default());
+
+        // Send command to Python.
+        if let Some(stdin) = process.stdin().as_mut() {
+            stdin
+                .write_all(b"print('Hello from Python')\n")
+                .await
+                .unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        // Wait a bit for output.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // We can either:
+        // - not close stdin and manually `terminate` the process or
+        // - close stdin, and wait for the process to naturally terminate (which python3 will).
+        process.stdin().close();
+        process
+            .wait_for_completion(Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+
+        let collected = collector.wait().await.unwrap();
+        assert_that(&collected).has_length(1);
+        assert_that(collected[0].as_str()).is_equal_to("Hello from Python");
     }
 }
