@@ -22,7 +22,7 @@ pub(crate) fn send_interrupt(child: &tokio::process::Child) -> std::io::Result<(
 
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::CTRL_C_EVENT;
+        use windows_sys::Win32::System::Console::CTRL_C_EVENT;
         use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
 
         let success = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid) };
@@ -61,7 +61,7 @@ pub(crate) fn send_terminate(child: &tokio::process::Child) -> std::io::Result<(
 
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::CTRL_BREAK_EVENT;
+        use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
         use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
 
         let success = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
