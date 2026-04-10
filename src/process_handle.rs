@@ -16,6 +16,12 @@ use tokio::process::{Child, ChildStdin};
 const STDOUT_STREAM_NAME: &str = "stdout";
 const STDERR_STREAM_NAME: &str = "stderr";
 
+pub(crate) struct SingleSubscriberStreamConfig {
+    pub(crate) chunk_size: NumBytes,
+    pub(crate) channel_capacity: usize,
+    pub(crate) backpressure_control: BackpressureControl,
+}
+
 /// Maximum time to wait for process termination after sending SIGKILL.
 ///
 /// This is a safety timeout since SIGKILL should terminate processes immediately,
@@ -105,7 +111,25 @@ pub struct ProcessHandle<O: OutputStream> {
     std_in: Stdin,
     std_out_stream: O,
     std_err_stream: O,
+    cleanup_on_drop: bool,
     panic_on_drop: Option<PanicOnDrop>,
+}
+
+impl<O: OutputStream> Drop for ProcessHandle<O> {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            // We want users to explicitly await or terminate spawned processes.
+            // If not done so, kill the process now to have some sort of last-resort cleanup.
+            // A separate panic-on-drop guard may additionally raise a panic to signal the misuse.
+            if let Err(err) = self.child.start_kill() {
+                tracing::warn!(
+                    process = %self.name,
+                    error = %err,
+                    "Failed to kill process while dropping an armed ProcessHandle"
+                );
+            }
+        }
+    }
 }
 
 impl ProcessHandle<BroadcastOutputStream> {
@@ -184,6 +208,7 @@ impl ProcessHandle<BroadcastOutputStream> {
             std_in,
             std_out_stream,
             std_err_stream,
+            cleanup_on_drop: false,
             panic_on_drop: None,
         };
         this.must_be_terminated();
@@ -263,10 +288,8 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
     pub(crate) fn spawn_with_capacity(
         name: impl Into<Cow<'static, str>>,
         mut cmd: tokio::process::Command,
-        stdout_chunk_size: NumBytes,
-        stderr_chunk_size: NumBytes,
-        stdout_channel_capacity: usize,
-        stderr_channel_capacity: usize,
+        stdout_config: SingleSubscriberStreamConfig,
+        stderr_config: SingleSubscriberStreamConfig,
     ) -> Result<Self, SpawnError> {
         let process_name = name.into();
         Self::prepare_command(&mut cmd)
@@ -275,10 +298,8 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
                 Self::new_from_child_with_piped_io_and_capacity(
                     process_name.clone(),
                     child,
-                    stdout_chunk_size,
-                    stderr_chunk_size,
-                    stdout_channel_capacity,
-                    stderr_channel_capacity,
+                    stdout_config,
+                    stderr_config,
                 )
             })
             .map_err(|source| SpawnError::SpawnFailed {
@@ -290,10 +311,8 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
     fn new_from_child_with_piped_io_and_capacity(
         name: impl Into<Cow<'static, str>>,
         mut child: Child,
-        stdout_chunk_size: NumBytes,
-        stderr_chunk_size: NumBytes,
-        stdout_channel_capacity: usize,
-        stderr_channel_capacity: usize,
+        stdout_config: SingleSubscriberStreamConfig,
+        stderr_config: SingleSubscriberStreamConfig,
     ) -> Self {
         let std_in = match child.stdin.take() {
             Some(stdin) => Stdin::Open(stdin),
@@ -311,19 +330,19 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
         let std_out_stream = SingleSubscriberOutputStream::from_stream(
             stdout,
             STDOUT_STREAM_NAME,
-            BackpressureControl::DropLatestIncomingIfBufferFull,
+            stdout_config.backpressure_control,
             FromStreamOptions {
-                chunk_size: stdout_chunk_size,
-                channel_capacity: stdout_channel_capacity,
+                chunk_size: stdout_config.chunk_size,
+                channel_capacity: stdout_config.channel_capacity,
             },
         );
         let std_err_stream = SingleSubscriberOutputStream::from_stream(
             stderr,
             STDERR_STREAM_NAME,
-            BackpressureControl::DropLatestIncomingIfBufferFull,
+            stderr_config.backpressure_control,
             FromStreamOptions {
-                chunk_size: stderr_chunk_size,
-                channel_capacity: stderr_channel_capacity,
+                chunk_size: stderr_config.chunk_size,
+                channel_capacity: stderr_config.channel_capacity,
             },
         );
 
@@ -333,6 +352,7 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
             std_in,
             std_out_stream,
             std_err_stream,
+            cleanup_on_drop: false,
             panic_on_drop: None,
         };
         this.must_be_terminated();
@@ -430,12 +450,10 @@ impl<O: OutputStream> ProcessHandle<O> {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // It is much too easy to leave dangling resources here and there.
-            // This library tries to make it clear and encourage users to terminate spawned
-            // processes appropriately. If not done so anyway, this acts as a "last resort"
-            // type of solution, less graceful as the `terminate_on_drop` effect but at least
-            // capable of cleaning up.
-            .kill_on_drop(true)
+            // ProcessHandle itself performs the last-resort cleanup while its panic-on-drop guard
+            // is armed. Keeping Tokio's unconditional kill-on-drop disabled ensures that
+            // `must_not_be_terminated()` can really opt out.
+            .kill_on_drop(false)
     }
 
     /// Returns the OS process ID if the process hasn't exited yet.
@@ -445,6 +463,32 @@ impl<O: OutputStream> ProcessHandle<O> {
         self.child.id()
     }
 
+    fn try_reap_exit_status(&mut self) -> Result<Option<ExitStatus>, io::Error> {
+        match self.child.try_wait() {
+            Ok(Some(exit_status)) => {
+                self.must_not_be_terminated();
+                Ok(Some(exit_status))
+            }
+            Ok(None) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn signalling_failed_or_reap(
+        &mut self,
+        signal: &'static str,
+        source: io::Error,
+    ) -> Result<ExitStatus, TerminationError> {
+        match self.try_reap_exit_status() {
+            Ok(Some(exit_status)) => Ok(exit_status),
+            Ok(None) | Err(_) => Err(TerminationError::SignallingFailed {
+                process_name: self.name.clone(),
+                source,
+                signal,
+            }),
+        }
+    }
+
     /// Checks if the process is currently running.
     ///
     /// Returns [`RunningState::Running`] if the process is still running,
@@ -452,12 +496,9 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// if the state could not be determined.
     //noinspection RsSelfConvention
     pub fn is_running(&mut self) -> RunningState {
-        match self.child.try_wait() {
+        match self.try_reap_exit_status() {
             Ok(None) => RunningState::Running,
-            Ok(Some(exit_status)) => {
-                self.must_not_be_terminated();
-                RunningState::Terminated(exit_status)
-            }
+            Ok(Some(exit_status)) => RunningState::Terminated(exit_status),
             Err(err) => RunningState::Uncertain(err),
         }
     }
@@ -529,6 +570,7 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// after calling this method, a panic will occur with a descriptive message
     /// to inform about the incorrect usage.
     pub fn must_be_terminated(&mut self) {
+        self.cleanup_on_drop = true;
         self.panic_on_drop = Some(PanicOnDrop::new(
             "tokio_process_tools::ProcessHandle",
             "The process was not terminated.",
@@ -536,9 +578,20 @@ impl<O: OutputStream> ProcessHandle<O> {
         ));
     }
 
-    /// Disables the panic-on-drop safeguard, allowing the spawned process to be kept running
-    /// uncontrolled in the background, while this handle can safely be dropped.
+    /// Disables the kill/panic-on-drop safeguards for this handle.
+    ///
+    /// Dropping the handle after calling this method will no longer signal, kill, or panic.
+    /// However, this does **not** keep the library-owned stdio pipes alive. If the child still
+    /// depends on stdin, stdout, or stderr being open, dropping the handle may still affect it.
+    ///
+    /// Use plain [`tokio::process::Command`] directly when you need a child process that can
+    /// outlive the original handle without depending on captured stdio pipes.
     pub fn must_not_be_terminated(&mut self) {
+        self.cleanup_on_drop = false;
+        self.defuse_drop_panic();
+    }
+
+    fn defuse_drop_panic(&mut self) {
         if let Some(mut it) = self.panic_on_drop.take() {
             it.defuse()
         }
@@ -592,14 +645,22 @@ impl<O: OutputStream> ProcessHandle<O> {
         // this process.
         // Dropping this handle should not create any on-drop panic anymore.
         // We accept that in extremely rare cases, failed `kill`, a rogue process may be left over.
-        self.must_not_be_terminated();
+        self.defuse_drop_panic();
 
-        self.send_interrupt_signal()
-            .map_err(|err| TerminationError::SignallingFailed {
-                process_name: self.name.clone(),
-                source: err,
-                signal: "SIGINT",
-            })?;
+        if let Some(exit_status) =
+            self.try_reap_exit_status()
+                .map_err(|source| TerminationError::SignallingFailed {
+                    process_name: self.name.clone(),
+                    source,
+                    signal: "SIGINT",
+                })?
+        {
+            return Ok(exit_status);
+        }
+
+        if let Err(err) = self.send_interrupt_signal() {
+            return self.signalling_failed_or_reap("SIGINT", err);
+        }
 
         match self.wait_for_completion(Some(interrupt_timeout)).await {
             Ok(exit_status) => Ok(exit_status),
@@ -610,12 +671,9 @@ impl<O: OutputStream> ProcessHandle<O> {
                     "Graceful shutdown using SIGINT (or equivalent on current platform) failed. Attempting graceful shutdown using SIGTERM signal."
                 );
 
-                self.send_terminate_signal()
-                    .map_err(|err| TerminationError::SignallingFailed {
-                        process_name: self.name.clone(),
-                        source: err,
-                        signal: "SIGTERM",
-                    })?;
+                if let Err(err) = self.send_terminate_signal() {
+                    return self.signalling_failed_or_reap("SIGTERM", err);
+                }
 
                 match self.wait_for_completion(Some(terminate_timeout)).await {
                     Ok(exit_status) => Ok(exit_status),
@@ -656,6 +714,9 @@ impl<O: OutputStream> ProcessHandle<O> {
                                 }
                             }
                             Err(kill_error) => {
+                                if let Ok(Some(exit_status)) = self.try_reap_exit_status() {
+                                    return Ok(exit_status);
+                                }
                                 tracing::error!(
                                     process = %self.name,
                                     error = %kill_error,
@@ -704,7 +765,7 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// Use [ProcessHandle::wait_for_completion_or_terminate] if you want immediate termination.
     ///
     /// This does not provide the processes output. You can take a look at the convenience function
-    /// [ProcessHandle::<BroadcastOutputStream>::wait_for_completion_with_output] to see
+    /// [`ProcessHandle::<BroadcastOutputStream>::wait_for_completion_with_output`] to see
     /// how the [ProcessHandle::stdout] and [ProcessHandle::stderr] streams (also available in
     /// *_mut variants) can be used to inspect / watch over / capture the processes output.
     pub async fn wait_for_completion(
@@ -753,8 +814,22 @@ impl<O: OutputStream> ProcessHandle<O> {
 
     /// Consumes this handle to provide the wrapped `tokio::process::Child` instance as well as the
     /// stdout and stderr output streams.
-    pub fn into_inner(self) -> (Child, O, O) {
-        (self.child, self.std_out_stream, self.std_err_stream)
+    pub fn into_inner(mut self) -> (Child, O, O) {
+        self.must_not_be_terminated();
+        let mut this = std::mem::ManuallyDrop::new(self);
+
+        unsafe {
+            let child = std::ptr::read(&this.child);
+            let stdout = std::ptr::read(&this.std_out_stream);
+            let stderr = std::ptr::read(&this.std_err_stream);
+
+            std::ptr::drop_in_place(&mut this.name);
+            // `ChildStdin` is stored separately from `child`, so we still need to drop it here.
+            std::ptr::drop_in_place(&mut this.std_in);
+            std::ptr::drop_in_place(&mut this.panic_on_drop);
+
+            (child, stdout, stderr)
+        }
     }
 }
 
@@ -762,7 +837,11 @@ impl<O: OutputStream> ProcessHandle<O> {
 mod tests {
     use super::*;
     use assertr::prelude::*;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
+
+    use crate::Next;
 
     #[tokio::test]
     async fn test_termination() {
@@ -785,10 +864,30 @@ mod tests {
         // Let's use a 50 ms grace period on the assertion taken up by performing the termination.
         // We can increase this if the test should turn out to be flaky.
         let ran_for = started_at.duration_until(&terminated_at);
-        assert_that(ran_for.as_secs_f32()).is_close_to(0.1, 0.5);
+        assert_that!(ran_for.as_secs_f32()).is_close_to(0.1, 0.5);
 
         // When terminated, we do not get an exit code (unix).
-        assert_that(exit_status.code()).is_none();
+        assert_that!(exit_status.code()).is_none();
+    }
+
+    #[tokio::test]
+    async fn terminate_returns_normal_exit_when_process_already_exited() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("exit 0");
+
+        let mut handle = crate::Process::new(cmd)
+            .name("sh")
+            .spawn_broadcast()
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let exit_status = handle
+            .terminate(Duration::from_millis(50), Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert_that!(exit_status.success()).is_true();
     }
 
     #[tokio::test]
@@ -800,7 +899,7 @@ mod tests {
             .unwrap();
 
         // Verify stdin starts as open.
-        assert_that(process.stdin().is_open()).is_true();
+        assert_that!(process.stdin().is_open()).is_true();
 
         // Write to stdin.
         let test_data = b"Hello from stdin!\n";
@@ -811,7 +910,7 @@ mod tests {
 
         // Close stdin to signal EOF.
         process.stdin().close();
-        assert_that(process.stdin().is_open()).is_false();
+        assert_that!(process.stdin().is_open()).is_false();
 
         // Collect stdout.
         let output = process
@@ -822,9 +921,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_that(output.status.success()).is_true();
-        assert_that(&output.stdout).has_length(1);
-        assert_that(output.stdout[0].as_str()).is_equal_to("Hello from stdin!");
+        assert_that!(output.status.success()).is_true();
+        assert_that!(&output.stdout).has_length(1);
+        assert_that!(output.stdout[0].as_str()).is_equal_to("Hello from stdin!");
     }
 
     #[tokio::test]
@@ -838,7 +937,7 @@ mod tests {
 
         // Close stdin immediately without writing.
         process.stdin().close();
-        assert_that(process.stdin().is_open()).is_false();
+        assert_that!(process.stdin().is_open()).is_false();
 
         // Process should terminate since it receives EOF.
         let status = process
@@ -846,7 +945,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_that(status.success()).is_true();
+        assert_that!(status.success()).is_true();
     }
 
     #[tokio::test]
@@ -875,16 +974,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_that(&output.stdout).has_length(3);
-        assert_that(output.stdout[0].as_str()).is_equal_to("Line 1");
-        assert_that(output.stdout[1].as_str()).is_equal_to("Line 2");
-        assert_that(output.stdout[2].as_str()).is_equal_to("Line 3");
+        assert_that!(&output.stdout).has_length(3);
+        assert_that!(output.stdout[0].as_str()).is_equal_to("Line 1");
+        assert_that!(output.stdout[1].as_str()).is_equal_to("Line 2");
+        assert_that!(output.stdout[2].as_str()).is_equal_to("Line 3");
     }
 
     #[tokio::test]
-    async fn test_python_command_dispatch() {
-        let mut cmd = tokio::process::Command::new("python3");
-        cmd.arg("-i"); // Interactive mode.
+    async fn test_shell_command_dispatch() {
+        let cmd = tokio::process::Command::new("sh");
 
         let mut process = crate::Process::new(cmd).spawn_broadcast().unwrap();
 
@@ -893,10 +991,10 @@ mod tests {
             .stdout()
             .collect_lines_into_vec(LineParsingOptions::default());
 
-        // Send command to Python.
+        // Send commands to the shell.
         if let Some(stdin) = process.stdin().as_mut() {
             stdin
-                .write_all(b"print('Hello from Python')\n")
+                .write_all(b"printf 'Hello from shell\\n'\nexit\n")
                 .await
                 .unwrap();
             stdin.flush().await.unwrap();
@@ -905,9 +1003,6 @@ mod tests {
         // Wait a bit for output.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // We can either:
-        // - not close stdin and manually `terminate` the process or
-        // - close stdin, and wait for the process to naturally terminate (which python3 will).
         process.stdin().close();
         process
             .wait_for_completion(Some(Duration::from_secs(1)))
@@ -915,7 +1010,242 @@ mod tests {
             .unwrap();
 
         let collected = collector.wait().await.unwrap();
-        assert_that(&collected).has_length(1);
-        assert_that(collected[0].as_str()).is_equal_to("Hello from Python");
+        assert_that!(&collected).has_length(1);
+        assert_that!(collected[0].as_str()).is_equal_to("Hello from shell");
+    }
+
+    #[tokio::test]
+    async fn test_into_inner_defuses_panic_guard() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("5");
+
+        let process = crate::Process::new(cmd)
+            .name("sleep")
+            .spawn_broadcast()
+            .unwrap();
+
+        let (mut child, _stdout, _stderr) = process.into_inner();
+        child.kill().await.unwrap();
+        let _status = child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_into_inner_with_owned_name_drops_owned_string() {
+        // Regression test: `into_inner` manually destructures the handle through
+        // `ManuallyDrop`. If the `name` field isn't explicitly dropped, a
+        // `Cow::Owned(String)` allocation leaks. Forcing the owned variant here
+        // exercises the path that the static-`&str` test above doesn't.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("5");
+
+        let process = crate::Process::new(cmd)
+            .with_name(format!("sleeper-{}", 7))
+            .spawn_broadcast()
+            .unwrap();
+
+        let (mut child, _stdout, _stderr) = process.into_inner();
+        child.kill().await.unwrap();
+        let _status = child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_defusing_drop_panic_keeps_cleanup_guard_armed() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("5");
+
+        let mut process = crate::Process::new(cmd)
+            .name("sleep")
+            .spawn_broadcast()
+            .unwrap();
+
+        assert_that!(process.cleanup_on_drop).is_true();
+        assert_that!(
+            process
+                .panic_on_drop
+                .as_ref()
+                .is_some_and(PanicOnDrop::is_armed)
+        )
+        .is_true();
+
+        process.defuse_drop_panic();
+
+        assert_that!(process.cleanup_on_drop).is_true();
+        assert_that!(&process.panic_on_drop).is_none();
+
+        process.kill().await.unwrap();
+        process.wait_for_completion(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_completion_disarms_cleanup_and_panic_guards() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("0.1");
+
+        let mut process = crate::Process::new(cmd)
+            .name("sleep")
+            .spawn_broadcast()
+            .unwrap();
+
+        process
+            .wait_for_completion(Some(Duration::from_secs(2)))
+            .await
+            .unwrap();
+
+        assert_that!(process.cleanup_on_drop).is_false();
+        assert_that!(&process.panic_on_drop).is_none();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_must_not_be_terminated_allows_process_to_survive_handle_drop() {
+        use nix::errno::Errno;
+        use nix::sys::signal::{self, Signal};
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("5");
+
+        let mut process = crate::Process::new(cmd)
+            .name("sleep")
+            .spawn_broadcast()
+            .unwrap();
+        let pid = process.id().unwrap();
+
+        process.must_not_be_terminated();
+        assert_that!(process.cleanup_on_drop).is_false();
+        assert_that!(&process.panic_on_drop).is_none();
+        drop(process);
+
+        let pid = Pid::from_raw(pid as i32);
+        assert_that!(signal::kill(pid, None).is_ok()).is_true();
+
+        signal::kill(pid, Signal::SIGKILL).unwrap();
+        match waitpid(pid, None) {
+            Ok(_) | Err(Errno::ECHILD) => {}
+            Err(err) => panic!("waitpid failed: {err}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_must_not_be_terminated_still_closes_stdin_on_drop() {
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let output_file = temp_dir.path().join("stdin-result.txt");
+        let output_file = output_file.to_str().unwrap().replace('\'', "'\"'\"'");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("cat >/dev/null; printf eof > '{output_file}'"));
+
+        let mut process = crate::Process::new(cmd)
+            .name("sh")
+            .spawn_broadcast()
+            .unwrap();
+        let pid = Pid::from_raw(process.id().unwrap() as i32);
+
+        process.must_not_be_terminated();
+        drop(process);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || waitpid(pid, None)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_that!(fs::read_to_string(temp_dir.path().join("stdin-result.txt")).unwrap())
+            .is_equal_to("eof");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_must_not_be_terminated_does_not_keep_stdout_pipe_alive() {
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+
+        let mut cmd = tokio::process::Command::new("yes");
+        cmd.arg("tick");
+
+        let mut process = crate::Process::new(cmd)
+            .name("yes")
+            .spawn_broadcast()
+            .unwrap();
+        let pid = Pid::from_raw(process.id().unwrap() as i32);
+
+        process.must_not_be_terminated();
+        drop(process);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || waitpid(pid, None)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_completion_with_output_preserves_unterminated_final_line() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("printf tail");
+
+        let mut process = crate::Process::new(cmd)
+            .name("sh")
+            .spawn_broadcast()
+            .unwrap();
+
+        let output = process
+            .wait_for_completion_with_output(
+                Some(Duration::from_secs(2)),
+                LineParsingOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_that!(output.status.success()).is_true();
+        assert_that!(output.stdout).contains_exactly(["tail"]);
+        assert_that!(output.stderr).is_empty();
+    }
+
+    #[tokio::test]
+    async fn test_inspect_lines_async_preserves_unterminated_final_line() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("printf tail");
+
+        let mut process = crate::Process::new(cmd)
+            .name("sh")
+            .spawn_broadcast()
+            .unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_in_task = Arc::clone(&seen);
+        let inspector = process.stdout().inspect_lines_async(
+            move |line| {
+                let seen = Arc::clone(&seen_in_task);
+                let line = line.into_owned();
+                async move {
+                    seen.lock().expect("lock").push(line);
+                    Next::Continue
+                }
+            },
+            LineParsingOptions::default(),
+        );
+
+        process
+            .wait_for_completion(Some(Duration::from_secs(2)))
+            .await
+            .unwrap();
+        inspector.wait().await.unwrap();
+
+        let seen = seen.lock().expect("lock").clone();
+        assert_that!(seen).contains_exactly(["tail"]);
     }
 }

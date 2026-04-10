@@ -1,5 +1,5 @@
 use bytes::{Buf, BytesMut};
-use std::io::BufRead;
+use std::borrow::Cow;
 
 /// Default chunk size read from the source stream. 16 kilobytes.
 pub const DEFAULT_CHUNK_SIZE: NumBytes = NumBytes(16 * 1024); // 16 kb
@@ -81,16 +81,27 @@ impl AsRef<[u8]> for Chunk {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamEvent {
+    Chunk(Chunk),
+    Gap,
+    Eof,
+}
+
+/// Controls how a single-subscriber stream reacts when its in-memory buffer fills up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackpressureControl {
-    /// ...
+    /// Drop newly read chunks whenever the in-memory buffer is full.
+    ///
+    /// This keeps the stream reader moving and avoids backpressuring the child process, but a slow
+    /// consumer may miss output.
     DropLatestIncomingIfBufferFull,
 
-    /// Will not lead to "lagging" (and dropping frames in the process).
-    /// But this lowers our speed at which we consume output and may affect the application
-    /// captured, as their pipe buffer may get full, requiring the application /
-    /// relying on the application to drop data instead of writing to stdout/stderr in order
-    /// to not block.
+    /// Wait for buffer space instead of dropping chunks.
+    ///
+    /// This avoids losing output inside the library, but it can slow down stream consumption. If
+    /// the child process writes faster than the consumer can keep up, the OS pipe may fill and
+    /// backpressure the child process itself.
     BlockUntilBufferHasSpace,
 }
 
@@ -112,6 +123,9 @@ pub enum Next {
 pub enum LineOverflowBehavior {
     /// Drop any additional data received after the current line was considered too long until
     /// the next newline character is observed, which then starts a new line.
+    ///
+    /// The discard state persists across chunk boundaries. Once the limit is reached, subsequent
+    /// bytes are ignored until a real newline is observed.
     #[default]
     DropAdditionalData,
 
@@ -123,6 +137,22 @@ pub enum LineOverflowBehavior {
     ///
     /// No data is dropped with this behavior.
     EmitAdditionalAsNewLines,
+}
+
+/// Controls how line-based write helpers delimit successive lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineWriteMode {
+    /// Write lines exactly as parsed, without appending any delimiter.
+    ///
+    /// Use this when your mapper already includes delimiters or when the downstream format does
+    /// not want line separators reintroduced.
+    AsIs,
+
+    /// Append a trailing `\n` after each emitted line.
+    ///
+    /// This reconstructs conventional line-oriented output after parsing removed the original
+    /// newline byte.
+    AppendLf,
 }
 
 /// Configuration options for parsing lines from a stream.
@@ -143,6 +173,10 @@ pub struct LineParsingOptions {
     pub max_line_length: NumBytes,
 
     /// What should happen when a line is too long?
+    ///
+    /// When lossy buffering drops chunks before they reach the parser, line-based consumers
+    /// conservatively discard any partial line and resynchronize at the next newline instead of
+    /// joining bytes across the gap.
     pub overflow_behavior: LineOverflowBehavior,
 }
 
@@ -152,6 +186,95 @@ impl Default for LineParsingOptions {
             max_line_length: 16.kilobytes(),
             overflow_behavior: LineOverflowBehavior::default(),
         }
+    }
+}
+
+/// Stateful parser for turning arbitrary byte chunks into lines.
+pub(crate) struct LineParserState {
+    line_buffer: BytesMut,
+    discard_until_newline: bool,
+}
+
+impl LineParserState {
+    pub fn new() -> Self {
+        Self {
+            line_buffer: BytesMut::new(),
+            discard_until_newline: false,
+        }
+    }
+
+    pub fn on_gap(&mut self) {
+        self.line_buffer.clear();
+        self.discard_until_newline = true;
+    }
+
+    pub fn visit_chunk(
+        &mut self,
+        chunk: &[u8],
+        options: LineParsingOptions,
+        mut f: impl FnMut(Cow<'_, str>) -> Next,
+    ) -> Next {
+        for byte in chunk.iter().copied() {
+            if self.discard_until_newline {
+                if byte == b'\n' {
+                    self.discard_until_newline = false;
+                }
+                continue;
+            }
+
+            if byte == b'\n' {
+                if self.emit_line(&mut f) == Next::Break {
+                    return Next::Break;
+                }
+                continue;
+            }
+
+            if options.max_line_length.0 != 0 && self.line_buffer.len() == options.max_line_length.0
+            {
+                match options.overflow_behavior {
+                    LineOverflowBehavior::DropAdditionalData => {
+                        if self.emit_line(&mut f) == Next::Break {
+                            return Next::Break;
+                        }
+                        self.discard_until_newline = true;
+                        continue;
+                    }
+                    LineOverflowBehavior::EmitAdditionalAsNewLines => {
+                        if self.emit_line(&mut f) == Next::Break {
+                            return Next::Break;
+                        }
+                    }
+                }
+            }
+
+            self.line_buffer.extend_from_slice(&[byte]);
+
+            if options.max_line_length.0 != 0
+                && self.line_buffer.len() == options.max_line_length.0
+                && matches!(
+                    options.overflow_behavior,
+                    LineOverflowBehavior::EmitAdditionalAsNewLines
+                )
+                && self.emit_line(&mut f) == Next::Break
+            {
+                return Next::Break;
+            }
+        }
+
+        Next::Continue
+    }
+
+    pub fn finish(&self, f: impl FnOnce(Cow<'_, str>) -> Next) -> Next {
+        if self.discard_until_newline || self.line_buffer.is_empty() {
+            Next::Continue
+        } else {
+            f(String::from_utf8_lossy(&self.line_buffer))
+        }
+    }
+
+    fn emit_line(&mut self, f: &mut impl FnMut(Cow<'_, str>) -> Next) -> Next {
+        let line = self.line_buffer.split().freeze();
+        f(String::from_utf8_lossy(&line))
     }
 }
 
@@ -204,164 +327,6 @@ impl NumBytesExt for usize {
     }
 }
 
-/// Conceptually, this iterator appends the given byte slice to the current line buffer, which may
-/// already hold some previously written data.
-/// The resulting view of data is split by newlines (`\n`). Every completed line is yielded.
-/// The remainder of the chunk, not completed with a newline character, will become the new content
-/// of `line_buffer`.
-///
-/// The implementation tries to allocate as little as possible.
-///
-/// It can be expected that `line_buffer` does not grow beyond `options.max_line_length` bytes
-/// **IF** any yielded line is dropped or cloned and **NOT** stored long term.
-/// Only then can the underlying storage, used to capture that line, be reused to capture the
-/// next line.
-///
-/// # Members
-/// * `chunk` - New slice of bytes to process.
-/// * `line_buffer` - Buffer for reading one line.
-///   May hold previously seen, not-yet-closed, line-data.
-pub(crate) struct LineReader<'c, 'b> {
-    chunk: &'c [u8],
-    line_buffer: &'b mut BytesMut,
-    last_line_length: Option<usize>,
-    options: LineParsingOptions,
-}
-
-impl<'c, 'b> LineReader<'c, 'b> {
-    pub fn new(
-        chunk: &'c [u8],
-        line_buffer: &'b mut BytesMut,
-        options: LineParsingOptions,
-    ) -> Self {
-        Self {
-            chunk,
-            line_buffer,
-            last_line_length: None,
-            options,
-        }
-    }
-
-    fn append_to_line_buffer(&mut self, chunk: &[u8]) {
-        self.line_buffer.extend_from_slice(chunk)
-    }
-
-    fn _take_line(&mut self) -> bytes::Bytes {
-        self.last_line_length = Some(self.line_buffer.len());
-        self.line_buffer.split().freeze()
-    }
-
-    fn take_line(&mut self, full_line_buffer: bool) -> bytes::Bytes {
-        if full_line_buffer {
-            match self.options.overflow_behavior {
-                LineOverflowBehavior::DropAdditionalData => {
-                    // Drop any additional (until the next newline character!)
-                    // and return the current (not regularly finished) line.
-                    let _ = self.chunk.skip_until(b'\n');
-                    self._take_line()
-                }
-                LineOverflowBehavior::EmitAdditionalAsNewLines => {
-                    // Do NOT drop any additional and return the current (not regularly finished)
-                    // line. This will lead to all additional data starting a new line in the
-                    // next iteration.
-                    self._take_line()
-                }
-            }
-        } else {
-            self._take_line()
-        }
-    }
-}
-
-impl Iterator for LineReader<'_, '_> {
-    type Item = bytes::Bytes;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Ensure we never go out of bounds with our line buffer.
-        // This also ensures that no-one creates a `LineReader` with a line buffer that is already
-        // too large for our current `options.max_line_length`.
-        if self.options.max_line_length.0 != 0 {
-            assert!(self.line_buffer.len() <= self.options.max_line_length.0);
-        }
-
-        // Note: This will always be seen, even when the processed chunk ends with `\n`, as
-        // every iterator must once return `None` to signal that it has finished!
-        // And this, we only do later.
-        if let Some(last_line_length) = self.last_line_length.take() {
-            // The previous iteration yielded line of this length!
-            let reclaimed = self.line_buffer.try_reclaim(last_line_length);
-            if !reclaimed {
-                tracing::warn!(
-                    "Could not reclaim {last_line_length} bytes of line_buffer space. DO NOT store a yielded line (of type `bytes::Bytes`) long term. If you need to, clone it instead, to prevent the `line_buffer` from growing indefinitely (for any additional line processed). Also, make sure to set an appropriate `options.max_line_length`."
-                );
-            }
-        }
-
-        // Code would work without this early-return. But this lets us skip a lot of actions on
-        // empty slices.
-        if self.chunk.is_empty() {
-            return None;
-        }
-
-        // Through our assert above, the first operand will always be bigger!
-        let remaining_line_length = if self.options.max_line_length.0 == 0 {
-            usize::MAX
-        } else {
-            self.options.max_line_length.0 - self.line_buffer.len()
-        };
-
-        // The previous iteration might have filled the line buffer completely.
-        // Apply overflow behavior.
-        if remaining_line_length == 0 {
-            return Some(self.take_line(true));
-        }
-
-        // We have space remaining in our line buffer.
-        // Split the chunk into two a usable portion (which would not "overflow" the line buffer)
-        // and the rest.
-        let (usable, rest) = self
-            .chunk
-            .split_at(usize::min(self.chunk.len(), remaining_line_length));
-
-        // Search for the next newline character in the usable portion of our current chunk.
-        match usable.iter().position(|b| *b == b'\n') {
-            None => {
-                // No line break found! Consume the whole usable chunk portion.
-                self.append_to_line_buffer(usable);
-                self.chunk = rest;
-
-                if rest.is_empty() {
-                    // Return None, as we have no more data to process.
-                    // Leftover data in `line_buffer` must be taken care of externally!
-                    None
-                } else {
-                    // Line now full. Would overflow using rest. Return the current line!
-                    assert_eq!(self.line_buffer.len(), self.options.max_line_length.0);
-                    Some(self.take_line(true))
-                }
-            }
-            Some(pos) => {
-                // Found a line break at `pos` - process the line and continue.
-                let (usable_until_line_break, _usable_rest) = usable.split_at(pos);
-                self.append_to_line_buffer(usable_until_line_break);
-
-                // We did split our chunk into `let (usable, rest) = ...` earlier.
-                // We then split usable into `let (usable_until_line_break, _usable_rest) = ...`.
-                // We know that `_usable_rest` and `rest` are consecutive in `chunk`!
-                // This is the combination of `_usable_rest` and `rest` expressed through `chunk`
-                // to get to the "real"/"complete" rest of data.
-                let rest = &self.chunk[usable_until_line_break.len()..];
-
-                // Skip the `\n` byte!
-                self.chunk = if rest.len() > 1 { &rest[1..] } else { &[] };
-
-                // Return the completed line.
-                Some(self.take_line(false))
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -380,130 +345,57 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    mod line_reader {
-        use crate::output_stream::LineReader;
-        use crate::{LineOverflowBehavior, LineParsingOptions, NumBytes, NumBytesExt};
+    mod line_parser_state {
+        use crate::output_stream::LineParserState;
+        use crate::{LineOverflowBehavior, LineParsingOptions, Next, NumBytes, NumBytesExt};
         use assertr::prelude::*;
-        use bytes::{Bytes, BytesMut};
-        use tracing_test::traced_test;
 
-        #[test]
-        #[traced_test]
-        fn multi_byte_utf_8_characters_are_preserved_even_when_parsing_multiple_one_byte_chunks() {
-            let mut line_buffer = BytesMut::new();
-            let mut collected_lines: Vec<String> = Vec::new();
-
-            let data = "❤️❤️❤️\n👍\n";
-            for byte in data.as_bytes() {
-                let lr = LineReader {
-                    chunk: &[*byte],
-                    line_buffer: &mut line_buffer,
-                    last_line_length: None,
-                    options: LineParsingOptions::default(),
-                };
-                for line in lr {
-                    collected_lines.push(String::from_utf8_lossy(&line).to_string());
-                }
-            }
-
-            assert_that(collected_lines).contains_exactly(["❤️❤️❤️", "👍"]);
-        }
-
-        #[test]
-        #[traced_test]
-        fn reclaims_line_buffer_space_before_collecting_new_line() {
-            let mut line_buffer = BytesMut::new();
-            let mut collected_lines: Vec<String> = Vec::new();
-            let mut bytes: Vec<Bytes> = Vec::new();
-
-            let data = "❤️❤️❤️\n❤️❤️❤️\n";
-            for byte in data.as_bytes() {
-                let lr = LineReader {
-                    chunk: &[*byte],
-                    line_buffer: &mut line_buffer,
-                    last_line_length: None,
-                    options: LineParsingOptions::default(),
-                };
-                for line in lr {
-                    collected_lines.push(String::from_utf8_lossy(&line).to_string());
-                    bytes.push(line);
-                }
-            }
-
-            let data = "❤️❤️❤️\n";
-            let lr = LineReader {
-                chunk: data.as_bytes(),
-                line_buffer: &mut line_buffer,
-                last_line_length: None,
-                options: LineParsingOptions::default(),
-            };
-            for line in lr {
-                collected_lines.push(String::from_utf8_lossy(&line).to_string());
-                bytes.push(line);
-            }
-
-            assert_that(collected_lines).contains_exactly(["❤️❤️❤️", "❤️❤️❤️", "❤️❤️❤️"]);
-
-            logs_assert(|lines: &[&str]| {
-                match lines
-                    .iter()
-                    .filter(|line| line.contains("Could not reclaim 18 bytes of line_buffer space. DO NOT store a yielded line (of type `bytes::Bytes`) long term. If you need to, clone it instead, to prevent the `line_buffer` from growing indefinitely (for any additional line processed). Also, make sure to set an appropriate `options.max_line_length`."))
-                    .count()
-                {
-                    3 => {}
-                    n => return Err(format!("Expected exactly one log, but found {n}")),
-                };
-                Ok(())
-            });
-        }
-
-        // Helper function to reduce duplication in test cases
         fn run_test_case(
-            chunk: &[u8],
-            line_buffer_before: &str,
-            line_buffer_after: &str,
+            chunks: &[&[u8]],
+            mark_gap_before_chunk: Option<usize>,
             expected_lines: &[&str],
             options: LineParsingOptions,
         ) {
-            let mut line_buffer = BytesMut::from(line_buffer_before);
-            let mut collected_lines: Vec<String> = Vec::new();
+            let mut parser = LineParserState::new();
+            let mut collected_lines = Vec::<String>::new();
 
-            let lr = LineReader {
-                chunk,
-                line_buffer: &mut line_buffer,
-                last_line_length: None,
-                options,
-            };
-            for line in lr {
-                collected_lines.push(String::from_utf8_lossy(&line).to_string());
+            for (index, chunk) in chunks.iter().enumerate() {
+                if mark_gap_before_chunk == Some(index) {
+                    parser.on_gap();
+                }
+
+                assert_that!(parser.visit_chunk(chunk, options, |line| {
+                    collected_lines.push(line.into_owned());
+                    Next::Continue
+                }))
+                .is_equal_to(Next::Continue);
             }
 
-            assert_that(line_buffer).is_equal_to(line_buffer_after);
+            let _ = parser.finish(|line| {
+                collected_lines.push(line.into_owned());
+                Next::Continue
+            });
 
             let expected_lines: Vec<String> =
                 expected_lines.iter().map(|s| s.to_string()).collect();
+            assert_that!(collected_lines).is_equal_to(expected_lines);
+        }
 
-            assert_that(collected_lines).is_equal_to(expected_lines);
+        fn as_single_byte_chunks(data: &str) -> Vec<&[u8]> {
+            data.as_bytes().iter().map(std::slice::from_ref).collect()
         }
 
         #[test]
         fn empty_chunk() {
-            run_test_case(
-                b"",
-                "previous: ",
-                "previous: ",
-                &[],
-                LineParsingOptions::default(),
-            );
+            run_test_case(&[b""], None, &[], LineParsingOptions::default());
         }
 
         #[test]
         fn chunk_without_any_newlines() {
             run_test_case(
-                b"no newlines here",
-                "previous: ",
-                "previous: no newlines here",
-                &[],
+                &[b"no newlines here"],
+                None,
+                &["no newlines here"],
                 LineParsingOptions::default(),
             );
         }
@@ -511,9 +403,8 @@ mod tests {
         #[test]
         fn single_completed_line() {
             run_test_case(
-                b"one line\n",
-                "",
-                "",
+                &[b"one line\n"],
+                None,
                 &["one line"],
                 LineParsingOptions::default(),
             );
@@ -522,9 +413,8 @@ mod tests {
         #[test]
         fn multiple_completed_lines() {
             run_test_case(
-                b"first line\nsecond line\nthird line\n",
-                "",
-                "",
+                &[b"first line\nsecond line\nthird line\n"],
+                None,
                 &["first line", "second line", "third line"],
                 LineParsingOptions::default(),
             );
@@ -533,10 +423,9 @@ mod tests {
         #[test]
         fn partial_line_at_the_end() {
             run_test_case(
-                b"complete line\npartial",
-                "",
-                "partial",
-                &["complete line"],
+                &[b"complete line\npartial"],
+                None,
+                &["complete line", "partial"],
                 LineParsingOptions::default(),
             );
         }
@@ -544,9 +433,8 @@ mod tests {
         #[test]
         fn initial_line_with_multiple_newlines() {
             run_test_case(
-                b"continuation\nmore lines\n",
-                "previous: ",
-                "",
+                &[b"previous: continuation\nmore lines\n"],
+                None,
                 &["previous: continuation", "more lines"],
                 LineParsingOptions::default(),
             );
@@ -555,9 +443,8 @@ mod tests {
         #[test]
         fn invalid_utf8_data() {
             run_test_case(
-                b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n",
-                "",
-                "",
+                &[b"valid utf8\xF0\x28\x8C\xBC invalid utf8\n"],
+                None,
                 &["valid utf8�(�� invalid utf8"],
                 LineParsingOptions::default(),
             );
@@ -566,12 +453,11 @@ mod tests {
         #[test]
         fn rest_of_too_long_line_is_dropped() {
             run_test_case(
-                b"123456789\nabcdefghi\n",
-                "",
-                "",
+                &[b"123456789\nabcdefghi\n"],
+                None,
                 &["1234", "abcd"],
                 LineParsingOptions {
-                    max_line_length: 4.bytes(), // Only allow lines with 4 ascii chars (or equiv.) max.
+                    max_line_length: 4.bytes(),
                     overflow_behavior: LineOverflowBehavior::DropAdditionalData,
                 },
             );
@@ -580,12 +466,11 @@ mod tests {
         #[test]
         fn rest_of_too_long_line_is_returned_as_additional_lines() {
             run_test_case(
-                b"123456789\nabcdefghi\n",
-                "",
-                "",
+                &[b"123456789\nabcdefghi\n"],
+                None,
                 &["1234", "5678", "9", "abcd", "efgh", "i"],
                 LineParsingOptions {
-                    max_line_length: 4.bytes(), // Only allow lines with 4 ascii chars (or equiv.) max.
+                    max_line_length: 4.bytes(),
                     overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
                 },
             );
@@ -594,9 +479,8 @@ mod tests {
         #[test]
         fn max_line_length_of_0_disables_line_length_checks_test1() {
             run_test_case(
-                b"123456789\nabcdefghi\n",
-                "",
-                "",
+                &[b"123456789\nabcdefghi\n"],
+                None,
                 &["123456789", "abcdefghi"],
                 LineParsingOptions {
                     max_line_length: NumBytes::zero(),
@@ -608,9 +492,8 @@ mod tests {
         #[test]
         fn max_line_length_of_0_disables_line_length_checks_test2() {
             run_test_case(
-                b"123456789\nabcdefghi\n",
-                "",
-                "",
+                &[b"123456789\nabcdefghi\n"],
+                None,
                 &["123456789", "abcdefghi"],
                 LineParsingOptions {
                     max_line_length: NumBytes::zero(),
@@ -622,14 +505,47 @@ mod tests {
         #[test]
         fn leading_and_trailing_whitespace_is_preserved() {
             run_test_case(
-                b"   123456789     \n    abcdefghi        \n",
-                "",
-                "",
+                &[b"   123456789     \n    abcdefghi        \n"],
+                None,
                 &["   123456789     ", "    abcdefghi        "],
                 LineParsingOptions {
                     max_line_length: NumBytes::zero(),
                     overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
                 },
+            );
+        }
+
+        #[test]
+        fn multi_byte_utf_8_characters_are_preserved_even_when_parsing_multiple_one_byte_chunks() {
+            let chunks = as_single_byte_chunks("❤️❤️❤️\n👍\n");
+            run_test_case(
+                &chunks,
+                None,
+                &["❤️❤️❤️", "👍"],
+                LineParsingOptions::default(),
+            );
+        }
+
+        #[test]
+        fn overflow_drop_additional_data_persists_across_chunks() {
+            run_test_case(
+                &[b"1234", b"5678", b"9\nok\n"],
+                None,
+                &["1234", "ok"],
+                LineParsingOptions {
+                    max_line_length: 4.bytes(),
+                    overflow_behavior: LineOverflowBehavior::DropAdditionalData,
+                },
+            );
+        }
+
+        #[test]
+        fn gap_discards_partial_line_until_next_newline() {
+            run_test_case(
+                &[b"rea", b"dy\nnext\n"],
+                Some(1),
+                &["next"],
+                LineParsingOptions::default(),
             );
         }
     }

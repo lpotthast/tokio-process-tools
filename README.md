@@ -23,7 +23,9 @@ When working with child processes in async Rust, you often need to:
 - 📝 **Programmatic Process Input** - Write data to the processes stdin stream, close it when done
 - ⚡ **Graceful Termination** - Automatic signal escalation (SIGINT → SIGTERM → SIGKILL)
 - 🛡️ **Collection Safety** - Fine-grained control over buffers used when collecting stdout/stderr streams
-- 🛡️ **Resource Safety** - Panic-on-drop guards ensure processes are properly cleaned up
+- 🛡️ **Resource Safety** - Dropping a live, still-armed `ProcessHandle` performs best-effort cleanup and then panics
+  loudly
+- 📄 **Correct EOF Semantics** - Final lines are preserved even when a process exits without a trailing newline
 - ⏱️ **Timeout Support** - Built-in timeout handling for all operations
 - 🌊 **Backpressure Control** - Configurable behavior when consumers can't keep up
 
@@ -33,7 +35,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.7.1"
+tokio-process-tools = "0.8.0"
 tokio = { version = "1", features = ["process", "sync", "io-util", "rt-multi-thread", "time"] }
 ```
 
@@ -61,6 +63,9 @@ async fn main() {
 }
 
 ```
+
+When waiting for or collecting lines, a final line without a trailing `\n` is still surfaced once
+the stream reaches EOF.
 
 ### Basic: Spawn and Collect Output
 
@@ -97,12 +102,24 @@ When spawning a process, you choose the stream type explicitly by calling either
 - ⚠️ **Only one consumer allowed** - creating a second inspector/collector will panic
 - 💡 **Use when**: You only need one way to consume output (e.g., just collecting OR just monitoring)
 
+For `.spawn_single_subscriber()`, the default backpressure policy is
+`BackpressureControl::DropLatestIncomingIfBufferFull`, which favors not blocking the child process.
+If you are waiting for a specific readiness line and prefer reliability over throughput, switch to
+`BackpressureControl::BlockUntilBufferHasSpace` via the `Process` builder.
+
 ### Broadcast (`.spawn_broadcast()`)
 
 - ✅ Multiple concurrent consumers
 - ✅ Great for logging + collecting + monitoring simultaneously
 - ⚠️ Slightly higher runtime costs
+- ⚠️ Slow consumers may lag and miss chunks when buffers overflow
 - 💡 **Use when**: You need multiple operations on the same stream (e.g., log to console AND save to file)
+
+Broadcast streams are built on `tokio::sync::broadcast`, so they do not support blocking
+backpressure. If a receiver falls behind, older chunks may be dropped for that receiver. If you
+need reliable delivery with blocking backpressure, use `.spawn_single_subscriber()` together with
+`BackpressureControl::BlockUntilBufferHasSpace` and fan out from that one reliable consumer
+yourself.
 
 ## Output Handling
 
@@ -119,6 +136,7 @@ async fn main() {
     cmd.arg("-f").arg("/var/log/app.log");
 
     let mut process = Process::new(cmd)
+        .stdout_backpressure_control(BackpressureControl::BlockUntilBufferHasSpace)
         .spawn_single_subscriber()
         .unwrap();
 
@@ -135,16 +153,25 @@ async fn main() {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Gracefully terminate
-    process.terminate(
+    let _ = process.terminate(
         Duration::from_secs(3),  // SIGINT timeout
         Duration::from_secs(5),  // SIGTERM timeout
-    ).await.unwrap();
+    ).await;
 }
 ```
 
 ### Wait for Specific Output
 
 Perfect for integration tests or ensuring services are ready:
+
+Note: `wait_for_line` and `wait_for_line_with_timeout` are stream consumers. When using
+`.spawn_single_subscriber()`, calling either method claims the only stdout/stderr receiver, so no
+other inspector or collector can be attached to that stream afterward. Use `.spawn_broadcast()` if
+you need to wait for readiness and also inspect or collect the same stream elsewhere.
+Also note: `wait_for_line(...)` only returns `Matched` or `StreamClosed`; `Timeout` is only produced
+by `wait_for_line_with_timeout(...)`.
+When line-oriented consumers miss chunks because of lossy buffering, they discard any partial line
+in progress and resynchronize at the next newline instead of stitching bytes across the gap.
 
 ```rust ,no_run
 use std::time::Duration;
@@ -164,19 +191,20 @@ async fn main() {
         LineParsingOptions::default(),
         Duration::from_secs(30),
     ).await {
-        Ok(_) => println!("Server is ready!"),
-        Err(_) => panic!("Server failed to start in time"),
+        WaitForLineResult::Matched => println!("Server is ready!"),
+        WaitForLineResult::StreamClosed => panic!("Server exited before becoming ready"),
+        WaitForLineResult::Timeout => panic!("Server failed to start in time"),
     }
 
     // Now safe to make requests to the server
     // ...
 
     // Cleanup
-    process.wait_for_completion_or_terminate(
+    let _ = process.wait_for_completion_or_terminate(
         Duration::from_secs(5),   // Wait timeout
         Duration::from_secs(3),   // SIGINT timeout
         Duration::from_secs(5),   // SIGTERM timeout
-    ).await.unwrap();
+    ).await;
 }
 ```
 
@@ -206,7 +234,8 @@ async fn main() {
     let log_file = tokio::fs::File::create("output.log").await.unwrap();
     let _file_writer = process.stdout().collect_lines_into_write(
         log_file,
-        LineParsingOptions::default()
+        LineParsingOptions::default(),
+        LineWriteMode::AppendLf,
     );
 
     // Consumer 3: Search for errors
@@ -229,6 +258,11 @@ async fn main() {
     println!("Found {} errors", errors.len());
 }
 ```
+
+`collect_lines_into_write(...)` and `collect_lines_into_write_mapped(...)` require an explicit
+`LineWriteMode` because parsed lines no longer contain their original newline byte. Use
+`LineWriteMode::AppendLf` to reconstruct line-oriented output or `LineWriteMode::AsIs` when your
+mapper already adds delimiters.
 
 ## Input Handling (stdin)
 
@@ -286,8 +320,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    let mut cmd = Command::new("python3");
-    cmd.arg("-i"); // Interactive mode.
+    let cmd = Command::new("sh");
 
     let mut process = Process::new(cmd).spawn_broadcast().unwrap();
 
@@ -296,10 +329,10 @@ async fn main() {
         .stdout()
         .collect_lines_into_vec(LineParsingOptions::default());
 
-    // Send command to Python.
+    // Send commands to the shell.
     if let Some(stdin) = process.stdin().as_mut() {
         stdin
-            .write_all(b"print('Hello from Python')\n")
+            .write_all(b"printf 'Hello from shell\\n'\nexit\n")
             .await
             .unwrap();
         stdin.flush().await.unwrap();
@@ -308,9 +341,6 @@ async fn main() {
     // Wait a bit for output.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // We can either:
-    // - not close stdin and manually `terminate` the process or
-    // - close stdin, and wait for the process to naturally terminate (which python3 will).
     process.stdin().close();
     process
         .wait_for_completion(Some(Duration::from_secs(1)))
@@ -318,8 +348,8 @@ async fn main() {
         .unwrap();
 
     let collected = collector.wait().await.unwrap();
-    assert_that(&collected).has_length(1);
-    assert_that(collected[0].as_str()).is_equal_to("Hello from Python");
+    assert_that!(&collected).has_length(1);
+    assert_that!(collected[0].as_str()).is_equal_to("Hello from shell");
 }
 ```
 
@@ -501,7 +531,8 @@ async fn main() {
     let collector = process.stdout().collect_lines_into_write_mapped(
         log_file,
         |line| format!("[stdout] {line}\n"),
-        LineParsingOptions::default()
+        LineParsingOptions::default(),
+        LineWriteMode::AsIs,
     );
 }
 ```
@@ -509,6 +540,8 @@ async fn main() {
 ### Custom Line Parsing
 
 The `LineParsingOptions` type controls how data is read from stdout/stderr streams.
+`LineOverflowBehavior::DropAdditionalData` now keeps discarding across chunk boundaries until the
+next newline is seen.
 
 ```rust ,no_run
 use tokio::process::Command;
@@ -520,13 +553,15 @@ async fn main() {
     let process = Process::new(cmd)
         .spawn_broadcast()
         .unwrap();
-    process.stdout().wait_for_line(
+    let result = process.stdout().wait_for_line(
         |line| line.contains("Ready"),
         LineParsingOptions {
             max_line_length: 1.megabytes(),  // Protect against memory exhaustion
             overflow_behavior: LineOverflowBehavior::DropAdditionalData,
         },
     ).await;
+
+    println!("wait result: {result:?}");
 }
 ```
 
@@ -655,6 +690,36 @@ async fn main() {
 }
 ```
 
+By default, `ProcessHandle` expects you to explicitly call `wait_for_completion(...)` or
+`terminate(...)`. Dropping a live handle without doing so first triggers best-effort cleanup and
+then panics to make the misuse obvious.
+
+`terminate(...)` also handles the common race where the child exits just before signalling starts:
+it reaps the exit status and returns success instead of surfacing a spurious signalling failure.
+
+If you intentionally want the spawned child to outlive the handle, call
+`must_not_be_terminated()` before dropping it:
+
+```rust ,no_run
+use tokio::process::Command;
+use tokio_process_tools::*;
+
+#[tokio::main]
+async fn main() {
+    let mut process = Process::new(Command::new("some-command"))
+        .spawn_broadcast()
+        .unwrap();
+
+    process.must_not_be_terminated();
+    drop(process); // No signal/kill is sent.
+}
+```
+
+Important: this still drops the library-owned stdin/stdout/stderr pipe endpoints. A child that is
+still reading stdin or writing to stdout/stderr may therefore observe EOF or closed pipes. Use
+plain `tokio::process::Command` directly when you need a child that can truly outlive the original
+handle without captured stdio.
+
 ## Testing Integration
 
 **Note**: If you use this libraries `TerminateOnDrop` under a test, ensure that a multithreaded runtime is used with:
@@ -671,9 +736,9 @@ async fn test() {
 - ✅ **Linux/macOS**: Using SIGINT, SIGTERM, SIGKILL
 - ✅ **Windows**: Using CTRL_C_EVENT, CTRL_BREAK_EVENT
 
-## Requirements
+## MSRV
 
-- Rust 1.85.0 or later (edition 2024)
+- From version `0.8.0` onwards, the MSRV is `1.89.0`.
 
 ## Contributing
 

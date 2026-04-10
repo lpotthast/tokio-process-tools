@@ -1,8 +1,8 @@
 [package]
 name = "tokio-process-tools"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.89.0"
 repository = "https://github.com/lpotthast/tokio-process-tools"
 description = """
 Interact with processes spawned by tokio.
@@ -15,7 +15,7 @@ authors = ["Lukas Potthast <privat@lukas-potthast.de>"]
 
 [dependencies]
 atomic-take = "1.1.0"
-bytes = { version = "1.10.1", default-features = false, features = ["std"] }
+bytes = { version = "1.11.1", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.17", default-features = false, features = ["std"] }
 tokio = { version = "1.48.0", default-features = false, features = ["process", "sync", "io-util", "macros", "rt-multi-thread", "time"] }
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
@@ -27,7 +27,7 @@ nix = { version = "0.30.1", default-features = false, features = ["signal", "pro
 windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Console"] }
 
 [dev-dependencies]
-assertr = "0.4.2"
+assertr = "0.5.0"
 jiff = "0.2.16"
 mockall = "0.13.1"
 tempfile = "3.23.0"

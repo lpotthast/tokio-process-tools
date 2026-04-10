@@ -5,7 +5,7 @@ use std::io;
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::{CollectorError, InspectorError};
+use crate::CollectorError;
 
 /// Errors that can occur when terminating a process.
 #[derive(Debug, Error)]
@@ -83,19 +83,21 @@ pub enum SpawnError {
     },
 }
 
-/// Errors that can occur when waiting for output patterns.
-#[derive(Debug, Error)]
-pub enum OutputError {
-    /// Waiting for output pattern timed out.
-    #[error("Timed out after {timeout:?} waiting for output pattern on {stream_name}")]
-    Timeout {
-        /// The name of the stream.
-        stream_name: &'static str,
-        /// The timeout duration that was exceeded.
-        timeout: Duration,
-    },
+/// Result of waiting for an output line matching a predicate.
+///
+/// Note that not every function returning this enum can produce every variant:
+/// [`crate::output_stream::broadcast::BroadcastOutputStream::wait_for_line`] and
+/// [`crate::output_stream::single_subscriber::SingleSubscriberOutputStream::wait_for_line`]
+/// never return [`WaitForLineResult::Timeout`]. The timeout variant is only produced by the
+/// corresponding `*_with_timeout` methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitForLineResult {
+    /// A matching line was observed before the stream ended or the timeout elapsed.
+    Matched,
 
-    /// Inspector task failed.
-    #[error("Inspector failed: {0}")]
-    InspectorFailed(#[from] InspectorError),
+    /// The stream ended before any matching line was observed.
+    StreamClosed,
+
+    /// The timeout elapsed before a matching line was observed or the stream ended.
+    Timeout,
 }

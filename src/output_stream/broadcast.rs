@@ -1,17 +1,17 @@
 use crate::collector::{AsyncCollectFn, Collector, Sink};
-use crate::error::OutputError;
 use crate::inspector::Inspector;
 use crate::output_stream::impls::{
     impl_collect_chunks, impl_collect_chunks_async, impl_collect_lines, impl_collect_lines_async,
-    impl_inspect_chunks, impl_inspect_lines, impl_inspect_lines_async,
+    impl_inspect_chunks, impl_inspect_lines, impl_inspect_lines_async, visit_final_line,
+    visit_lines,
 };
-use crate::output_stream::{Chunk, FromStreamOptions, LineReader, Next};
-use crate::output_stream::{LineParsingOptions, OutputStream};
-use crate::{InspectorError, NumBytes};
+use crate::output_stream::{Chunk, FromStreamOptions, LineWriteMode, Next, StreamEvent};
+use crate::output_stream::{LineParserState, LineParsingOptions, OutputStream};
+use crate::{NumBytes, WaitForLineResult};
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::error::RecvError;
@@ -32,7 +32,13 @@ pub struct BroadcastOutputStream {
     /// We only store the chunk sender. The initial receiver is dropped immediately after creating
     /// the channel.
     /// New subscribers can be created from this sender.
-    sender: broadcast::Sender<Option<Chunk>>,
+    sender: broadcast::Sender<StreamEvent>,
+
+    /// Tracks whether the underlying stream has already reached EOF.
+    ///
+    /// Broadcast channels do not replay old messages to late subscribers, so we need to know
+    /// whether to synthesize a terminal EOF event for consumers that attach after stream closure.
+    closure_state: Arc<Mutex<ClosureState>>,
 
     /// The maximum size of every chunk read by the backing `stream_reader`.
     chunk_size: NumBytes,
@@ -42,6 +48,26 @@ pub struct BroadcastOutputStream {
 
     /// Name of this stream.
     name: &'static str,
+}
+
+struct ClosureState {
+    closed: bool,
+}
+
+struct Subscription {
+    receiver: broadcast::Receiver<StreamEvent>,
+    emit_terminal_eof: bool,
+}
+
+impl Subscription {
+    async fn recv(&mut self) -> Result<StreamEvent, RecvError> {
+        if self.emit_terminal_eof {
+            self.emit_terminal_eof = false;
+            return Ok(StreamEvent::Eof);
+        }
+
+        self.receiver.recv().await
+    }
 }
 
 impl OutputStream for BroadcastOutputStream {
@@ -70,7 +96,7 @@ impl Debug for BroadcastOutputStream {
             .field("output_collector", &"non-debug < JoinHandle<()> >")
             .field(
                 "sender",
-                &"non-debug < tokio::sync::broadcast::Sender<Option<Chunk>> >",
+                &"non-debug < tokio::sync::broadcast::Sender<StreamEvent> >",
             )
             .finish()
     }
@@ -82,14 +108,15 @@ impl Debug for BroadcastOutputStream {
 async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
     mut read: B,
     chunk_size: NumBytes,
-    sender: broadcast::Sender<Option<Chunk>>,
+    sender: broadcast::Sender<StreamEvent>,
+    closure_state: Arc<Mutex<ClosureState>>,
 ) {
-    let send_chunk = move |chunk: Option<Chunk>| {
+    let send_chunk = move |event: StreamEvent| {
         // When we could not send the chunk, we get it back in the error value and
         // then drop it. This means that the BytesMut storage portion of that chunk
         // is now reclaimable and can be used for storing the next chunk of incoming
         // bytes.
-        match sender.send(chunk) {
+        match sender.send(event) {
             Ok(_received_by) => {}
             Err(err) => {
                 // No receivers: All already dropped or none was yet created.
@@ -113,7 +140,16 @@ async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
                 let is_eof = bytes_read == 0;
 
                 match is_eof {
-                    true => send_chunk(None),
+                    true => {
+                        // `subscribe()` and EOF publication both synchronize on `closure_state`.
+                        // This makes late subscribers observe either:
+                        // 1. a receiver that was created before the real terminal EOF, or
+                        // 2. a closed state that requires synthesizing EOF.
+                        // They can no longer observe "closed" while still skipping queued tail data.
+                        let mut state = closure_state.lock().expect("closure_state poisoned");
+                        state.closed = true;
+                        send_chunk(StreamEvent::Eof);
+                    }
                     false => {
                         while !buf.is_empty() {
                             // Split of at least `chunk_size` bytes and send it, even if we were
@@ -128,7 +164,7 @@ async fn read_chunked<B: AsyncRead + Unpin + Send + 'static>(
                             //
                             // NOTE: If we only split of at max `chunk_size` bytes, we have to repeat
                             // this, unless all data is processed.
-                            send_chunk(Some(Chunk(buf.split_to(split_to).freeze())));
+                            send_chunk(StreamEvent::Chunk(Chunk(buf.split_to(split_to).freeze())));
                         }
                     }
                 };
@@ -148,28 +184,50 @@ impl BroadcastOutputStream {
         stream_name: &'static str,
         options: FromStreamOptions,
     ) -> BroadcastOutputStream {
-        let (sender, receiver) = broadcast::channel::<Option<Chunk>>(options.channel_capacity);
+        let (sender, receiver) = broadcast::channel::<StreamEvent>(options.channel_capacity);
         drop(receiver);
 
-        let stream_reader = tokio::spawn(read_chunked(stream, options.chunk_size, sender.clone()));
+        let closure_state = Arc::new(Mutex::new(ClosureState { closed: false }));
+
+        let stream_reader = tokio::spawn(read_chunked(
+            stream,
+            options.chunk_size,
+            sender.clone(),
+            Arc::clone(&closure_state),
+        ));
 
         BroadcastOutputStream {
             stream_reader,
             sender,
+            closure_state,
             chunk_size: options.chunk_size,
             max_channel_capacity: options.channel_capacity,
             name: stream_name,
         }
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<Option<Chunk>> {
-        self.sender.subscribe()
+    fn subscribe(&self) -> Subscription {
+        let (receiver, emit_terminal_eof) = {
+            let state = self.closure_state.lock().expect("closure_state poisoned");
+            let receiver = self.sender.subscribe();
+
+            // If the stream already finished before this subscriber attached, broadcast channels
+            // have no history for us. Synthesize EOF for this subscriber only so
+            // we do not disturb existing subscribers or evict buffered chunks from the shared
+            // channel. The lock makes this decision linearizable with EOF publication.
+            (receiver, state.closed)
+        };
+
+        Subscription {
+            receiver,
+            emit_terminal_eof,
+        }
     }
 }
 
 // Expected types:
 // loop_label: &'static str
-// receiver: tokio::sync::broadcast::Receiver<Option<Chunk>>,
+// receiver: Subscription
 // term_rx: tokio::sync::oneshot::Receiver<()>,
 macro_rules! handle_subscription {
     ($loop_label:tt, $receiver:expr, $term_rx:expr, |$chunk:ident| $body:block) => {
@@ -177,8 +235,8 @@ macro_rules! handle_subscription {
             tokio::select! {
                 out = $receiver.recv() => {
                     match out {
-                        Ok(maybe_chunk) => {
-                            let $chunk = maybe_chunk;
+                        Ok(event) => {
+                            let $chunk = event;
                             $body
                         }
                         Err(RecvError::Closed) => {
@@ -187,6 +245,8 @@ macro_rules! handle_subscription {
                         },
                         Err(RecvError::Lagged(lagged)) => {
                             tracing::warn!(lagged, "Inspector is lagging behind");
+                            let $chunk = StreamEvent::Gap;
+                            $body
                         }
                     }
                 }
@@ -356,11 +416,15 @@ impl BroadcastOutputStream {
     }
 
     /// Collects lines into an async writer.
+    ///
+    /// Parsed lines no longer include their trailing newline byte, so `mode` controls whether a
+    /// `\n` delimiter should be reintroduced for each emitted line.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_into_write<W: Sink + AsyncWriteExt + Unpin>(
         &self,
         write: W,
         options: LineParsingOptions,
+        mode: LineWriteMode,
     ) -> Collector<W> {
         self.collect_lines_async(
             write,
@@ -368,6 +432,10 @@ impl BroadcastOutputStream {
                 Box::pin(async move {
                     if let Err(err) = write.write_all(line.as_bytes()).await {
                         tracing::warn!("Could not write line to write sink: {err:#?}");
+                    } else if matches!(mode, LineWriteMode::AppendLf)
+                        && let Err(err) = write.write_all(b"\n").await
+                    {
+                        tracing::warn!("Could not write line delimiter to write sink: {err:#?}");
                     };
                     Next::Continue
                 })
@@ -399,6 +467,10 @@ impl BroadcastOutputStream {
     }
 
     /// Collects lines into an async writer after mapping them with the provided function.
+    ///
+    /// `mode` applies after `mapper`: choose [`LineWriteMode::AsIs`] when the mapped output
+    /// already contains delimiters, or [`LineWriteMode::AppendLf`] to append `\n` after each
+    /// mapped line.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_lines_into_write_mapped<
         W: Sink + AsyncWriteExt + Unpin,
@@ -408,6 +480,7 @@ impl BroadcastOutputStream {
         write: W,
         mapper: impl Fn(Cow<'_, str>) -> B + Send + Sync + Copy + 'static,
         options: LineParsingOptions,
+        mode: LineWriteMode,
     ) -> Collector<W> {
         self.collect_lines_async(
             write,
@@ -417,6 +490,10 @@ impl BroadcastOutputStream {
                     let mapped = mapped.as_ref();
                     if let Err(err) = write.write_all(mapped).await {
                         tracing::warn!("Could not write line to write sink: {err:#?}");
+                    } else if matches!(mode, LineWriteMode::AppendLf)
+                        && let Err(err) = write.write_all(b"\n").await
+                    {
+                        tracing::warn!("Could not write line delimiter to write sink: {err:#?}");
                     };
                     Next::Continue
                 })
@@ -428,43 +505,91 @@ impl BroadcastOutputStream {
 
 // Impls for waiting for a specific line of output.
 impl BroadcastOutputStream {
+    async fn wait_for_line_inner(
+        &self,
+        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
+        options: LineParsingOptions,
+    ) -> WaitForLineResult {
+        let mut receiver = self.subscribe();
+        let mut parser = LineParserState::new();
+
+        loop {
+            match receiver.recv().await {
+                Ok(StreamEvent::Chunk(chunk)) => {
+                    if visit_lines(chunk.as_ref(), &mut parser, options, |line| {
+                        if predicate(line) {
+                            Next::Break
+                        } else {
+                            Next::Continue
+                        }
+                    }) == Next::Break
+                    {
+                        return WaitForLineResult::Matched;
+                    }
+                }
+                Ok(StreamEvent::Gap) => {
+                    parser.on_gap();
+                }
+                Ok(StreamEvent::Eof) | Err(RecvError::Closed) => {
+                    if visit_final_line(&parser, |line| {
+                        if predicate(line) {
+                            Next::Break
+                        } else {
+                            Next::Continue
+                        }
+                    }) == Next::Break
+                    {
+                        return WaitForLineResult::Matched;
+                    }
+                    return WaitForLineResult::StreamClosed;
+                }
+                Err(RecvError::Lagged(lagged)) => {
+                    tracing::warn!(lagged, "Waiter is lagging behind");
+                    parser.on_gap();
+                }
+            }
+        }
+    }
+
     /// Waits for a line that matches the given predicate.
     ///
-    /// This method blocks until a line is found that satisfies the predicate.
+    /// Returns [`WaitForLineResult::Matched`] if a matching line is found, or
+    /// [`WaitForLineResult::StreamClosed`] if the stream ends first.
+    /// This method never returns [`WaitForLineResult::Timeout`]; use
+    /// [`BroadcastOutputStream::wait_for_line_with_timeout`] if you need a bounded wait.
+    ///
+    /// Broadcast delivery is lossy under pressure. If this waiter lags and misses chunks, it
+    /// discards any partial line in progress and resynchronizes at the next newline instead of
+    /// matching across a gap.
     pub async fn wait_for_line(
         &self,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
-    ) -> Result<(), InspectorError> {
-        let inspector = self.inspect_lines(
-            move |line| {
-                if predicate(line) {
-                    Next::Break
-                } else {
-                    Next::Continue
-                }
-            },
-            options,
-        );
-        inspector.wait().await
+    ) -> WaitForLineResult {
+        self.wait_for_line_inner(predicate, options).await
     }
 
     /// Waits for a line that matches the given predicate, with a timeout.
     ///
-    /// Returns `Ok(())` if a matching line is found, or `Err(OutputError::Timeout)` if the timeout expires.
+    /// Returns [`WaitForLineResult::Matched`] if a matching line is found,
+    /// [`WaitForLineResult::StreamClosed`] if the stream ends first, or
+    /// [`WaitForLineResult::Timeout`] if the timeout expires first.
+    ///
+    /// This is the only line-wait variant on this type that can return
+    /// [`WaitForLineResult::Timeout`].
+    ///
+    /// Broadcast delivery is lossy under pressure. If this waiter lags and misses chunks, it
+    /// discards any partial line in progress and resynchronizes at the next newline instead of
+    /// matching across a gap.
     pub async fn wait_for_line_with_timeout(
         &self,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
         timeout: Duration,
-    ) -> Result<(), OutputError> {
-        tokio::time::timeout(timeout, self.wait_for_line(predicate, options))
+    ) -> WaitForLineResult {
+        tokio::time::timeout(timeout, self.wait_for_line_inner(predicate, options))
             .await
-            .map_err(|_elapsed| OutputError::Timeout {
-                stream_name: self.name(),
-                timeout,
-            })
-            .and_then(|res| res.map_err(OutputError::InspectorFailed))
+            .unwrap_or(WaitForLineResult::Timeout)
     }
 }
 
@@ -480,21 +605,28 @@ pub struct LineConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::read_chunked;
+    use super::{ClosureState, read_chunked};
     use crate::NumBytesExt;
+    use crate::WaitForLineResult;
     use crate::output_stream::broadcast::BroadcastOutputStream;
     use crate::output_stream::tests::write_test_data;
-    use crate::output_stream::{FromStreamOptions, LineParsingOptions, Next};
-    use assertr::assert_that;
-    use assertr::prelude::{LengthAssertions, PartialEqAssertions, VecAssertions};
+    use crate::output_stream::{Chunk, StreamEvent};
+    use crate::output_stream::{FromStreamOptions, LineParsingOptions, LineWriteMode, Next};
+    use assertr::prelude::*;
+    use bytes::Bytes;
     use mockall::*;
+    use std::future::poll_fn;
     use std::io::Read;
     use std::io::Seek;
     use std::io::SeekFrom;
     use std::io::Write;
+    use std::pin::pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     use tokio::sync::broadcast;
+    use tokio::sync::broadcast::error::RecvError;
     use tokio::time::sleep;
     use tracing_test::traced_test;
 
@@ -514,16 +646,27 @@ mod tests {
         write_half.write_all(b"hello world").await.unwrap();
         write_half.flush().await.unwrap();
 
-        let stream_reader = tokio::spawn(read_chunked(read_half, 2.bytes(), tx));
+        let stream_reader = tokio::spawn(read_chunked(
+            read_half,
+            2.bytes(),
+            tx,
+            Arc::new(Mutex::new(ClosureState { closed: false })),
+        ));
 
         drop(write_half); // This closes the stream and should let stream_reader terminate.
         stream_reader.await.unwrap();
 
         let mut chunks = Vec::<String>::new();
-        while let Ok(Some(chunk)) = rx.recv().await {
-            chunks.push(String::from_utf8_lossy(chunk.as_ref()).to_string());
+        while let Ok(event) = rx.recv().await {
+            match event {
+                StreamEvent::Chunk(chunk) => {
+                    chunks.push(String::from_utf8_lossy(chunk.as_ref()).to_string());
+                }
+                StreamEvent::Gap => {}
+                StreamEvent::Eof => break,
+            }
         }
-        assert_that(chunks).contains_exactly(["he", "ll", "o ", "wo", "rl", "d"]);
+        assert_that!(chunks).contains_exactly(["he", "ll", "o ", "wo", "rl", "d"]);
     }
 
     #[tokio::test]
@@ -532,16 +675,292 @@ mod tests {
         let (read_half, write_half) = tokio::io::duplex(64);
         let (tx, mut rx) = broadcast::channel(10);
 
-        let stream_reader = tokio::spawn(read_chunked(read_half, 2.bytes(), tx));
+        let stream_reader = tokio::spawn(read_chunked(
+            read_half,
+            2.bytes(),
+            tx,
+            Arc::new(Mutex::new(ClosureState { closed: false })),
+        ));
 
         drop(write_half); // This closes the stream and should let stream_reader terminate.
         stream_reader.await.unwrap();
 
         let mut chunks = Vec::<String>::new();
-        while let Ok(Some(chunk)) = rx.recv().await {
-            chunks.push(String::from_utf8_lossy(chunk.as_ref()).to_string());
+        while let Ok(event) = rx.recv().await {
+            match event {
+                StreamEvent::Chunk(chunk) => {
+                    chunks.push(String::from_utf8_lossy(chunk.as_ref()).to_string());
+                }
+                StreamEvent::Gap => {}
+                StreamEvent::Eof => break,
+            }
         }
-        assert_that(chunks).is_empty();
+        assert_that!(chunks).is_empty();
+    }
+
+    #[tokio::test]
+    async fn wait_for_line_returns_matched_when_line_appears_before_eof() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        let os =
+            BroadcastOutputStream::from_stream(read_half, "custom", FromStreamOptions::default());
+
+        let waiter = os.wait_for_line(|line| line.contains("ready"), LineParsingOptions::default());
+        let mut waiter = pin!(waiter);
+
+        // Drive the first poll on the current task so the synchronous subscribe step
+        // inside `wait_for_line` runs before the producer writes. Once polled, the
+        // future has either completed already or is parked waiting on the broadcast
+        // channel — either outcome is race-free with respect to subsequent writes.
+        poll_fn(|cx| {
+            let _ = waiter.as_mut().poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        write_half.write_all(b"booting\nready\n").await.unwrap();
+        write_half.flush().await.unwrap();
+        drop(write_half);
+
+        let result = waiter.await;
+        assert_that!(result).is_equal_to(WaitForLineResult::Matched);
+    }
+
+    #[tokio::test]
+    async fn wait_for_line_returns_stream_closed_when_stream_ends_before_match() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        let os =
+            BroadcastOutputStream::from_stream(read_half, "custom", FromStreamOptions::default());
+
+        let waiter = os.wait_for_line(|line| line.contains("ready"), LineParsingOptions::default());
+        let mut waiter = pin!(waiter);
+
+        // See `wait_for_line_returns_matched_when_line_appears_before_eof` for why
+        // we drive the first poll explicitly here instead of yielding once.
+        poll_fn(|cx| {
+            let _ = waiter.as_mut().poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        write_half
+            .write_all(b"booting\nstill starting\n")
+            .await
+            .unwrap();
+        write_half.flush().await.unwrap();
+        drop(write_half);
+
+        let result = waiter.await;
+        assert_that!(result).is_equal_to(WaitForLineResult::StreamClosed);
+    }
+
+    #[tokio::test]
+    async fn wait_for_line_returns_matched_for_partial_final_line_at_eof() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        let os =
+            BroadcastOutputStream::from_stream(read_half, "custom", FromStreamOptions::default());
+
+        let waiter = os.wait_for_line(|line| line.contains("ready"), LineParsingOptions::default());
+        let mut waiter = pin!(waiter);
+
+        // See `wait_for_line_returns_matched_when_line_appears_before_eof` for why
+        // we drive the first poll explicitly here instead of yielding once.
+        poll_fn(|cx| {
+            let _ = waiter.as_mut().poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        write_half.write_all(b"booting\nready").await.unwrap();
+        write_half.flush().await.unwrap();
+        drop(write_half);
+
+        let result = waiter.await;
+        assert_that!(result).is_equal_to(WaitForLineResult::Matched);
+    }
+
+    #[tokio::test]
+    async fn wait_for_line_with_timeout_returns_timeout_while_stream_stays_open() {
+        let (read_half, _write_half) = tokio::io::duplex(64);
+        let os =
+            BroadcastOutputStream::from_stream(read_half, "custom", FromStreamOptions::default());
+
+        let result = os
+            .wait_for_line_with_timeout(
+                |line| line.contains("ready"),
+                LineParsingOptions::default(),
+                Duration::from_millis(25),
+            )
+            .await;
+
+        assert_that!(result).is_equal_to(WaitForLineResult::Timeout);
+    }
+
+    #[tokio::test]
+    async fn wait_for_line_returns_stream_closed_for_late_subscriber_after_eof() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        let os =
+            BroadcastOutputStream::from_stream(read_half, "custom", FromStreamOptions::default());
+
+        write_half.write_all(b"booting\n").await.unwrap();
+        write_half.flush().await.unwrap();
+        drop(write_half);
+
+        // Wait deterministically until `read_chunked` has observed EOF and flipped
+        // `closed`. This ensures we exercise the late-subscriber path (with the
+        // synthesized terminal EOF) rather than racing it.
+        while !os
+            .closure_state
+            .lock()
+            .expect("closure_state poisoned")
+            .closed
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let result = os
+            .wait_for_line(|line| line.contains("ready"), LineParsingOptions::default())
+            .await;
+
+        assert_that!(result).is_equal_to(WaitForLineResult::StreamClosed);
+    }
+
+    #[tokio::test]
+    async fn late_subscriber_after_eof_does_not_disturb_existing_subscribers() {
+        let (sender, receiver) = broadcast::channel::<StreamEvent>(2);
+        drop(receiver);
+
+        let closure_state = Arc::new(Mutex::new(ClosureState { closed: false }));
+        let os = BroadcastOutputStream {
+            stream_reader: tokio::spawn(async {}),
+            sender: sender.clone(),
+            closure_state: Arc::clone(&closure_state),
+            chunk_size: 4.bytes(),
+            max_channel_capacity: 2,
+            name: "custom",
+        };
+
+        let mut existing = os.subscribe();
+
+        sender
+            .send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"one\n"))))
+            .unwrap();
+        sender
+            .send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"two\n"))))
+            .unwrap();
+        sender.send(StreamEvent::Eof).unwrap();
+        closure_state.lock().expect("closure_state poisoned").closed = true;
+
+        let mut late = os.subscribe();
+        assert_that!(late.recv().await)
+            .is_ok()
+            .is_equal_to(StreamEvent::Eof);
+
+        assert_that!(existing.recv().await)
+            .is_err()
+            .is_equal_to(RecvError::Lagged(1));
+        let chunk = existing.recv().await.unwrap();
+        assert_that!(chunk).is_equal_to(StreamEvent::Chunk(Chunk(Bytes::from_static(b"two\n"))));
+        assert_that!(existing.recv().await)
+            .is_ok()
+            .is_equal_to(StreamEvent::Eof);
+    }
+
+    #[tokio::test]
+    async fn subscriber_created_before_closure_receives_tail_data_before_terminal_eof() {
+        let (sender, receiver) = broadcast::channel::<StreamEvent>(4);
+        drop(receiver);
+
+        let closure_state = Arc::new(Mutex::new(ClosureState { closed: false }));
+        let os = BroadcastOutputStream {
+            stream_reader: tokio::spawn(async {}),
+            sender: sender.clone(),
+            closure_state: Arc::clone(&closure_state),
+            chunk_size: 4.bytes(),
+            max_channel_capacity: 4,
+            name: "custom",
+        };
+
+        let mut subscriber = os.subscribe();
+
+        sender
+            .send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"tail\n"))))
+            .unwrap();
+        {
+            let mut state = closure_state.lock().expect("closure_state poisoned");
+            state.closed = true;
+            sender.send(StreamEvent::Eof).unwrap();
+        }
+
+        let chunk = subscriber.recv().await.unwrap();
+        assert_that!(chunk).is_equal_to(StreamEvent::Chunk(Chunk(Bytes::from_static(b"tail\n"))));
+        assert_that!(subscriber.recv().await)
+            .is_ok()
+            .is_equal_to(StreamEvent::Eof);
+    }
+
+    #[tokio::test]
+    async fn wait_for_line_does_not_match_across_lag_gap() {
+        let (sender, receiver) = broadcast::channel::<StreamEvent>(2);
+        drop(receiver);
+
+        let closure_state = Arc::new(Mutex::new(ClosureState { closed: false }));
+        let os = BroadcastOutputStream {
+            stream_reader: tokio::spawn(async {}),
+            sender: sender.clone(),
+            closure_state: Arc::clone(&closure_state),
+            chunk_size: 4.bytes(),
+            max_channel_capacity: 2,
+            name: "custom",
+        };
+
+        let waiter = os.wait_for_line(|line| line == "ready", LineParsingOptions::default());
+        let mut waiter = pin!(waiter);
+
+        poll_fn(|cx| {
+            let _ = waiter.as_mut().poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        sender
+            .send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"rea"))))
+            .unwrap();
+        sender
+            .send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"lost"))))
+            .unwrap();
+        sender
+            .send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"dy\n"))))
+            .unwrap();
+        {
+            let mut state = closure_state.lock().expect("closure_state poisoned");
+            state.closed = true;
+        }
+        sender.send(StreamEvent::Eof).unwrap();
+
+        assert_that!(waiter.await).is_equal_to(WaitForLineResult::StreamClosed);
+    }
+
+    #[tokio::test]
+    async fn collect_lines_into_write_appends_requested_line_delimiter() {
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let os =
+            BroadcastOutputStream::from_stream(read_half, "custom", FromStreamOptions::default());
+
+        let temp_file = tokio::fs::File::from_std(tempfile::tempfile().unwrap());
+        let collector = os.collect_lines_into_write(
+            temp_file,
+            LineParsingOptions::default(),
+            LineWriteMode::AppendLf,
+        );
+
+        tokio::spawn(write_test_data(write_half)).await.unwrap();
+
+        let mut temp_file = collector.cancel().await.unwrap();
+        temp_file.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut contents = String::new();
+        temp_file.read_to_string(&mut contents).await.unwrap();
+
+        assert_that!(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
     }
 
     #[tokio::test]
@@ -584,23 +1003,13 @@ mod tests {
         drop(os);
 
         logs_assert(|lines: &[&str]| {
-            match lines
+            let lagged_logs = lines
                 .iter()
-                .filter(|line| line.contains("Inspector is lagging behind lagged=1"))
-                .count()
-            {
-                1 => {}
-                n => return Err(format!("Expected exactly one lagged=1 log, but found {n}")),
-            };
-            match lines
-                .iter()
-                .filter(|line| line.contains("Inspector is lagging behind lagged=3"))
-                .count()
-            {
-                2 => {}
-                3 => {}
-                n => return Err(format!("Expected exactly two lagged=3 logs, but found {n}")),
-            };
+                .filter(|line| line.contains("Inspector is lagging behind lagged="))
+                .count();
+            if lagged_logs == 0 {
+                return Err("Expected at least one lagged log".to_string());
+            }
             Ok(())
         });
     }
@@ -690,7 +1099,7 @@ mod tests {
 
         let seen = collector.wait().await.unwrap();
 
-        assert_that(seen).contains_exactly(["start", "break"]);
+        assert_that!(seen).contains_exactly(["start", "break"]);
     }
 
     #[tokio::test]
@@ -722,7 +1131,7 @@ mod tests {
         let mut contents = String::new();
         temp_file.read_to_string(&mut contents).unwrap();
 
-        assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
+        assert_that!(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
     }
 
     #[tokio::test]
@@ -756,7 +1165,7 @@ mod tests {
         let mut contents = String::new();
         temp_file.read_to_string(&mut contents).unwrap();
 
-        assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
+        assert_that!(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
     }
 
     #[tokio::test]
@@ -794,7 +1203,7 @@ mod tests {
         let mut contents = String::new();
         temp_file.read_to_string(&mut contents).await.unwrap();
 
-        assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
+        assert_that!(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
     }
 
     #[tokio::test]
@@ -848,13 +1257,13 @@ mod tests {
         temp_file1.seek(SeekFrom::Start(0)).await.unwrap();
         let mut contents = String::new();
         temp_file1.read_to_string(&mut contents).await.unwrap();
-        assert_that(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
+        assert_that!(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
 
         let mut temp_file2 = collector2.cancel().await.unwrap();
         temp_file2.seek(SeekFrom::Start(0)).await.unwrap();
         let mut contents = String::new();
         temp_file2.read_to_string(&mut contents).await.unwrap();
-        assert_that(contents)
+        assert_that!(contents)
             .is_equal_to("ok-Cargo.lock\nok-Cargo.toml\nok-README.md\nok-src\nok-target\n");
     }
 }

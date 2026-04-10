@@ -3,7 +3,8 @@
 use crate::error::SpawnError;
 use crate::output_stream::broadcast::BroadcastOutputStream;
 use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
-use crate::output_stream::{DEFAULT_CHANNEL_CAPACITY, DEFAULT_CHUNK_SIZE};
+use crate::output_stream::{BackpressureControl, DEFAULT_CHANNEL_CAPACITY, DEFAULT_CHUNK_SIZE};
+use crate::process_handle::SingleSubscriberStreamConfig;
 use crate::{NumBytes, ProcessHandle};
 use std::borrow::Cow;
 
@@ -92,11 +93,11 @@ impl AutoNameSettings {
 
     fn format_cmd(&self, cmd: &std::process::Command) -> String {
         let mut name = String::new();
-        if self.include_current_dir {
-            if let Some(current_dir) = cmd.get_current_dir() {
-                name.push_str(current_dir.to_string_lossy().as_ref());
-                name.push_str(" % ");
-            }
+        if self.include_current_dir
+            && let Some(current_dir) = cmd.get_current_dir()
+        {
+            name.push_str(current_dir.to_string_lossy().as_ref());
+            name.push_str(" % ");
         }
         if self.include_envs {
             let envs = cmd.get_envs();
@@ -219,6 +220,8 @@ pub struct Process {
     stderr_chunk_size: NumBytes,
     stdout_capacity: usize,
     stderr_capacity: usize,
+    stdout_backpressure_control: BackpressureControl,
+    stderr_backpressure_control: BackpressureControl,
 }
 
 impl Process {
@@ -247,6 +250,8 @@ impl Process {
             stderr_chunk_size: DEFAULT_CHUNK_SIZE,
             stdout_capacity: DEFAULT_CHANNEL_CAPACITY,
             stderr_capacity: DEFAULT_CHANNEL_CAPACITY,
+            stdout_backpressure_control: BackpressureControl::DropLatestIncomingIfBufferFull,
+            stderr_backpressure_control: BackpressureControl::DropLatestIncomingIfBufferFull,
         }
     }
 
@@ -475,6 +480,47 @@ impl Process {
         self
     }
 
+    /// Sets the stdout backpressure policy used by `.spawn_single_subscriber()`.
+    ///
+    /// The default is [`BackpressureControl::DropLatestIncomingIfBufferFull`], which prioritizes
+    /// keeping the child process unblocked over delivering every chunk to the consumer. Use
+    /// [`BackpressureControl::BlockUntilBufferHasSpace`] when you prefer reliable observation over
+    /// throughput, for example when waiting for a startup line in tests.
+    ///
+    /// This setting is ignored by `.spawn_broadcast()`.
+    pub fn stdout_backpressure_control(
+        mut self,
+        backpressure_control: BackpressureControl,
+    ) -> Self {
+        self.stdout_backpressure_control = backpressure_control;
+        self
+    }
+
+    /// Sets the stderr backpressure policy used by `.spawn_single_subscriber()`.
+    ///
+    /// The default is [`BackpressureControl::DropLatestIncomingIfBufferFull`].
+    /// This setting is ignored by `.spawn_broadcast()`.
+    pub fn stderr_backpressure_control(
+        mut self,
+        backpressure_control: BackpressureControl,
+    ) -> Self {
+        self.stderr_backpressure_control = backpressure_control;
+        self
+    }
+
+    /// Sets the stdout and stderr backpressure policy used by `.spawn_single_subscriber()`.
+    ///
+    /// This is a shorthand for configuring both streams with the same
+    /// [`BackpressureControl`]. The default is
+    /// [`BackpressureControl::DropLatestIncomingIfBufferFull`].
+    ///
+    /// This setting is ignored by `.spawn_broadcast()`.
+    pub fn backpressure_control(mut self, backpressure_control: BackpressureControl) -> Self {
+        self.stdout_backpressure_control = backpressure_control;
+        self.stderr_backpressure_control = backpressure_control;
+        self
+    }
+
     /// Generates a process name based on the configured naming strategy.
     fn generate_name(&self) -> Cow<'static, str> {
         match &self.name {
@@ -491,6 +537,12 @@ impl Process {
     /// Broadcast streams support multiple concurrent consumers of stdout/stderr,
     /// which is useful when you need to inspect, collect, and process output
     /// simultaneously. This comes with slightly higher memory overhead due to cloning.
+    ///
+    /// Broadcast streams are lossy under pressure: if a receiver falls behind the bounded
+    /// broadcast buffer, it may miss older chunks. This backend does not support blocking
+    /// backpressure. If you need reliable delivery with backpressure, use
+    /// [`Process::spawn_single_subscriber`] together with
+    /// [`BackpressureControl::BlockUntilBufferHasSpace`].
     ///
     /// # Examples
     ///
@@ -552,10 +604,16 @@ impl Process {
         ProcessHandle::<SingleSubscriberOutputStream>::spawn_with_capacity(
             name,
             self.cmd,
-            self.stdout_chunk_size,
-            self.stderr_chunk_size,
-            self.stdout_capacity,
-            self.stderr_capacity,
+            SingleSubscriberStreamConfig {
+                chunk_size: self.stdout_chunk_size,
+                channel_capacity: self.stdout_capacity,
+                backpressure_control: self.stdout_backpressure_control,
+            },
+            SingleSubscriberStreamConfig {
+                chunk_size: self.stderr_chunk_size,
+                channel_capacity: self.stderr_capacity,
+                backpressure_control: self.stderr_backpressure_control,
+            },
         )
     }
 }
@@ -563,7 +621,7 @@ impl Process {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LineParsingOptions, NumBytesExt, Output, OutputStream};
+    use crate::{BackpressureControl, LineParsingOptions, NumBytesExt, Output, OutputStream};
     use assertr::prelude::*;
     use std::path::PathBuf;
     use tokio::process::Command;
@@ -574,10 +632,10 @@ mod tests {
             .spawn_broadcast()
             .expect("Failed to spawn");
 
-        assert_that(process.stdout().chunk_size()).is_equal_to(DEFAULT_CHUNK_SIZE);
-        assert_that(process.stderr().chunk_size()).is_equal_to(DEFAULT_CHUNK_SIZE);
-        assert_that(process.stdout().channel_capacity()).is_equal_to(DEFAULT_CHANNEL_CAPACITY);
-        assert_that(process.stderr().channel_capacity()).is_equal_to(DEFAULT_CHANNEL_CAPACITY);
+        assert_that!(process.stdout().chunk_size()).is_equal_to(DEFAULT_CHUNK_SIZE);
+        assert_that!(process.stderr().chunk_size()).is_equal_to(DEFAULT_CHUNK_SIZE);
+        assert_that!(process.stdout().channel_capacity()).is_equal_to(DEFAULT_CHANNEL_CAPACITY);
+        assert_that!(process.stderr().channel_capacity()).is_equal_to(DEFAULT_CHANNEL_CAPACITY);
 
         let Output {
             status,
@@ -588,9 +646,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_that(status.success()).is_true();
-        assert_that(stdout).is_not_empty();
-        assert_that(stderr).is_empty();
+        assert_that!(status.success()).is_true();
+        assert_that!(stdout).is_not_empty();
+        assert_that!(stderr).is_empty();
     }
 
     #[tokio::test]
@@ -603,10 +661,10 @@ mod tests {
             .spawn_broadcast()
             .expect("Failed to spawn");
 
-        assert_that(process.stdout().chunk_size()).is_equal_to(42.kilobytes());
-        assert_that(process.stderr().chunk_size()).is_equal_to(43.kilobytes());
-        assert_that(process.stdout().channel_capacity()).is_equal_to(42);
-        assert_that(process.stderr().channel_capacity()).is_equal_to(43);
+        assert_that!(process.stdout().chunk_size()).is_equal_to(42.kilobytes());
+        assert_that!(process.stderr().chunk_size()).is_equal_to(43.kilobytes());
+        assert_that!(process.stdout().channel_capacity()).is_equal_to(42);
+        assert_that!(process.stderr().channel_capacity()).is_equal_to(43);
 
         let Output {
             status,
@@ -617,9 +675,40 @@ mod tests {
             .await
             .unwrap();
 
-        assert_that(status.success()).is_true();
-        assert_that(stdout).is_not_empty();
-        assert_that(stderr).is_empty();
+        assert_that!(status.success()).is_true();
+        assert_that!(stdout).is_not_empty();
+        assert_that!(stderr).is_empty();
+    }
+
+    #[tokio::test]
+    async fn process_builder_single_subscriber_with_custom_backpressure_controls() {
+        let mut process = Process::new(Command::new("ls"))
+            .stdout_backpressure_control(BackpressureControl::BlockUntilBufferHasSpace)
+            .stderr_backpressure_control(BackpressureControl::DropLatestIncomingIfBufferFull)
+            .spawn_single_subscriber()
+            .expect("Failed to spawn");
+
+        assert_that!(process.stdout().backpressure_control())
+            .is_equal_to(BackpressureControl::BlockUntilBufferHasSpace);
+        assert_that!(process.stderr().backpressure_control())
+            .is_equal_to(BackpressureControl::DropLatestIncomingIfBufferFull);
+
+        let _ = process.wait_for_completion(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_builder_single_subscriber_with_shared_backpressure_control() {
+        let mut process = Process::new(Command::new("ls"))
+            .backpressure_control(BackpressureControl::BlockUntilBufferHasSpace)
+            .spawn_single_subscriber()
+            .expect("Failed to spawn");
+
+        assert_that!(process.stdout().backpressure_control())
+            .is_equal_to(BackpressureControl::BlockUntilBufferHasSpace);
+        assert_that!(process.stderr().backpressure_control())
+            .is_equal_to(BackpressureControl::BlockUntilBufferHasSpace);
+
+        let _ = process.wait_for_completion(None).await.unwrap();
     }
 
     #[tokio::test]
@@ -628,10 +717,14 @@ mod tests {
             .spawn_single_subscriber()
             .expect("Failed to spawn");
 
-        assert_that(process.stdout().chunk_size()).is_equal_to(DEFAULT_CHUNK_SIZE);
-        assert_that(process.stderr().chunk_size()).is_equal_to(DEFAULT_CHUNK_SIZE);
-        assert_that(process.stdout().channel_capacity()).is_equal_to(DEFAULT_CHANNEL_CAPACITY);
-        assert_that(process.stderr().channel_capacity()).is_equal_to(DEFAULT_CHANNEL_CAPACITY);
+        assert_that!(process.stdout().chunk_size()).is_equal_to(DEFAULT_CHUNK_SIZE);
+        assert_that!(process.stderr().chunk_size()).is_equal_to(DEFAULT_CHUNK_SIZE);
+        assert_that!(process.stdout().channel_capacity()).is_equal_to(DEFAULT_CHANNEL_CAPACITY);
+        assert_that!(process.stderr().channel_capacity()).is_equal_to(DEFAULT_CHANNEL_CAPACITY);
+        assert_that!(process.stdout().backpressure_control())
+            .is_equal_to(BackpressureControl::DropLatestIncomingIfBufferFull);
+        assert_that!(process.stderr().backpressure_control())
+            .is_equal_to(BackpressureControl::DropLatestIncomingIfBufferFull);
 
         let Output {
             status,
@@ -642,9 +735,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_that(status.success()).is_true();
-        assert_that(stdout).is_not_empty();
-        assert_that(stderr).is_empty();
+        assert_that!(status.success()).is_true();
+        assert_that!(stdout).is_not_empty();
+        assert_that!(stderr).is_empty();
     }
 
     #[tokio::test]
@@ -657,10 +750,14 @@ mod tests {
             .spawn_single_subscriber()
             .expect("Failed to spawn");
 
-        assert_that(process.stdout().chunk_size()).is_equal_to(42.kilobytes());
-        assert_that(process.stderr().chunk_size()).is_equal_to(43.kilobytes());
-        assert_that(process.stdout().channel_capacity()).is_equal_to(42);
-        assert_that(process.stderr().channel_capacity()).is_equal_to(43);
+        assert_that!(process.stdout().chunk_size()).is_equal_to(42.kilobytes());
+        assert_that!(process.stderr().chunk_size()).is_equal_to(43.kilobytes());
+        assert_that!(process.stdout().channel_capacity()).is_equal_to(42);
+        assert_that!(process.stderr().channel_capacity()).is_equal_to(43);
+        assert_that!(process.stdout().backpressure_control())
+            .is_equal_to(BackpressureControl::DropLatestIncomingIfBufferFull);
+        assert_that!(process.stderr().backpressure_control())
+            .is_equal_to(BackpressureControl::DropLatestIncomingIfBufferFull);
 
         let Output {
             status,
@@ -671,9 +768,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_that(status.success()).is_true();
-        assert_that(stdout).is_not_empty();
-        assert_that(stderr).is_empty();
+        assert_that!(status.success()).is_true();
+        assert_that!(stdout).is_not_empty();
+        assert_that!(stderr).is_empty();
     }
 
     #[tokio::test]
@@ -687,7 +784,7 @@ mod tests {
             .spawn_broadcast()
             .expect("Failed to spawn");
 
-        assert_that(&process.name).is_equal_to("ls \"-la\"");
+        assert_that!(&process.name).is_equal_to("ls \"-la\"");
 
         let _ = process.wait_for_completion(None).await;
     }
@@ -704,7 +801,7 @@ mod tests {
             .spawn_broadcast()
             .expect("Failed to spawn");
 
-        assert_that(&process.name).is_equal_to("ls");
+        assert_that!(&process.name).is_equal_to("ls");
 
         let _ = process.wait_for_completion(None).await;
     }
@@ -723,7 +820,7 @@ mod tests {
             .spawn_broadcast()
             .expect("Failed to spawn");
 
-        assert_that(&process.name).is_equal_to("FOO=foo ls \"-la\"");
+        assert_that!(&process.name).is_equal_to("FOO=foo ls \"-la\"");
 
         let _ = process.wait_for_completion(None).await;
     }
@@ -741,7 +838,7 @@ mod tests {
             .spawn_broadcast()
             .expect("Failed to spawn");
 
-        assert_that(&process.name).is_equal_to("./ % FOO=foo ls \"-la\"");
+        assert_that!(&process.name).is_equal_to("./ % FOO=foo ls \"-la\"");
 
         let _ = process.wait_for_completion(None).await;
     }
@@ -758,7 +855,7 @@ mod tests {
             .spawn_broadcast()
             .expect("Failed to spawn");
 
-        assert_that(&process.name).is_equal_to(
+        assert_that!(&process.name).is_equal_to(
             "Command { std: cd \"./\" && FOO=\"foo\" \"ls\" \"-la\", kill_on_drop: false }",
         );
 
@@ -773,7 +870,7 @@ mod tests {
             .spawn_broadcast()
             .expect("Failed to spawn");
 
-        assert_that(&process.name).is_equal_to("worker-42");
+        assert_that!(&process.name).is_equal_to("worker-42");
 
         let _ = process.wait_for_completion(None).await;
     }

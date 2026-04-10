@@ -26,7 +26,8 @@ use std::time::Duration;
 /// # Implementation Details
 ///
 /// The drop implementation tries to terminate the process if it was neither awaited nor
-/// terminated before being dropped. If termination fails, a panic is raised.
+/// terminated before being dropped. If checking the current process state fails, it still attempts
+/// best-effort termination. If termination fails, a panic is raised.
 #[derive(Debug)]
 pub struct TerminateOnDrop<O: OutputStream> {
     pub(crate) process_handle: ProcessHandle<O>,
@@ -51,12 +52,22 @@ impl<O: OutputStream> DerefMut for TerminateOnDrop<O> {
 impl<O: OutputStream> Drop for TerminateOnDrop<O> {
     fn drop(&mut self) {
         async_drop::run_future(async {
-            if !self.process_handle.is_running().as_bool() {
-                tracing::debug!(
-                    process = %self.process_handle.name,
-                    "Process already terminated"
-                );
-                return;
+            match self.process_handle.is_running() {
+                crate::RunningState::Terminated(_) => {
+                    tracing::debug!(
+                        process = %self.process_handle.name,
+                        "Process already terminated"
+                    );
+                    return;
+                }
+                crate::RunningState::Running => {}
+                crate::RunningState::Uncertain(err) => {
+                    tracing::warn!(
+                        process = %self.process_handle.name,
+                        error = %err,
+                        "Could not determine process state during drop; attempting best-effort termination"
+                    );
+                }
             }
 
             tracing::debug!(process = %self.process_handle.name, "Terminating process");

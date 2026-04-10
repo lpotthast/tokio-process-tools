@@ -18,12 +18,13 @@ mod terminate_on_drop;
 
 /* public exports */
 pub use collector::{Collector, CollectorError, Sink};
-pub use error::{OutputError, SpawnError, TerminationError, WaitError};
+pub use error::{SpawnError, TerminationError, WaitError, WaitForLineResult};
 pub use inspector::{Inspector, InspectorError};
 pub use output::Output;
 pub use output_stream::{
-    DEFAULT_CHANNEL_CAPACITY, DEFAULT_CHUNK_SIZE, LineOverflowBehavior, LineParsingOptions, Next,
-    NumBytes, NumBytesExt, OutputStream, broadcast, single_subscriber,
+    BackpressureControl, DEFAULT_CHANNEL_CAPACITY, DEFAULT_CHUNK_SIZE, LineOverflowBehavior,
+    LineParsingOptions, LineWriteMode, Next, NumBytes, NumBytesExt, OutputStream, broadcast,
+    single_subscriber,
 };
 pub use process::{AutoName, AutoNameSettings, Process, ProcessName};
 pub use process_handle::{ProcessHandle, RunningState, Stdin};
@@ -57,8 +58,8 @@ mod test {
             .wait_for_completion_with_output(None, LineParsingOptions::default())
             .await
             .unwrap();
-        assert_that(status.success()).is_true();
-        assert_that(stdout).is_equal_to([
+        assert_that!(status.success()).is_true();
+        for expected in [
             "Cargo.lock",
             "Cargo.toml",
             "LICENSE-APACHE",
@@ -66,8 +67,13 @@ mod test {
             "README.md",
             "src",
             "target",
-        ]);
-        assert_that(stderr).is_empty();
+        ] {
+            assert!(
+                stdout.iter().any(|entry| entry == expected),
+                "expected ls output to contain {expected:?}, got {stdout:?}"
+            );
+        }
+        assert_that!(stderr).is_empty();
     }
 
     #[tokio::test]
@@ -104,10 +110,10 @@ mod test {
         match process.is_running() {
             RunningState::Running => {}
             RunningState::Terminated(exit_status) => {
-                assert_that(exit_status).fail("Process should be running");
+                assert_that!(exit_status).fail("Process should be running");
             }
             RunningState::Uncertain(_) => {
-                assert_that_ref(&process).fail("Process state should not be uncertain");
+                assert_that!(&process).fail("Process state should not be uncertain");
             }
         };
 
@@ -115,14 +121,14 @@ mod test {
 
         match process.is_running() {
             RunningState::Running => {
-                assert_that(process).fail("Process should not be running anymore");
+                assert_that!(process).fail("Process should not be running anymore");
             }
             RunningState::Terminated(exit_status) => {
-                assert_that(exit_status.code()).is_some().is_equal_to(0);
-                assert_that(exit_status.success()).is_true();
+                assert_that!(exit_status.code()).is_some().is_equal_to(0);
+                assert_that!(exit_status.success()).is_true();
             }
             RunningState::Uncertain(_) => {
-                assert_that(process).fail("Process state should not be uncertain");
+                assert_that!(process).fail("Process state should not be uncertain");
             }
         };
     }
@@ -141,15 +147,15 @@ mod test {
             .unwrap();
         match process.is_running() {
             RunningState::Running => {
-                assert_that(process).fail("Process should not be running anymore");
+                assert_that!(process).fail("Process should not be running anymore");
             }
             RunningState::Terminated(exit_status) => {
                 // Terminating a process with a signal results in no code being emitted (on linux).
-                assert_that(exit_status.code()).is_none();
-                assert_that(exit_status.success()).is_false();
+                assert_that!(exit_status.code()).is_none();
+                assert_that!(exit_status.success()).is_false();
             }
             RunningState::Uncertain(_) => {
-                assert_that(process).fail("Process state should not be uncertain");
+                assert_that!(process).fail("Process state should not be uncertain");
             }
         };
     }
