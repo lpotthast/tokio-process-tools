@@ -1,23 +1,24 @@
-use crate::collector::{AsyncCollectFn, Collector, Sink};
+use crate::collector::{AsyncChunkCollector, AsyncLineCollector, Collector, Sink};
 use crate::inspector::Inspector;
 use crate::output_stream::impls::{
-    impl_collect_chunks, impl_collect_chunks_async, impl_collect_lines, impl_collect_lines_async,
-    impl_inspect_chunks, impl_inspect_lines, impl_inspect_lines_async, visit_final_line,
-    visit_lines,
+    impl_collect_chunks, impl_collect_chunks_async, impl_collect_chunks_into_write,
+    impl_collect_chunks_into_write_mapped, impl_collect_lines, impl_collect_lines_async,
+    impl_collect_lines_into_write, impl_collect_lines_into_write_mapped, impl_inspect_chunks,
+    impl_inspect_lines, impl_inspect_lines_async, visit_final_line, visit_lines,
 };
 use crate::output_stream::{
     BackpressureControl, Chunk, FromStreamOptions, LineWriteMode, Next, OutputStream, StreamEvent,
 };
 use crate::{LineParsingOptions, NumBytes, WaitForLineResult};
 use atomic_take::AtomicTake;
+use bytes::Buf;
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 /// The output stream from a process. Either representing stdout or stderr.
@@ -86,6 +87,10 @@ impl Debug for SingleSubscriberOutputStream {
 /// Uses a single `bytes::BytesMut` instance into which the input stream is read.
 /// Every chunk sent into `sender` is a frozen slice of that buffer.
 /// Once chunks were handled by all active receivers, the space of the chunk is reclaimed and reused.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the stream reader keeps tightly coupled buffer and backpressure state together"
+)]
 async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
     mut read: R,
     chunk_size: NumBytes,
@@ -96,34 +101,53 @@ async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
         do_break: bool,
     }
 
-    fn try_send_event(
-        event: StreamEvent,
+    enum TrySendStatus {
+        Sent,
+        Full,
+        Closed,
+    }
+
+    fn log_if_lagged(lagged: &mut usize) {
+        if *lagged > 0 {
+            tracing::debug!(lagged = *lagged, "Stream reader is lagging behind");
+            *lagged = 0;
+        }
+    }
+
+    fn try_send_gap(sender: &mpsc::Sender<StreamEvent>, lagged: &mut usize) -> TrySendStatus {
+        match sender.try_send(StreamEvent::Gap) {
+            Ok(()) => {
+                log_if_lagged(lagged);
+                TrySendStatus::Sent
+            }
+            Err(TrySendError::Full(_data)) => TrySendStatus::Full,
+            Err(TrySendError::Closed(_data)) => TrySendStatus::Closed,
+        }
+    }
+
+    fn try_send_chunk(
+        chunk: Chunk,
         sender: &mpsc::Sender<StreamEvent>,
         lagged: &mut usize,
-    ) -> AfterSend {
+    ) -> TrySendStatus {
+        let event = StreamEvent::Chunk(chunk);
         match sender.try_send(event) {
             Ok(()) => {
-                if *lagged > 0 {
-                    tracing::debug!(lagged, "Stream reader is lagging behind");
-                    *lagged = 0;
-                }
+                log_if_lagged(lagged);
+                TrySendStatus::Sent
             }
-            Err(err) => {
-                match err {
-                    TrySendError::Full(_data) => {
-                        *lagged += 1;
-                    }
-                    TrySendError::Closed(_data) => {
-                        // All receivers already dropped.
-                        // We intentionally ignore this error.
-                        // If it occurs, the user just isn't interested in
-                        // newer chunks anymore.
-                        return AfterSend { do_break: true };
-                    }
-                }
+            Err(TrySendError::Full(_data)) => {
+                *lagged += 1;
+                TrySendStatus::Full
+            }
+            Err(TrySendError::Closed(_data)) => {
+                // All receivers already dropped.
+                // We intentionally ignore this error.
+                // If it occurs, the user just isn't interested in
+                // newer chunks anymore.
+                TrySendStatus::Closed
             }
         }
-        AfterSend { do_break: false }
     }
 
     async fn send_event(event: StreamEvent, sender: &mpsc::Sender<StreamEvent>) -> AfterSend {
@@ -150,8 +174,8 @@ async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
             Ok(bytes_read) => {
                 let is_eof = bytes_read == 0;
 
-                match is_eof {
-                    true => match backpressure_control {
+                if is_eof {
+                    match backpressure_control {
                         BackpressureControl::DropLatestIncomingIfBufferFull => {
                             if gap_pending {
                                 let after = send_event(StreamEvent::Gap, &sender).await;
@@ -171,45 +195,52 @@ async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
                                 break 'outer;
                             }
                         }
-                    },
-                    false => {
-                        while !buf.is_empty() {
-                            let split_to = usize::min(chunk_size.bytes(), buf.len());
-                            let event = StreamEvent::Chunk(Chunk(buf.split_to(split_to).freeze()));
+                    }
+                } else {
+                    while !buf.is_empty() {
+                        let split_to = usize::min(chunk_size.bytes(), buf.len());
 
-                            match backpressure_control {
-                                BackpressureControl::DropLatestIncomingIfBufferFull => {
-                                    if gap_pending {
-                                        let after =
-                                            try_send_event(StreamEvent::Gap, &sender, &mut lagged);
-                                        if after.do_break {
-                                            break 'outer;
+                        match backpressure_control {
+                            BackpressureControl::DropLatestIncomingIfBufferFull => {
+                                if gap_pending {
+                                    match try_send_gap(&sender, &mut lagged) {
+                                        TrySendStatus::Sent => {
+                                            gap_pending = false;
                                         }
-                                        if lagged != 0 {
-                                            gap_pending = true;
+                                        TrySendStatus::Full => {
+                                            let dropped_chunks = if chunk_size.bytes() == 0 {
+                                                buf.len()
+                                            } else {
+                                                buf.len().div_ceil(chunk_size.bytes())
+                                            };
+                                            buf.advance(buf.len());
+                                            lagged += dropped_chunks;
                                             continue;
                                         }
-                                        gap_pending = false;
-                                    }
-
-                                    let after = try_send_event(event, &sender, &mut lagged);
-                                    if after.do_break {
-                                        break 'outer;
-                                    }
-                                    if lagged != 0 {
-                                        gap_pending = true;
+                                        TrySendStatus::Closed => break 'outer,
                                     }
                                 }
-                                BackpressureControl::BlockUntilBufferHasSpace => {
-                                    let after = send_event(event, &sender).await;
-                                    if after.do_break {
-                                        break 'outer;
+
+                                let chunk = Chunk(buf.split_to(split_to).freeze());
+                                match try_send_chunk(chunk, &sender, &mut lagged) {
+                                    TrySendStatus::Sent => {}
+                                    TrySendStatus::Full => {
+                                        gap_pending = true;
                                     }
+                                    TrySendStatus::Closed => break 'outer,
+                                }
+                            }
+                            BackpressureControl::BlockUntilBufferHasSpace => {
+                                let event =
+                                    StreamEvent::Chunk(Chunk(buf.split_to(split_to).freeze()));
+                                let after = send_event(event, &sender).await;
+                                if after.do_break {
+                                    break 'outer;
                                 }
                             }
                         }
                     }
-                };
+                }
 
                 if is_eof {
                     break;
@@ -228,6 +259,8 @@ impl SingleSubscriberOutputStream {
         backpressure_control: BackpressureControl,
         options: FromStreamOptions,
     ) -> SingleSubscriberOutputStream {
+        options.chunk_size.assert_non_zero("options.chunk_size");
+
         let (tx_stdout, rx_stdout) = mpsc::channel::<StreamEvent>(options.channel_capacity);
 
         let stream_reader = tokio::spawn(read_chunked(
@@ -344,23 +377,44 @@ impl SingleSubscriberOutputStream {
         into: S,
         collect: impl Fn(Chunk, &mut S) + Send + 'static,
     ) -> Collector<S> {
-        let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
-        impl_collect_chunks!(self.name(), receiver, collect, sink, handle_subscription)
+        impl_collect_chunks!(self.name(), receiver, collect, into, handle_subscription)
     }
 
-    /// Collects chunks from the stream into a sink using an async closure.
+    /// Collects chunks from the stream into a sink using an async collector.
     ///
-    /// The provided async closure is called for each chunk, with mutable access to the sink.
+    /// The provided async collector is called for each chunk, with mutable access to the sink.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tokio_process_tools::{AsyncChunkCollector, Chunk, Next, Process};
+    ///
+    /// struct ExtendChunks;
+    ///
+    /// impl AsyncChunkCollector<Vec<u8>> for ExtendChunks {
+    ///     async fn collect<'a>(&'a mut self, chunk: Chunk, bytes: &'a mut Vec<u8>) -> Next {
+    ///         bytes.extend_from_slice(chunk.as_ref());
+    ///         Next::Continue
+    ///     }
+    /// }
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let process = Process::new(tokio::process::Command::new("some-command"))
+    ///     .spawn_single_subscriber()?;
+    /// let collector = process.stdout().collect_chunks_async(Vec::new(), ExtendChunks);
+    /// # drop(collector);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_async<S, F>(&self, into: S, collect: F) -> Collector<S>
+    pub fn collect_chunks_async<S, C>(&self, into: S, collect: C) -> Collector<S>
     where
         S: Sink,
-        F: Fn(Chunk, &mut S) -> AsyncCollectFn<'_> + Send + 'static,
+        C: AsyncChunkCollector<S>,
     {
-        let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
-        impl_collect_chunks_async!(self.name(), receiver, collect, sink, handle_subscription)
+        impl_collect_chunks_async!(self.name(), receiver, collect, into, handle_subscription)
     }
 
     /// Collects lines from the stream into a sink.
@@ -374,41 +428,71 @@ impl SingleSubscriberOutputStream {
         collect: impl Fn(Cow<'_, str>, &mut S) -> Next + Send + 'static,
         options: LineParsingOptions,
     ) -> Collector<S> {
-        let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
         impl_collect_lines!(
             self.name(),
             receiver,
             collect,
             options,
-            sink,
+            into,
             handle_subscription
         )
     }
 
-    /// Collects lines from the stream into a sink using an async closure.
+    /// Collects lines from the stream into a sink using an async collector.
     ///
-    /// The provided async closure is called for each line, with mutable access to the sink.
+    /// The provided async collector is called for each line, with mutable access to the sink.
     /// Return [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::borrow::Cow;
+    /// use tokio_process_tools::{AsyncLineCollector, LineParsingOptions, Next, Process};
+    ///
+    /// struct PushLines;
+    ///
+    /// impl AsyncLineCollector<Vec<String>> for PushLines {
+    ///     async fn collect<'a>(
+    ///         &'a mut self,
+    ///         line: Cow<'a, str>,
+    ///         lines: &'a mut Vec<String>,
+    ///     ) -> Next {
+    ///         lines.push(line.into_owned());
+    ///         Next::Continue
+    ///     }
+    /// }
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let process = Process::new(tokio::process::Command::new("some-command"))
+    ///     .spawn_single_subscriber()?;
+    /// let collector = process.stdout().collect_lines_async(
+    ///     Vec::new(),
+    ///     PushLines,
+    ///     LineParsingOptions::default(),
+    /// );
+    /// # drop(collector);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_async<S, F>(
+    pub fn collect_lines_async<S, C>(
         &self,
         into: S,
-        collect: F,
+        collect: C,
         options: LineParsingOptions,
     ) -> Collector<S>
     where
         S: Sink,
-        F: for<'a> Fn(Cow<'a, str>, &'a mut S) -> AsyncCollectFn<'a> + Send + Sync + 'static,
+        C: AsyncLineCollector<S>,
     {
-        let sink = Arc::new(RwLock::new(into));
         let mut receiver = self.take_receiver();
         impl_collect_lines_async!(
             self.name(),
             receiver,
             collect,
             options,
-            sink,
+            into,
             handle_subscription
         )
     }
@@ -416,7 +500,9 @@ impl SingleSubscriberOutputStream {
     /// Convenience method to collect all chunks into a `Vec<u8>`.
     #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
     pub fn collect_chunks_into_vec(&self) -> Collector<Vec<u8>> {
-        self.collect_chunks(Vec::new(), |chunk, vec| vec.extend(chunk.as_ref()))
+        self.collect_chunks(Vec::new(), |chunk, vec| {
+            vec.extend_from_slice(chunk.as_ref());
+        })
     }
 
     /// Convenience method to collect all lines into a `Vec<String>`.
@@ -438,14 +524,8 @@ impl SingleSubscriberOutputStream {
         &self,
         write: W,
     ) -> Collector<W> {
-        self.collect_chunks_async(write, move |chunk, write| {
-            Box::pin(async move {
-                if let Err(err) = write.write_all(chunk.as_ref()).await {
-                    tracing::warn!("Could not write chunk to write sink: {err:#?}");
-                };
-                Next::Continue
-            })
-        })
+        let mut receiver = self.take_receiver();
+        impl_collect_chunks_into_write!(self.name(), receiver, write, handle_subscription)
     }
 
     /// Collects lines into an async writer.
@@ -459,21 +539,14 @@ impl SingleSubscriberOutputStream {
         options: LineParsingOptions,
         mode: LineWriteMode,
     ) -> Collector<W> {
-        self.collect_lines_async(
+        let mut receiver = self.take_receiver();
+        impl_collect_lines_into_write!(
+            self.name(),
+            receiver,
             write,
-            move |line, write| {
-                Box::pin(async move {
-                    if let Err(err) = write.write_all(line.as_bytes()).await {
-                        tracing::warn!("Could not write line to write sink: {err:#?}");
-                    } else if matches!(mode, LineWriteMode::AppendLf)
-                        && let Err(err) = write.write_all(b"\n").await
-                    {
-                        tracing::warn!("Could not write line delimiter to write sink: {err:#?}");
-                    };
-                    Next::Continue
-                })
-            },
             options,
+            mode,
+            handle_subscription
         )
     }
 
@@ -487,16 +560,14 @@ impl SingleSubscriberOutputStream {
         write: W,
         mapper: impl Fn(Chunk) -> B + Send + Sync + Copy + 'static,
     ) -> Collector<W> {
-        self.collect_chunks_async(write, move |chunk, write| {
-            Box::pin(async move {
-                let mapped = mapper(chunk);
-                let mapped = mapped.as_ref();
-                if let Err(err) = write.write_all(mapped).await {
-                    tracing::warn!("Could not write chunk to write sink: {err:#?}");
-                };
-                Next::Continue
-            })
-        })
+        let mut receiver = self.take_receiver();
+        impl_collect_chunks_into_write_mapped!(
+            self.name(),
+            receiver,
+            write,
+            mapper,
+            handle_subscription
+        )
     }
 
     /// Collects lines into an async writer after mapping them with the provided function.
@@ -515,23 +586,15 @@ impl SingleSubscriberOutputStream {
         options: LineParsingOptions,
         mode: LineWriteMode,
     ) -> Collector<W> {
-        self.collect_lines_async(
+        let mut receiver = self.take_receiver();
+        impl_collect_lines_into_write_mapped!(
+            self.name(),
+            receiver,
             write,
-            move |line, write| {
-                Box::pin(async move {
-                    let mapped = mapper(line);
-                    let mapped = mapped.as_ref();
-                    if let Err(err) = write.write_all(mapped).await {
-                        tracing::warn!("Could not write line to write sink: {err:#?}");
-                    } else if matches!(mode, LineWriteMode::AppendLf)
-                        && let Err(err) = write.write_all(b"\n").await
-                    {
-                        tracing::warn!("Could not write line delimiter to write sink: {err:#?}");
-                    };
-                    Next::Continue
-                })
-            },
+            mapper,
             options,
+            mode,
+            handle_subscription
         )
     }
 }
@@ -637,17 +700,69 @@ mod tests {
     use crate::output_stream::tests::write_test_data;
     use crate::output_stream::{BackpressureControl, FromStreamOptions, LineWriteMode, Next};
     use crate::single_subscriber::read_chunked;
-    use crate::{LineParsingOptions, NumBytesExt, WaitForLineResult};
+    use crate::{AsyncChunkCollector, AsyncLineCollector};
+    use crate::{LineParsingOptions, NumBytes, NumBytesExt, WaitForLineResult};
     use assertr::prelude::*;
     use atomic_take::AtomicTake;
     use bytes::Bytes;
     use mockall::{automock, predicate};
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::borrow::Cow;
+    use std::io::{Cursor, Read, Seek, SeekFrom, Write};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     use tokio::sync::mpsc;
     use tokio::time::sleep;
     use tracing_test::traced_test;
+
+    struct BreakOnLine;
+
+    impl AsyncLineCollector<Vec<String>> for BreakOnLine {
+        async fn collect<'a>(&'a mut self, line: Cow<'a, str>, seen: &'a mut Vec<String>) -> Next {
+            if line == "break" {
+                seen.push(line.into_owned());
+                Next::Break
+            } else {
+                seen.push(line.into_owned());
+                Next::Continue
+            }
+        }
+    }
+
+    struct WriteLine;
+
+    impl AsyncLineCollector<std::fs::File> for WriteLine {
+        async fn collect<'a>(
+            &'a mut self,
+            line: Cow<'a, str>,
+            temp_file: &'a mut std::fs::File,
+        ) -> Next {
+            writeln!(temp_file, "{line}").unwrap();
+            Next::Continue
+        }
+    }
+
+    struct ExtendChunks;
+
+    impl AsyncChunkCollector<Vec<u8>> for ExtendChunks {
+        async fn collect<'a>(&'a mut self, chunk: Chunk, seen: &'a mut Vec<u8>) -> Next {
+            seen.extend_from_slice(chunk.as_ref());
+            Next::Continue
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "options.chunk_size must be greater than zero bytes")]
+    fn from_stream_panics_on_zero_chunk_size() {
+        let _stream = SingleSubscriberOutputStream::from_stream(
+            tokio::io::empty(),
+            "custom",
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions {
+                chunk_size: NumBytes::zero(),
+                ..FromStreamOptions::default()
+            },
+        );
+    }
 
     #[tokio::test]
     #[traced_test]
@@ -686,6 +801,73 @@ mod tests {
             }
         }
         assert_that!(chunks).contains_exactly(["he", "ll", "o ", "wo", "rl", "d"]);
+    }
+
+    #[tokio::test]
+    async fn read_chunked_sends_pending_gap_before_terminal_eof() {
+        let read = Cursor::new(b"aabbcc".to_vec());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let stream_reader = tokio::spawn(read_chunked(
+            read,
+            2.bytes(),
+            tx,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+        ));
+
+        match rx.recv().await.unwrap() {
+            StreamEvent::Chunk(chunk) => {
+                assert_that!(chunk.as_ref()).is_equal_to(b"aa".as_slice());
+            }
+            other => panic!("expected first chunk, got {other:?}"),
+        }
+        assert_that!(rx.recv().await.unwrap()).is_equal_to(StreamEvent::Gap);
+        assert_that!(rx.recv().await.unwrap()).is_equal_to(StreamEvent::Eof);
+
+        stream_reader.await.unwrap();
+        assert_that!(rx.recv().await).is_none();
+    }
+
+    #[tokio::test]
+    async fn read_chunked_sends_pending_gap_before_resumed_chunk_delivery() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        let (tx, mut rx) = mpsc::channel(2);
+
+        let stream_reader = tokio::spawn(read_chunked(
+            read_half,
+            2.bytes(),
+            tx,
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+        ));
+
+        write_half.write_all(b"aabbcc").await.unwrap();
+        write_half.flush().await.unwrap();
+        sleep(Duration::from_millis(25)).await;
+
+        for expected in [b"aa".as_slice(), b"bb".as_slice()] {
+            match rx.recv().await.unwrap() {
+                StreamEvent::Chunk(chunk) => {
+                    assert_that!(chunk.as_ref()).is_equal_to(expected);
+                }
+                other => panic!("expected buffered chunk, got {other:?}"),
+            }
+        }
+
+        write_half.write_all(b"dd").await.unwrap();
+        write_half.flush().await.unwrap();
+        drop(write_half);
+
+        assert_that!(rx.recv().await.unwrap()).is_equal_to(StreamEvent::Gap);
+        match rx.recv().await.unwrap() {
+            StreamEvent::Chunk(chunk) => {
+                assert_that!(chunk.as_ref()).is_equal_to(b"dd".as_slice());
+            }
+            other => panic!("expected resumed chunk, got {other:?}"),
+        }
+        assert_that!(rx.recv().await.unwrap()).is_equal_to(StreamEvent::Eof);
+
+        stream_reader.await.unwrap();
+        assert_that!(rx.recv().await).is_none();
     }
 
     #[tokio::test]
@@ -886,20 +1068,11 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_lines() {
-        let (read_half, write_half) = tokio::io::duplex(64);
-        let os = SingleSubscriberOutputStream::from_stream(
-            read_half,
-            "custom",
-            BackpressureControl::DropLatestIncomingIfBufferFull,
-            FromStreamOptions::default(),
-        );
-
         #[automock]
         trait LineVisitor {
             fn visit(&self, line: String);
         }
 
-        let mut mock = MockLineVisitor::new();
         #[rustfmt::skip]
         fn configure(mock: &mut MockLineVisitor) {
             mock.expect_visit().with(predicate::eq("Cargo.lock".to_string())).times(1).return_const(());
@@ -908,6 +1081,16 @@ mod tests {
             mock.expect_visit().with(predicate::eq("src".to_string())).times(1).return_const(());
             mock.expect_visit().with(predicate::eq("target".to_string())).times(1).return_const(());
         }
+
+        let (read_half, write_half) = tokio::io::duplex(64);
+        let os = SingleSubscriberOutputStream::from_stream(
+            read_half,
+            "custom",
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions::default(),
+        );
+
+        let mut mock = MockLineVisitor::new();
         configure(&mut mock);
 
         let inspector = os.inspect_lines(
@@ -921,7 +1104,7 @@ mod tests {
         tokio::spawn(write_test_data(write_half)).await.unwrap();
 
         inspector.cancel().await.unwrap();
-        drop(os)
+        drop(os);
     }
 
     /// This tests that our impl macros properly `break 'outer`, as they might be in an inner loop!
@@ -942,21 +1125,7 @@ mod tests {
         );
 
         let seen: Vec<String> = Vec::new();
-        let collector = os.collect_lines_async(
-            seen,
-            move |line, seen: &mut Vec<String>| {
-                Box::pin(async move {
-                    if line == "break" {
-                        seen.push(line.into_owned());
-                        Next::Break
-                    } else {
-                        seen.push(line.into_owned());
-                        Next::Continue
-                    }
-                })
-            },
-            LineParsingOptions::default(),
-        );
+        let collector = os.collect_lines_async(seen, BreakOnLine, LineParsingOptions::default());
 
         let _writer = tokio::spawn(async move {
             write_half.write_all("start\n".as_bytes()).await.unwrap();
@@ -978,6 +1147,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_chunks_async_into_vec() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        let os = SingleSubscriberOutputStream::from_stream(
+            read_half,
+            "custom",
+            BackpressureControl::DropLatestIncomingIfBufferFull,
+            FromStreamOptions {
+                chunk_size: 2.bytes(),
+                ..Default::default()
+            },
+        );
+
+        let collector = os.collect_chunks_async(Vec::new(), ExtendChunks);
+
+        write_half.write_all(b"abcdef").await.unwrap();
+        drop(write_half);
+
+        let seen = collector.wait().await.unwrap();
+        assert_that!(seen).is_equal_to(b"abcdef".to_vec());
+    }
+
+    #[tokio::test]
     async fn collect_lines_to_file() {
         let (read_half, write_half) = tokio::io::duplex(64);
         let os = SingleSubscriberOutputStream::from_stream(
@@ -994,7 +1185,7 @@ mod tests {
         let collector = os.collect_lines(
             temp_file,
             |line, temp_file| {
-                writeln!(temp_file, "{}", line).unwrap();
+                writeln!(temp_file, "{line}").unwrap();
                 Next::Continue
             },
             LineParsingOptions::default(),
@@ -1024,16 +1215,7 @@ mod tests {
         );
 
         let temp_file = tempfile::tempfile().unwrap();
-        let collector = os.collect_lines_async(
-            temp_file,
-            |line, temp_file| {
-                Box::pin(async move {
-                    writeln!(temp_file, "{}", line).unwrap();
-                    Next::Continue
-                })
-            },
-            LineParsingOptions::default(),
-        );
+        let collector = os.collect_lines_async(temp_file, WriteLine, LineParsingOptions::default());
 
         tokio::spawn(write_test_data(write_half)).await.unwrap();
 
@@ -1122,11 +1304,13 @@ mod tests {
             FromStreamOptions::default(),
         );
 
-        let _inspector = os.inspect_lines(|_line| Next::Continue, Default::default());
+        let _inspector = os.inspect_lines(|_line| Next::Continue, LineParsingOptions::default());
 
         // Doesn't matter if we call `inspect_lines` or some other "consuming" function instead.
-        assert_that_panic_by(move || os.inspect_lines(|_line| Next::Continue, Default::default()))
-            .has_type::<String>()
-            .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'custom'). Only one inspector or collector can be active at a time. Use .spawn_broadcast() instead of .spawn_single_subscriber() to support multiple consumers.");
+        assert_that_panic_by(move || {
+            os.inspect_lines(|_line| Next::Continue, LineParsingOptions::default())
+        })
+        .has_type::<String>()
+        .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'custom'). Only one inspector or collector can be active at a time. Use .spawn_broadcast() instead of .spawn_single_subscriber() to support multiple consumers.");
     }
 }

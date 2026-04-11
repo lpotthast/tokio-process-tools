@@ -1,5 +1,5 @@
 use crate::error::{SpawnError, TerminationError, WaitError};
-use crate::output::Output;
+use crate::output::{Output, RawOutput};
 use crate::output_stream::broadcast::BroadcastOutputStream;
 use crate::output_stream::single_subscriber::SingleSubscriberOutputStream;
 use crate::output_stream::{BackpressureControl, FromStreamOptions};
@@ -16,6 +16,7 @@ use tokio::process::{Child, ChildStdin};
 const STDOUT_STREAM_NAME: &str = "stdout";
 const STDERR_STREAM_NAME: &str = "stderr";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SingleSubscriberStreamConfig {
     pub(crate) chunk_size: NumBytes,
     pub(crate) channel_capacity: usize,
@@ -43,6 +44,7 @@ pub enum Stdin {
 
 impl Stdin {
     /// Returns `true` if stdin is open and available for writing.
+    #[must_use]
     pub fn is_open(&self) -> bool {
         matches!(self, Stdin::Open(_))
     }
@@ -79,6 +81,7 @@ pub enum RunningState {
 
 impl RunningState {
     /// Returns `true` if the process is running, `false` otherwise.
+    #[must_use]
     pub fn as_bool(&self) -> bool {
         match self {
             RunningState::Running => true,
@@ -145,6 +148,9 @@ impl ProcessHandle<BroadcastOutputStream> {
         stdout_channel_capacity: usize,
         stderr_channel_capacity: usize,
     ) -> Result<ProcessHandle<BroadcastOutputStream>, SpawnError> {
+        stdout_chunk_size.assert_non_zero("stdout_chunk_size");
+        stderr_chunk_size.assert_non_zero("stderr_chunk_size");
+
         let process_name = name.into();
         Self::prepare_command(&mut cmd)
             .spawn()
@@ -216,8 +222,8 @@ impl ProcessHandle<BroadcastOutputStream> {
     }
 
     /// Convenience function, waiting for the process to complete using
-    /// [ProcessHandle::wait_for_completion] while collecting both `stdout` and `stderr`
-    /// into individual `Vec<String>` collections using the provided [LineParsingOptions].
+    /// [`ProcessHandle::wait_for_completion`] while collecting both `stdout` and `stderr`
+    /// into individual `Vec<String>` collections using the provided [`LineParsingOptions`].
     ///
     /// You may want to destructure this using:
     /// ```no_run
@@ -232,6 +238,10 @@ impl ProcessHandle<BroadcastOutputStream> {
     /// } = proc.wait_for_completion_with_output(None, LineParsingOptions::default()).await.unwrap();
     /// # });
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError`] if waiting for the process or collecting output fails.
     pub async fn wait_for_completion_with_output(
         &mut self,
         timeout: Option<Duration>,
@@ -253,8 +263,38 @@ impl ProcessHandle<BroadcastOutputStream> {
     }
 
     /// Convenience function, waiting for the process to complete using
-    /// [ProcessHandle::wait_for_completion_or_terminate] while collecting both `stdout` and `stderr`
-    /// into individual `Vec<String>` collections using the provided [LineParsingOptions].
+    /// [`ProcessHandle::wait_for_completion`] while collecting both `stdout` and `stderr`
+    /// into raw byte vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError`] if waiting for the process or collecting output fails.
+    pub async fn wait_for_completion_with_raw_output(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<RawOutput, WaitError> {
+        let out_collector = self.stdout().collect_chunks_into_vec();
+        let err_collector = self.stderr().collect_chunks_into_vec();
+
+        let status = self.wait_for_completion(timeout).await?;
+
+        let stdout = out_collector.wait().await?;
+        let stderr = err_collector.wait().await?;
+
+        Ok(RawOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Convenience function, waiting for the process to complete using
+    /// [`ProcessHandle::wait_for_completion_or_terminate`] while collecting both `stdout` and `stderr`
+    /// into individual `Vec<String>` collections using the provided [`LineParsingOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError`] if waiting for the process, terminating it, or collecting output fails.
     pub async fn wait_for_completion_with_output_or_terminate(
         &mut self,
         wait_timeout: Duration,
@@ -278,6 +318,36 @@ impl ProcessHandle<BroadcastOutputStream> {
             stderr,
         })
     }
+
+    /// Convenience function, waiting for the process to complete using
+    /// [`ProcessHandle::wait_for_completion_or_terminate`] while collecting both `stdout` and
+    /// `stderr` into raw byte vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError`] if waiting for the process, terminating it, or collecting output fails.
+    pub async fn wait_for_completion_with_raw_output_or_terminate(
+        &mut self,
+        wait_timeout: Duration,
+        interrupt_timeout: Duration,
+        terminate_timeout: Duration,
+    ) -> Result<RawOutput, WaitError> {
+        let out_collector = self.stdout().collect_chunks_into_vec();
+        let err_collector = self.stderr().collect_chunks_into_vec();
+
+        let status = self
+            .wait_for_completion_or_terminate(wait_timeout, interrupt_timeout, terminate_timeout)
+            .await?;
+
+        let stdout = out_collector.wait().await?;
+        let stderr = err_collector.wait().await?;
+
+        Ok(RawOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
 }
 
 impl ProcessHandle<SingleSubscriberOutputStream> {
@@ -291,6 +361,13 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
         stdout_config: SingleSubscriberStreamConfig,
         stderr_config: SingleSubscriberStreamConfig,
     ) -> Result<Self, SpawnError> {
+        stdout_config
+            .chunk_size
+            .assert_non_zero("stdout_config.chunk_size");
+        stderr_config
+            .chunk_size
+            .assert_non_zero("stderr_config.chunk_size");
+
         let process_name = name.into();
         Self::prepare_command(&mut cmd)
             .spawn()
@@ -360,8 +437,8 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
     }
 
     /// Convenience function, waiting for the process to complete using
-    /// [ProcessHandle::wait_for_completion] while collecting both `stdout` and `stderr`
-    /// into individual `Vec<String>` collections using the provided [LineParsingOptions].
+    /// [`ProcessHandle::wait_for_completion`] while collecting both `stdout` and `stderr`
+    /// into individual `Vec<String>` collections using the provided [`LineParsingOptions`].
     ///
     /// You may want to destructure this using:
     /// ```no_run
@@ -375,6 +452,10 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
     /// } = proc.wait_for_completion_with_output(None, LineParsingOptions::default()).await.unwrap();
     /// # });
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError`] if waiting for the process or collecting output fails.
     pub async fn wait_for_completion_with_output(
         &mut self,
         timeout: Option<Duration>,
@@ -396,8 +477,38 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
     }
 
     /// Convenience function, waiting for the process to complete using
-    /// [ProcessHandle::wait_for_completion_or_terminate] while collecting both `stdout` and `stderr`
-    /// into individual `Vec<String>` collections using the provided [LineParsingOptions].
+    /// [`ProcessHandle::wait_for_completion`] while collecting both `stdout` and `stderr`
+    /// into raw byte vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError`] if waiting for the process or collecting output fails.
+    pub async fn wait_for_completion_with_raw_output(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<RawOutput, WaitError> {
+        let out_collector = self.stdout().collect_chunks_into_vec();
+        let err_collector = self.stderr().collect_chunks_into_vec();
+
+        let status = self.wait_for_completion(timeout).await?;
+
+        let stdout = out_collector.wait().await?;
+        let stderr = err_collector.wait().await?;
+
+        Ok(RawOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Convenience function, waiting for the process to complete using
+    /// [`ProcessHandle::wait_for_completion_or_terminate`] while collecting both `stdout` and `stderr`
+    /// into individual `Vec<String>` collections using the provided [`LineParsingOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError`] if waiting for the process, terminating it, or collecting output fails.
     pub async fn wait_for_completion_with_output_or_terminate(
         &mut self,
         wait_timeout: Duration,
@@ -421,6 +532,36 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
             stderr,
         })
     }
+
+    /// Convenience function, waiting for the process to complete using
+    /// [`ProcessHandle::wait_for_completion_or_terminate`] while collecting both `stdout` and
+    /// `stderr` into raw byte vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError`] if waiting for the process, terminating it, or collecting output fails.
+    pub async fn wait_for_completion_with_raw_output_or_terminate(
+        &mut self,
+        wait_timeout: Duration,
+        interrupt_timeout: Duration,
+        terminate_timeout: Duration,
+    ) -> Result<RawOutput, WaitError> {
+        let out_collector = self.stdout().collect_chunks_into_vec();
+        let err_collector = self.stderr().collect_chunks_into_vec();
+
+        let status = self
+            .wait_for_completion_or_terminate(wait_timeout, interrupt_timeout, terminate_timeout)
+            .await?;
+
+        let stdout = out_collector.wait().await?;
+        let stderr = err_collector.wait().await?;
+
+        Ok(RawOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
 }
 
 impl<O: OutputStream> ProcessHandle<O> {
@@ -430,7 +571,7 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// i.e. sending the event to group ID 0. Therefore, we create a new process group
     /// for the child process we are about to spawn.
     ///
-    /// See: https://stackoverflow.com/questions/44124338/trying-to-implement-signal-ctrl-c-event-in-python3-6
+    /// See: <https://stackoverflow.com/questions/44124338/trying-to-implement-signal-ctrl-c-event-in-python3-6>
     fn prepare_platform_specifics(
         command: &mut tokio::process::Command,
     ) -> &mut tokio::process::Command {
@@ -560,7 +701,7 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// dropped without invoking `terminate()` or `wait()`, an intentional panic will occur to
     /// prevent silent failure-states, ensuring that system resources are handled correctly.
     ///
-    /// You typically do not need to call this, as every ProcessHandle is marked by default.
+    /// You typically do not need to call this, as every `ProcessHandle` is marked by default.
     /// Call `must_not_be_terminated` to clear this safeguard to explicitly allow dropping the
     /// process without terminating it.
     ///
@@ -593,7 +734,7 @@ impl<O: OutputStream> ProcessHandle<O> {
 
     fn defuse_drop_panic(&mut self) {
         if let Some(mut it) = self.panic_on_drop.take() {
-            it.defuse()
+            it.defuse();
         }
     }
 
@@ -620,6 +761,10 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// Manually send a `SIGINT` on unix or equivalent on Windows to this process.
     ///
     /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform signal could not be sent.
     pub fn send_interrupt_signal(&mut self) -> Result<(), io::Error> {
         signal::send_interrupt(&self.child)
     }
@@ -627,6 +772,10 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// Manually send a `SIGTERM` on unix or equivalent on Windows to this process.
     ///
     /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform signal could not be sent.
     pub fn send_terminate_signal(&mut self) -> Result<(), io::Error> {
         signal::send_terminate(&self.child)
     }
@@ -636,6 +785,10 @@ impl<O: OutputStream> ProcessHandle<O> {
     ///
     /// This handle can be dropped safely after this call returned, no matter the outcome.
     /// We accept that in extremely rare cases, failed `SIGKILL`, a rogue process may be left over.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminationError`] if signalling or waiting for process termination fails.
     pub async fn terminate(
         &mut self,
         interrupt_timeout: Duration,
@@ -737,9 +890,13 @@ impl<O: OutputStream> ProcessHandle<O> {
         }
     }
 
-    /// Forces the process to exit. Most users should call [ProcessHandle::terminate] instead.
+    /// Forces the process to exit. Most users should call [`ProcessHandle::terminate`] instead.
     ///
     /// This is equivalent to sending a SIGKILL on unix platforms followed by wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Tokio cannot kill the child process.
     pub async fn kill(&mut self) -> io::Result<()> {
         self.child.kill().await
     }
@@ -762,12 +919,16 @@ impl<O: OutputStream> ProcessHandle<O> {
     ///
     /// If the timeout is reached before the process terminated, an error is returned but the
     /// process remains untouched / keeps running.
-    /// Use [ProcessHandle::wait_for_completion_or_terminate] if you want immediate termination.
+    /// Use [`ProcessHandle::wait_for_completion_or_terminate`] if you want immediate termination.
     ///
     /// This does not provide the processes output. You can take a look at the convenience function
     /// [`ProcessHandle::<BroadcastOutputStream>::wait_for_completion_with_output`] to see
-    /// how the [ProcessHandle::stdout] and [ProcessHandle::stderr] streams (also available in
+    /// how the [`ProcessHandle::stdout`] and [`ProcessHandle::stderr`] streams (also available in
     /// *_mut variants) can be used to inspect / watch over / capture the processes output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError`] if waiting for the process fails or the timeout elapses.
     pub async fn wait_for_completion(
         &mut self,
         timeout: Option<Duration>,
@@ -796,10 +957,14 @@ impl<O: OutputStream> ProcessHandle<O> {
     /// Wait for this process to run to completion within `timeout`.
     ///
     /// If the timeout is reached before the process terminated normally, external termination of
-    /// the process is forced through [ProcessHandle::terminate].
+    /// the process is forced through [`ProcessHandle::terminate`].
     ///
     /// Note that this function may return `Ok` even though the timeout was reached, carrying the
     /// exit status received after sending a termination signal!
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminationError`] if termination is required and then fails.
     pub async fn wait_for_completion_or_terminate(
         &mut self,
         wait_timeout: Duration,
@@ -819,14 +984,14 @@ impl<O: OutputStream> ProcessHandle<O> {
         let mut this = std::mem::ManuallyDrop::new(self);
 
         unsafe {
-            let child = std::ptr::read(&this.child);
-            let stdout = std::ptr::read(&this.std_out_stream);
-            let stderr = std::ptr::read(&this.std_err_stream);
+            let child = std::ptr::read(&raw const this.child);
+            let stdout = std::ptr::read(&raw const this.std_out_stream);
+            let stderr = std::ptr::read(&raw const this.std_err_stream);
 
-            std::ptr::drop_in_place(&mut this.name);
+            std::ptr::drop_in_place(&raw mut this.name);
             // `ChildStdin` is stored separately from `child`, so we still need to drop it here.
-            std::ptr::drop_in_place(&mut this.std_in);
-            std::ptr::drop_in_place(&mut this.panic_on_drop);
+            std::ptr::drop_in_place(&raw mut this.std_in);
+            std::ptr::drop_in_place(&raw mut this.panic_on_drop);
 
             (child, stdout, stderr)
         }
@@ -1117,7 +1282,7 @@ mod tests {
         assert_that!(&process.panic_on_drop).is_none();
         drop(process);
 
-        let pid = Pid::from_raw(pid as i32);
+        let pid = Pid::from_raw(pid.cast_signed());
         assert_that!(signal::kill(pid, None).is_ok()).is_true();
 
         signal::kill(pid, Signal::SIGKILL).unwrap();
@@ -1146,7 +1311,7 @@ mod tests {
             .name("sh")
             .spawn_broadcast()
             .unwrap();
-        let pid = Pid::from_raw(process.id().unwrap() as i32);
+        let pid = Pid::from_raw(process.id().unwrap().cast_signed());
 
         process.must_not_be_terminated();
         drop(process);
@@ -1177,7 +1342,7 @@ mod tests {
             .name("yes")
             .spawn_broadcast()
             .unwrap();
-        let pid = Pid::from_raw(process.id().unwrap() as i32);
+        let pid = Pid::from_raw(process.id().unwrap().cast_signed());
 
         process.must_not_be_terminated();
         drop(process);
@@ -1213,6 +1378,48 @@ mod tests {
         assert_that!(output.status.success()).is_true();
         assert_that!(output.stdout).contains_exactly(["tail"]);
         assert_that!(output.stderr).is_empty();
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_wait_for_completion_with_raw_output_preserves_bytes() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf 'out\nraw'; printf 'err\nraw' >&2");
+
+        let mut process = crate::Process::new(cmd)
+            .name("sh")
+            .spawn_broadcast()
+            .unwrap();
+
+        let output = process
+            .wait_for_completion_with_raw_output(Some(Duration::from_secs(2)))
+            .await
+            .unwrap();
+
+        assert_that!(output.status.success()).is_true();
+        assert_that!(output.stdout).is_equal_to(b"out\nraw".to_vec());
+        assert_that!(output.stderr).is_equal_to(b"err\nraw".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_single_subscriber_wait_for_completion_with_raw_output_preserves_bytes() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf 'out\nraw'; printf 'err\nraw' >&2");
+
+        let mut process = crate::Process::new(cmd)
+            .name("sh")
+            .spawn_single_subscriber()
+            .unwrap();
+
+        let output = process
+            .wait_for_completion_with_raw_output(Some(Duration::from_secs(2)))
+            .await
+            .unwrap();
+
+        assert_that!(output.status.success()).is_true();
+        assert_that!(output.stdout).is_equal_to(b"out\nraw".to_vec());
+        assert_that!(output.stderr).is_equal_to(b"err\nraw".to_vec());
     }
 
     #[tokio::test]

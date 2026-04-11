@@ -14,7 +14,7 @@ use std::future::Future;
 /// 2. `block_on` is needed because it takes an async operation and runs it to completion
 ///    synchronously - it's how we can execute async operations within synchronous contexts.
 ///
-/// 3. However, block_on by itself isn't safe to call from within an async context
+/// 3. However, `block_on` by itself isn't safe to call from within an async context
 ///    (which we are in since we're inside the Tokio runtime).
 ///    This is because it could lead to deadlocks - imagine if the current thread is needed to
 ///    process some task that our blocked async operation is waiting on.

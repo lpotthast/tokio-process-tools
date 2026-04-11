@@ -37,8 +37,11 @@ pub struct Inspector {
 
 impl Inspector {
     /// Checks if this task has finished.
+    #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.task.as_ref().map(|t| t.is_finished()).unwrap_or(true)
+        self.task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
     /// Wait for the inspector to terminate naturally.
@@ -50,6 +53,14 @@ impl Inspector {
     /// 3. The first `Next::Break` is observed.
     ///
     /// If none of these may occur in your case, this could/will hang forever!
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InspectorError::TaskJoin`] if the inspector task cannot be joined.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inspector's internal task has already been taken.
     pub async fn wait(mut self) -> Result<(), InspectorError> {
         // Take the `task_termination_sender`. Let's make sure nobody can ever interfere with us
         // waiting here. DO NOT drop it, or the task will terminate (at least if it also takes the
@@ -73,6 +84,14 @@ impl Inspector {
     }
 
     /// Sends a cancellation event to the inspector, letting it shut down.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InspectorError::TaskJoin`] if the inspector task cannot be joined.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inspector's internal cancellation sender has already been taken.
     pub async fn cancel(mut self) -> Result<(), InspectorError> {
         // We ignore any potential error here.
         // Sending may fail if the task is already terminated (for example, by reaching EOF),

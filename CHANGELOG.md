@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-04-11
 
 ### Added
 
@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mapped output as-is and appending `\n` delimiters.
 - Added `Process` builder methods for single-subscriber backpressure control:
   `stdout_backpressure_control`, `stderr_backpressure_control`, and `backpressure_control`.
-- Re-exported `BackpressureControl` and `LineWriteMode` from the crate root.
+- Added `AsyncChunkCollector` and `AsyncLineCollector` for wiring up custom async collectors not
+  requiring a per-item allocation.
+- Re-exported `BackpressureControl`, `Chunk`, and `LineWriteMode` from the crate root.
 - Added this `CHANGELOG.md` in Keep a Changelog format.
 
 ### Changed
@@ -25,9 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completed.
 - Changed `collect_lines_into_write` and `collect_lines_into_write_mapped` on both stream
   backends to require an explicit `LineWriteMode`.
+- **Breaking:** Changed `collect_chunks_async` and `collect_lines_async` on both stream backends
+  to accept the new collector traits instead of callbacks returning boxed futures. This removes
+  the per-item allocation previously required by `Pin<Box<dyn Future<Output = Next> + Send + '_>>`.
 - Changed `ProcessHandle` to perform its own cleanup-on-drop instead of relying on Tokio's
   `kill_on_drop(true)`, which restores `must_not_be_terminated()` as a real opt-out from
   implicit termination.
+- Now enforcing pedantic clippy lints.
 - Raised the MSRV from `1.85.0` to `1.89.0`.
 - Updated the README and crate-level docs to cover the new line-wait outcomes, EOF behavior,
   backpressure trade-offs, stdin examples, and drop semantics.
@@ -38,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   best-effort cleanup and then lets the panic-on-drop guard report the misuse.
 - Fixed `must_not_be_terminated()` so it once again disables implicit cleanup-on-drop behavior.
 - Fixed `terminate()` to return the real exit status when the child exits just before or during
-  the first signalling step instead of reporting a spurious signalling failure.
+  the first signaling step instead of reporting a spurious signaling failure.
 - Fixed `TerminateOnDrop` to attempt best-effort termination when process state probing is
   uncertain instead of treating that case as already terminated.
 - Fixed a broadcast-stream late-subscriber race at EOF so subscribers that attach before closure
@@ -50,11 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped chunks.
 - Fixed `LineOverflowBehavior::DropAdditionalData` so discarding now persists across chunk
   boundaries until the next newline is observed.
+- Now requiring `bytes` in v0.11.1 to enforce a RUSTSEC-2026-0007 fixed version.
 
 ### Removed
 
 - Removed `OutputError` from the public API because line-wait timeouts are now modeled as a
   normal result instead of an error.
+- Removed the boxed async collector callback API.
 
 ## [0.7.2] - 2025-11-11
 
@@ -246,7 +254,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added process state helpers such as `id()` and `is_running()`.
 - Added `collect_into_*` helpers on `OutputStream`.
 
-[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/lpotthast/tokio-process-tools/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/lpotthast/tokio-process-tools/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/lpotthast/tokio-process-tools/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/lpotthast/tokio-process-tools/compare/v0.6.0...v0.7.0

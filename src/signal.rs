@@ -16,7 +16,8 @@ pub(crate) fn send_interrupt(child: &tokio::process::Child) -> std::io::Result<(
         use nix::sys::signal::{self, Signal};
         use nix::unistd::Pid;
 
-        signal::kill(Pid::from_raw(pid as i32), Signal::SIGINT).map_err(std::io::Error::other)?;
+        signal::kill(Pid::from_raw(pid.cast_signed()), Signal::SIGINT)
+            .map_err(std::io::Error::other)?;
         Ok(())
     }
 
@@ -55,7 +56,8 @@ pub(crate) fn send_terminate(child: &tokio::process::Child) -> std::io::Result<(
         use nix::sys::signal::{self, Signal};
         use nix::unistd::Pid;
 
-        signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM).map_err(std::io::Error::other)?;
+        signal::kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
+            .map_err(std::io::Error::other)?;
         Ok(())
     }
 

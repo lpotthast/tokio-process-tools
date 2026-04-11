@@ -16,15 +16,14 @@ mod process_handle;
 mod signal;
 mod terminate_on_drop;
 
-/* public exports */
-pub use collector::{Collector, CollectorError, Sink};
+pub use collector::{AsyncChunkCollector, AsyncLineCollector, Collector, CollectorError, Sink};
 pub use error::{SpawnError, TerminationError, WaitError, WaitForLineResult};
 pub use inspector::{Inspector, InspectorError};
-pub use output::Output;
+pub use output::{Output, RawOutput};
 pub use output_stream::{
-    BackpressureControl, DEFAULT_CHANNEL_CAPACITY, DEFAULT_CHUNK_SIZE, LineOverflowBehavior,
-    LineParsingOptions, LineWriteMode, Next, NumBytes, NumBytesExt, OutputStream, broadcast,
-    single_subscriber,
+    BackpressureControl, Chunk, DEFAULT_CHANNEL_CAPACITY, DEFAULT_CHUNK_SIZE, FromStreamOptions,
+    LineOverflowBehavior, LineParsingOptions, LineWriteMode, Next, NumBytes, NumBytesExt,
+    OutputStream, broadcast, single_subscriber,
 };
 pub use process::{AutoName, AutoNameSettings, Process, ProcessName};
 pub use process_handle::{ProcessHandle, RunningState, Stdin};
@@ -115,7 +114,7 @@ mod test {
             RunningState::Uncertain(_) => {
                 assert_that!(&process).fail("Process state should not be uncertain");
             }
-        };
+        }
 
         let _exit_status = process.wait_for_completion(None).await.unwrap();
 
@@ -130,7 +129,7 @@ mod test {
             RunningState::Uncertain(_) => {
                 assert_that!(process).fail("Process state should not be uncertain");
             }
-        };
+        }
     }
 
     #[tokio::test]
@@ -157,6 +156,6 @@ mod test {
             RunningState::Uncertain(_) => {
                 assert_that!(process).fail("Process state should not be uncertain");
             }
-        };
+        }
     }
 }

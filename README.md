@@ -21,7 +21,7 @@ When working with child processes in async Rust, you often need to:
 - 🎯 **Flexible Collection** - Gather output into vectors, files, or custom sinks
 - 🔄 **Multiple Consumers** - Support for both single and broadcast (multi-consumer) stream consumption
 - 📝 **Programmatic Process Input** - Write data to the processes stdin stream, close it when done
-- ⚡ **Graceful Termination** - Automatic signal escalation (SIGINT → SIGTERM → SIGKILL)
+- ⚡ **Graceful Termination** - Automatic signal escalation (SIGINT → SIGTERM → kill, or platform equivalents)
 - 🛡️ **Collection Safety** - Fine-grained control over buffers used when collecting stdout/stderr streams
 - 🛡️ **Resource Safety** - Dropping a live, still-armed `ProcessHandle` performs best-effort cleanup and then panics
   loudly
@@ -36,7 +36,7 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 tokio-process-tools = "0.8.0"
-tokio = { version = "1", features = ["process", "sync", "io-util", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["process", "sync", "io-util", "rt-multi-thread", "time", "macros", "fs"] }
 ```
 
 ## Examples
@@ -90,6 +90,30 @@ async fn main() {
 }
 ```
 
+Use `wait_for_completion_with_raw_output(...)` when you need bytes instead of parsed lines:
+
+```rust ,no_run
+use tokio::process::Command;
+use tokio_process_tools::*;
+
+#[tokio::main]
+async fn main() {
+    let cmd = Command::new("ls");
+    let mut process = Process::new(cmd)
+        .spawn_single_subscriber()
+        .expect("Failed to spawn command");
+
+    let RawOutput { status, stdout, stderr } = process
+        .wait_for_completion_with_raw_output(None)
+        .await
+        .unwrap();
+
+    println!("Exit status: {:?}", status);
+    println!("Raw stdout bytes: {:?}", stdout);
+    println!("Raw stderr bytes: {:?}", stderr);
+}
+```
+
 ## Stream Types: Which to choose?
 
 When spawning a process, you choose the stream type explicitly by calling either `.spawn_broadcast()` or
@@ -97,7 +121,7 @@ When spawning a process, you choose the stream type explicitly by calling either
 
 ### Single Subscriber (`.spawn_single_subscriber()`)
 
-- ✅ More efficient (lower memory, no cloning)
+- ✅ More efficient (lower memory footprint)
 - ✅ Configurable backpressure handling
 - ⚠️ **Only one consumer allowed** - creating a second inspector/collector will panic
 - 💡 **Use when**: You only need one way to consume output (e.g., just collecting OR just monitoring)
@@ -222,9 +246,9 @@ async fn main() {
         .unwrap();
 
     // Consumer 1: Log to console
-    let _logger = process.stdout().inspect_lines(
+    let logger = process.stdout().inspect_lines(
         |line| {
-            eprintln!("[LOG] {}", line);
+            eprintln!("[LOG] {line}");
             Next::Continue
         },
         LineParsingOptions::default()
@@ -232,7 +256,7 @@ async fn main() {
 
     // Consumer 2: Collect to file
     let log_file = tokio::fs::File::create("output.log").await.unwrap();
-    let _file_writer = process.stdout().collect_lines_into_write(
+    let file_writer = process.stdout().collect_lines_into_write(
         log_file,
         LineParsingOptions::default(),
         LineWriteMode::AppendLf,
@@ -254,6 +278,8 @@ async fn main() {
     process.wait_for_completion(None).await.unwrap();
 
     // Get collected errors
+    logger.wait().await.unwrap();
+    let _log_file = file_writer.wait().await.unwrap();
     let errors = error_collector.wait().await.unwrap();
     println!("Found {} errors", errors.len());
 }
@@ -371,7 +397,7 @@ chunks that can be buffered):
 
 **Chunk Size**: Controls the size of the buffer used when reading from stdout/stderr. Larger chunks reduce syscall
 overhead but use more memory per read and therefore more memory overall. Default is 16 KB. Lower values may be chosen
-for them to fit in smaller CPU caches.
+for them to fit in smaller CPU caches. Chunk size must be greater than zero; configuring a zero-byte chunk size panics.
 
 **Channel Capacity**: Controls how many chunks can be queued before backpressure is applied. Higher capacity allows more
 buffering but uses more memory. Default is 128.
@@ -454,7 +480,7 @@ async fn main() {
         .unwrap();
 
     // Process output asynchronously (e.g., send to database)
-    let _processor = process.stdout().inspect_lines_async(
+    let processor = process.stdout().inspect_lines_async(
         |line| {
             let line = line.into_owned();
             async move {
@@ -467,6 +493,7 @@ async fn main() {
     );
 
     process.wait_for_completion(None).await.unwrap();
+    processor.wait().await.unwrap();
 }
 
 async fn process_line_in_database(line: &str) {
@@ -484,7 +511,7 @@ use tokio_process_tools::*;
 #[tokio::main]
 async fn main() {
     let cmd = Command::new("some-command");
-    let process = Process::new(cmd)
+    let mut process = Process::new(cmd)
         .spawn_broadcast()
         .unwrap();
 
@@ -507,13 +534,59 @@ async fn main() {
         LineParsingOptions::default()
     );
 
+    process.wait_for_completion(None).await.unwrap();
+    let result = custom_collector.wait().await.unwrap();
+}
+```
+
+Async collectors implement `AsyncLineCollector` or `AsyncChunkCollector`. This avoids allocating a
+boxed future for every collected item. The API uses traits for now because stable Rust cannot yet
+express the required `Send` bound on futures returned by `AsyncFn` callbacks.
+
+```rust ,no_run
+use std::borrow::Cow;
+use tokio::process::Command;
+use tokio_process_tools::*;
+
+#[derive(Debug, Default)]
+struct MyCollector {
+    lines: Vec<String>,
+}
+
+struct StoreLine;
+
+impl AsyncLineCollector<MyCollector> for StoreLine {
+    async fn collect<'a>(
+        &'a mut self,
+        line: Cow<'a, str>,
+        custom: &'a mut MyCollector,
+    ) -> Next {
+        custom.lines.push(line.into_owned());
+        Next::Continue
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let cmd = Command::new("some-command");
+    let mut process = Process::new(cmd)
+        .spawn_broadcast()
+        .unwrap();
+
+    let custom_collector = process.stdout().collect_lines_async(
+        MyCollector::default(),
+        StoreLine,
+        LineParsingOptions::default()
+    );
+
+    process.wait_for_completion(None).await.unwrap();
     let result = custom_collector.wait().await.unwrap();
 }
 ```
 
 ### Mapped Output
 
-Transform output before writing into sink supporting the returned by the map closure.
+Transform parsed lines before writing them into an async writer:
 
 ```rust ,no_run
 use tokio::process::Command;
@@ -522,7 +595,7 @@ use tokio_process_tools::*;
 #[tokio::main]
 async fn main() {
     let cmd = Command::new("some-command");
-    let process = Process::new(cmd)
+    let mut process = Process::new(cmd)
         .spawn_broadcast()
         .unwrap();
 
@@ -534,6 +607,9 @@ async fn main() {
         LineParsingOptions::default(),
         LineWriteMode::AsIs,
     );
+
+    process.wait_for_completion(None).await.unwrap();
+    let _log_file = collector.wait().await.unwrap();
 }
 ```
 
@@ -550,7 +626,7 @@ use tokio_process_tools::*;
 #[tokio::main]
 async fn main() {
     let mut cmd = Command::new("some-command");
-    let process = Process::new(cmd)
+    let mut process = Process::new(cmd)
         .spawn_broadcast()
         .unwrap();
     let result = process.stdout().wait_for_line(
@@ -562,6 +638,7 @@ async fn main() {
     ).await;
 
     println!("wait result: {result:?}");
+    process.wait_for_completion(None).await.unwrap();
 }
 ```
 
@@ -582,10 +659,12 @@ use tokio_process_tools::*;
 #[tokio::main]
 async fn main() {
     let id = 42;
-    let mut process = Process::new(Command::new("agent"))
+    let mut process = Process::new(Command::new("true"))
         .with_name(format!("agent-{id}"))
         .spawn_single_subscriber()
         .unwrap();
+
+    process.wait_for_completion(None).await.unwrap();
 }
 ```
 
@@ -606,35 +685,39 @@ async fn main() {
         .with_auto_name(AutoName::Using(AutoNameSettings::program_only()))
         .spawn_broadcast()
         .unwrap();
+    process.wait_for_completion(None).await.unwrap();
 
-    // Include arguments in the name (DEFAULT). Name will be "cargo test --all-features"
-    let mut cmd = Command::new("cargo");
-    cmd.arg("test").arg("--all-features");
+    // Include arguments in the name (DEFAULT). Name will be "true \"--help\""
+    let mut cmd = Command::new("true");
+    cmd.arg("--help");
 
     let mut process = Process::new(cmd)
         .with_auto_name(AutoName::Using(AutoNameSettings::program_with_args()))
         .spawn_broadcast()
         .unwrap();
+    process.wait_for_completion(None).await.unwrap();
 
-    // Include environment variables and arguments in the name. Name will be "S3_ENDPOINT=127.0.0.1:9000 cargo test --all-features"
-    let mut cmd = Command::new("cargo");
-    cmd.arg("test").arg("--all-features");
+    // Include environment variables and arguments in the name. Name will include "S3_ENDPOINT=127.0.0.1:9000 true \"--help\""
+    let mut cmd = Command::new("true");
+    cmd.arg("--help");
     cmd.env("S3_ENDPOINT", "127.0.0.1:9000");
 
     let mut process = Process::new(cmd)
         .with_auto_name(AutoName::Using(AutoNameSettings::program_with_env_and_args()))
         .spawn_broadcast()
         .unwrap();
+    process.wait_for_completion(None).await.unwrap();
 
     // Full debug output (for troubleshooting). Name includes all tokio Command details.
-    let mut cmd = Command::new("server");
-    cmd.arg("--port").arg("8080");
+    let mut cmd = Command::new("true");
+    cmd.arg("--help");
     cmd.env("S3_ENDPOINT", "127.0.0.1:9000");
 
     let mut process = Process::new(cmd)
         .with_auto_name(AutoName::Debug)
         .spawn_broadcast()
         .unwrap();
+    process.wait_for_completion(None).await.unwrap();
 }
 ```
 
@@ -662,7 +745,7 @@ async fn main() {
         Duration::from_secs(30),  // Wait for 30s
         Duration::from_secs(3),   // Then send SIGINT, wait 3s
         Duration::from_secs(5),   // Then send SIGTERM, wait 5s
-        // If still running, sends SIGKILL
+        // If still running, kills the process
     ).await {
         Ok(status) => println!("Completed with status: {:?}", status),
         Err(e) => eprintln!("Termination failed: {}", e),
@@ -733,8 +816,8 @@ async fn test() {
 
 ## Platform Support
 
-- ✅ **Linux/macOS**: Using SIGINT, SIGTERM, SIGKILL
-- ✅ **Windows**: Using CTRL_C_EVENT, CTRL_BREAK_EVENT
+- ✅ **Linux/macOS**: Using SIGINT, SIGTERM, then kill
+- ✅ **Windows**: Using `CTRL_C_EVENT`, `CTRL_BREAK_EVENT`, then kill
 
 ## MSRV
 

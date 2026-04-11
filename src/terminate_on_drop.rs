@@ -81,7 +81,7 @@ impl<O: OutputStream> Drop for TerminateOnDrop<O> {
                         process = %self.process_handle.name,
                         ?exit_status,
                         "Successfully terminated process"
-                    )
+                    );
                 }
                 Err(err) => {
                     panic!(
@@ -89,7 +89,7 @@ impl<O: OutputStream> Drop for TerminateOnDrop<O> {
                         self.process_handle.name, err
                     );
                 }
-            };
+            }
         });
     }
 }

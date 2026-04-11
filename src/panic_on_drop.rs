@@ -3,7 +3,7 @@ use std::borrow::Cow;
 
 /// A type raising a panic when dropped.
 ///
-/// Call [PanicOnDrop::defuse] to prevent the panic.
+/// Call [`PanicOnDrop::defuse`] to prevent the panic.
 #[derive(Debug)]
 pub struct PanicOnDrop {
     /// Name of the original resource that encloses this type.
@@ -19,7 +19,7 @@ pub struct PanicOnDrop {
 impl PanicOnDrop {
     /// Creates a new `PanicOnDrop` instance, raising a panic when dropped.
     ///
-    /// This panic can only be prevented when [PanicOnDrop::defuse] was called before this type is
+    /// This panic can only be prevented when [`PanicOnDrop::defuse`] was called before this type is
     /// dropped.
     pub fn new(
         resource_name: impl Into<Cow<'static, str>>,

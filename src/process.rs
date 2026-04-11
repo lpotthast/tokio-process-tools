@@ -35,6 +35,10 @@ impl Default for AutoName {
 
 /// Controls in detail which parts of the command are automatically captured as the process name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag controls one optional part of the generated process name"
+)]
 pub struct AutoNameSettings {
     include_current_dir: bool,
     include_envs: bool,
@@ -46,6 +50,7 @@ impl AutoNameSettings {
     /// Capture the program name.
     ///
     /// Example: `Command::new("ls").arg("-la").env("FOO", "foo)` is captured as `"ls"`.
+    #[must_use]
     pub fn program_only() -> Self {
         AutoNameSettings {
             include_current_dir: false,
@@ -58,6 +63,7 @@ impl AutoNameSettings {
     /// Capture the program name and all arguments.
     ///
     /// Example: `Command::new("ls").arg("-la").env("FOO", "foo)` is captured as `"ls -la"`.
+    #[must_use]
     pub fn program_with_args() -> Self {
         AutoNameSettings {
             include_current_dir: false,
@@ -70,6 +76,7 @@ impl AutoNameSettings {
     /// Capture the program name and all environment variables and arguments.
     ///
     /// Example: `Command::new("ls").arg("-la").env("FOO", "foo)` is captured as `"FOO=foo ls -la"`.
+    #[must_use]
     pub fn program_with_env_and_args() -> Self {
         AutoNameSettings {
             include_current_dir: false,
@@ -82,6 +89,7 @@ impl AutoNameSettings {
     /// Capture the directory and the program name and all environment variables and arguments.
     ///
     /// Example: `Command::new("ls").arg("-la").env("FOO", "foo)` is captured as `"/some/dir % FOO=foo ls -la"`.
+    #[must_use]
     pub fn full() -> Self {
         AutoNameSettings {
             include_current_dir: true,
@@ -91,7 +99,7 @@ impl AutoNameSettings {
         }
     }
 
-    fn format_cmd(&self, cmd: &std::process::Command) -> String {
+    fn format_cmd(self, cmd: &std::process::Command) -> String {
         let mut name = String::new();
         if self.include_current_dir
             && let Some(current_dir) = cmd.get_current_dir()
@@ -242,6 +250,7 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn new(cmd: tokio::process::Command) -> Self {
         Self {
             cmd,
@@ -281,6 +290,7 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn name(mut self, name: impl Into<ProcessName>) -> Self {
         self.name = name.into();
         self
@@ -310,6 +320,7 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn with_name(self, name: impl Into<Cow<'static, str>>) -> Self {
         self.name(ProcessName::Explicit(name.into()))
     }
@@ -335,6 +346,7 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn with_auto_name(self, mode: AutoName) -> Self {
         self.name(ProcessName::Auto(mode))
     }
@@ -342,7 +354,11 @@ impl Process {
     /// Sets the stdout chunk size.
     ///
     /// This controls the size of the buffer used when reading from the process's stdout stream.
-    /// Default is [DEFAULT_CHUNK_SIZE].
+    /// Default is [`DEFAULT_CHUNK_SIZE`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is zero.
     ///
     /// # Examples
     ///
@@ -357,7 +373,9 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn stdout_chunk_size(mut self, chunk_size: NumBytes) -> Self {
+        chunk_size.assert_non_zero("chunk_size");
         self.stdout_chunk_size = chunk_size;
         self
     }
@@ -365,7 +383,11 @@ impl Process {
     /// Sets the stderr chunk size.
     ///
     /// This controls the size of the buffer used when reading from the process's stderr stream.
-    /// Default is [DEFAULT_CHUNK_SIZE].
+    /// Default is [`DEFAULT_CHUNK_SIZE`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is zero.
     ///
     /// # Examples
     ///
@@ -380,7 +402,9 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn stderr_chunk_size(mut self, chunk_size: NumBytes) -> Self {
+        chunk_size.assert_non_zero("chunk_size");
         self.stderr_chunk_size = chunk_size;
         self
     }
@@ -389,7 +413,11 @@ impl Process {
     ///
     /// This controls the size of the buffers used when reading from the process's stdout and
     /// stderr streams.
-    /// Default is [DEFAULT_CHUNK_SIZE].
+    /// Default is [`DEFAULT_CHUNK_SIZE`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is zero.
     ///
     /// # Examples
     ///
@@ -404,7 +432,9 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn chunk_sizes(mut self, chunk_size: NumBytes) -> Self {
+        chunk_size.assert_non_zero("chunk_size");
         self.stdout_chunk_size = chunk_size;
         self.stderr_chunk_size = chunk_size;
         self
@@ -413,7 +443,7 @@ impl Process {
     /// Sets the stdout channel capacity.
     ///
     /// This controls how many chunks can be buffered before backpressure is applied.
-    /// Default is [DEFAULT_CHANNEL_CAPACITY].
+    /// Default is [`DEFAULT_CHANNEL_CAPACITY`].
     ///
     /// # Examples
     ///
@@ -428,6 +458,7 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn stdout_capacity(mut self, capacity: usize) -> Self {
         self.stdout_capacity = capacity;
         self
@@ -436,7 +467,7 @@ impl Process {
     /// Sets the stderr channel capacity.
     ///
     /// This controls how many chunks can be buffered before backpressure is applied.
-    /// Default is [DEFAULT_CHANNEL_CAPACITY].
+    /// Default is [`DEFAULT_CHANNEL_CAPACITY`].
     ///
     /// # Examples
     ///
@@ -451,6 +482,7 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn stderr_capacity(mut self, capacity: usize) -> Self {
         self.stderr_capacity = capacity;
         self
@@ -459,7 +491,7 @@ impl Process {
     /// Sets the stdout and stderr channel capacity.
     ///
     /// This controls how many chunks can be buffered before backpressure is applied.
-    /// Default is [DEFAULT_CHANNEL_CAPACITY].
+    /// Default is [`DEFAULT_CHANNEL_CAPACITY`].
     ///
     /// # Examples
     ///
@@ -474,6 +506,7 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    #[must_use]
     pub fn capacities(mut self, capacity: usize) -> Self {
         self.stdout_capacity = capacity;
         self.stderr_capacity = capacity;
@@ -488,6 +521,7 @@ impl Process {
     /// throughput, for example when waiting for a startup line in tests.
     ///
     /// This setting is ignored by `.spawn_broadcast()`.
+    #[must_use]
     pub fn stdout_backpressure_control(
         mut self,
         backpressure_control: BackpressureControl,
@@ -500,6 +534,7 @@ impl Process {
     ///
     /// The default is [`BackpressureControl::DropLatestIncomingIfBufferFull`].
     /// This setting is ignored by `.spawn_broadcast()`.
+    #[must_use]
     pub fn stderr_backpressure_control(
         mut self,
         backpressure_control: BackpressureControl,
@@ -515,6 +550,7 @@ impl Process {
     /// [`BackpressureControl::DropLatestIncomingIfBufferFull`].
     ///
     /// This setting is ignored by `.spawn_broadcast()`.
+    #[must_use]
     pub fn backpressure_control(mut self, backpressure_control: BackpressureControl) -> Self {
         self.stdout_backpressure_control = backpressure_control;
         self.stderr_backpressure_control = backpressure_control;
@@ -564,6 +600,10 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError::SpawnFailed`] if the process cannot be spawned.
     pub fn spawn_broadcast(self) -> Result<ProcessHandle<BroadcastOutputStream>, SpawnError> {
         let name = self.generate_name();
         ProcessHandle::<BroadcastOutputStream>::spawn_with_capacity(
@@ -597,6 +637,10 @@ impl Process {
     /// # Ok::<_, SpawnError>(())
     /// # });
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError::SpawnFailed`] if the process cannot be spawned.
     pub fn spawn_single_subscriber(
         self,
     ) -> Result<ProcessHandle<SingleSubscriberOutputStream>, SpawnError> {
@@ -621,10 +665,18 @@ impl Process {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BackpressureControl, LineParsingOptions, NumBytesExt, Output, OutputStream};
+    use crate::{
+        BackpressureControl, LineParsingOptions, NumBytes, NumBytesExt, Output, OutputStream,
+    };
     use assertr::prelude::*;
     use std::path::PathBuf;
     use tokio::process::Command;
+
+    #[test]
+    #[should_panic(expected = "chunk_size must be greater than zero bytes")]
+    fn process_builder_panics_on_zero_chunk_size() {
+        let _process = Process::new(Command::new("ls")).chunk_sizes(NumBytes::zero());
+    }
 
     #[tokio::test]
     async fn process_builder_broadcast() {

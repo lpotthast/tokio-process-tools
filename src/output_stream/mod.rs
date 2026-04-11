@@ -1,4 +1,5 @@
 use bytes::{Buf, BytesMut};
+use memchr::memchr;
 use std::borrow::Cow;
 
 /// Default chunk size read from the source stream. 16 kilobytes.
@@ -17,8 +18,8 @@ pub mod single_subscriber;
 
 /// We support the following implementations:
 ///
-/// - [broadcast::BroadcastOutputStream]
-/// - [single_subscriber::SingleSubscriberOutputStream]
+/// - [`broadcast::BroadcastOutputStream`]
+/// - [`single_subscriber::SingleSubscriberOutputStream`]
 pub trait OutputStream {
     /// The maximum size of every chunk read by the backing `stream_reader`.
     fn chunk_size(&self) -> NumBytes;
@@ -35,8 +36,11 @@ pub trait OutputStream {
 /// Although reaching that level requires:
 /// 1. A receiver to listen for chunks.
 /// 2. The channel getting full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FromStreamOptions {
     /// The size of an individual chunk read from the read buffer in bytes.
+    ///
+    /// Must be greater than zero.
     ///
     /// default: 16 * 1024 // 16 kb
     pub chunk_size: NumBytes,
@@ -210,21 +214,18 @@ impl LineParserState {
 
     pub fn visit_chunk(
         &mut self,
-        chunk: &[u8],
+        mut chunk: &[u8],
         options: LineParsingOptions,
         mut f: impl FnMut(Cow<'_, str>) -> Next,
     ) -> Next {
-        for byte in chunk.iter().copied() {
+        while !chunk.is_empty() {
             if self.discard_until_newline {
-                if byte == b'\n' {
-                    self.discard_until_newline = false;
-                }
-                continue;
-            }
-
-            if byte == b'\n' {
-                if self.emit_line(&mut f) == Next::Break {
-                    return Next::Break;
+                match memchr(b'\n', chunk) {
+                    Some(pos) => {
+                        self.discard_until_newline = false;
+                        chunk = &chunk[pos + 1..];
+                    }
+                    None => return Next::Continue,
                 }
                 continue;
             }
@@ -237,7 +238,6 @@ impl LineParserState {
                             return Next::Break;
                         }
                         self.discard_until_newline = true;
-                        continue;
                     }
                     LineOverflowBehavior::EmitAdditionalAsNewLines => {
                         if self.emit_line(&mut f) == Next::Break {
@@ -245,9 +245,35 @@ impl LineParserState {
                         }
                     }
                 }
+                continue;
             }
 
-            self.line_buffer.extend_from_slice(&[byte]);
+            let remaining_line_length = if options.max_line_length.0 == 0 {
+                chunk.len()
+            } else {
+                options.max_line_length.0 - self.line_buffer.len()
+            };
+            let scan_len = remaining_line_length.min(chunk.len());
+            let scan = &chunk[..scan_len];
+
+            if let Some(pos) = memchr(b'\n', scan) {
+                // Optimization: Complete line in chunk? Then do not copy into BytesMut first.
+                let result = if self.line_buffer.is_empty() {
+                    f(String::from_utf8_lossy(&scan[..pos]))
+                } else {
+                    self.line_buffer.extend_from_slice(&scan[..pos]);
+                    self.emit_line(&mut f)
+                };
+
+                if result == Next::Break {
+                    return Next::Break;
+                }
+                chunk = &chunk[pos + 1..];
+                continue;
+            }
+
+            self.line_buffer.extend_from_slice(scan);
+            chunk = &chunk[scan_len..];
 
             if options.max_line_length.0 != 0
                 && self.line_buffer.len() == options.max_line_length.0
@@ -264,6 +290,18 @@ impl LineParserState {
         Next::Continue
     }
 
+    pub(crate) fn owned_lines<'a>(
+        &'a mut self,
+        chunk: &'a [u8],
+        options: LineParsingOptions,
+    ) -> OwnedLineReader<'a> {
+        OwnedLineReader {
+            parser: self,
+            chunk,
+            options,
+        }
+    }
+
     pub fn finish(&self, f: impl FnOnce(Cow<'_, str>) -> Next) -> Next {
         if self.discard_until_newline || self.line_buffer.is_empty() {
             Next::Continue
@@ -272,9 +310,93 @@ impl LineParserState {
         }
     }
 
+    pub(crate) fn finish_owned(&self) -> Option<String> {
+        if self.discard_until_newline || self.line_buffer.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&self.line_buffer).into_owned())
+        }
+    }
+
     fn emit_line(&mut self, f: &mut impl FnMut(Cow<'_, str>) -> Next) -> Next {
         let line = self.line_buffer.split().freeze();
         f(String::from_utf8_lossy(&line))
+    }
+
+    fn emit_owned_line(&mut self) -> String {
+        let line = self.line_buffer.split().freeze();
+        String::from_utf8_lossy(&line).into_owned()
+    }
+}
+
+pub(crate) struct OwnedLineReader<'a> {
+    parser: &'a mut LineParserState,
+    chunk: &'a [u8],
+    options: LineParsingOptions,
+}
+
+impl Iterator for OwnedLineReader<'_> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.chunk.is_empty() {
+            if self.parser.discard_until_newline {
+                if let Some(pos) = memchr(b'\n', self.chunk) {
+                    self.parser.discard_until_newline = false;
+                    self.chunk = &self.chunk[pos + 1..];
+                } else {
+                    self.chunk = &[];
+                    return None;
+                }
+                continue;
+            }
+
+            if self.options.max_line_length.0 != 0
+                && self.parser.line_buffer.len() == self.options.max_line_length.0
+            {
+                return match self.options.overflow_behavior {
+                    LineOverflowBehavior::DropAdditionalData => {
+                        self.parser.discard_until_newline = true;
+                        Some(self.parser.emit_owned_line())
+                    }
+                    LineOverflowBehavior::EmitAdditionalAsNewLines => {
+                        Some(self.parser.emit_owned_line())
+                    }
+                };
+            }
+
+            let remaining_line_length = if self.options.max_line_length.0 == 0 {
+                self.chunk.len()
+            } else {
+                self.options.max_line_length.0 - self.parser.line_buffer.len()
+            };
+            let scan_len = remaining_line_length.min(self.chunk.len());
+            let scan = &self.chunk[..scan_len];
+
+            if let Some(pos) = memchr(b'\n', scan) {
+                self.chunk = &self.chunk[pos + 1..];
+                if self.parser.line_buffer.is_empty() {
+                    return Some(String::from_utf8_lossy(&scan[..pos]).into_owned());
+                }
+                self.parser.line_buffer.extend_from_slice(&scan[..pos]);
+                return Some(self.parser.emit_owned_line());
+            }
+
+            self.parser.line_buffer.extend_from_slice(scan);
+            self.chunk = &self.chunk[scan_len..];
+
+            if self.options.max_line_length.0 != 0
+                && self.parser.line_buffer.len() == self.options.max_line_length.0
+                && matches!(
+                    self.options.overflow_behavior,
+                    LineOverflowBehavior::EmitAdditionalAsNewLines
+                )
+            {
+                return Some(self.parser.emit_owned_line());
+            }
+        }
+
+        None
     }
 }
 
@@ -290,12 +412,21 @@ impl LineParserState {
 pub struct NumBytes(usize);
 
 impl NumBytes {
-    /// Creates a NumBytes value of zero.
+    /// Creates a `NumBytes` value of zero.
+    #[must_use]
     pub fn zero() -> Self {
         Self(0)
     }
 
+    pub(crate) fn assert_non_zero(self, parameter_name: &str) {
+        assert!(
+            self.0 > 0,
+            "{parameter_name} must be greater than zero bytes"
+        );
+    }
+
     /// The amount of bytes represented by this instance.
+    #[must_use]
     pub fn bytes(&self) -> usize {
         self.0
     }
@@ -376,8 +507,10 @@ mod tests {
                 Next::Continue
             });
 
-            let expected_lines: Vec<String> =
-                expected_lines.iter().map(|s| s.to_string()).collect();
+            let expected_lines: Vec<String> = expected_lines
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
             assert_that!(collected_lines).is_equal_to(expected_lines);
         }
 
