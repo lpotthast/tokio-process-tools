@@ -13,11 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations.
 - Added `LineWriteMode` so line-writing helpers require an explicit choice between preserving
   mapped output as-is and appending `\n` delimiters.
-- Added `Process` builder methods for single-subscriber backpressure control:
-  `stdout_backpressure_control`, `stderr_backpressure_control`, and `backpressure_control`.
+- Added single-subscriber backpressure configuration via `Process::stdout_backpressure_control`,
+  `Process::stderr_backpressure_control`, and `Process::backpressure_control`, plus
+  `SingleSubscriberOutputStream::backpressure_control()` to inspect the configured policy.
 - Added `AsyncChunkCollector` and `AsyncLineCollector` for wiring up custom async collectors not
   requiring a per-item allocation.
-- Re-exported `BackpressureControl`, `Chunk`, and `LineWriteMode` from the crate root.
+- Added `RawOutput` plus `wait_for_completion_with_raw_output` and
+  `wait_for_completion_with_raw_output_or_terminate` on both process handle backends for collecting
+  stdout and stderr as raw bytes.
+- Made `BroadcastOutputStream::from_stream` public and re-exported `FromStreamOptions` for custom
+  stream construction.
+- Re-exported `BackpressureControl`, `Chunk`, `FromStreamOptions`, `LineWriteMode`, and
+  `RawOutput` from the crate root.
 - Added this `CHANGELOG.md` in Keep a Changelog format.
 
 ### Changed
@@ -33,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Changed `ProcessHandle` to perform its own cleanup-on-drop instead of relying on Tokio's
   `kill_on_drop(true)`, which restores `must_not_be_terminated()` as a real opt-out from
   implicit termination.
+- Changed chunk-size configuration to reject `NumBytes::zero()` in `Process` builder methods and
+  stream `from_stream` constructors.
 - Now enforcing pedantic clippy lints.
 - Raised the MSRV from `1.85.0` to `1.89.0`.
 - Updated the README and crate-level docs to cover the new line-wait outcomes, EOF behavior,
@@ -50,13 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed a broadcast-stream late-subscriber race at EOF so subscribers that attach before closure
   cannot receive a synthetic terminal `None` ahead of real tail data.
 - Fixed line-oriented output handling to preserve the final unterminated line at EOF in
-  `wait_for_completion_with_output`, line collectors (sync and async), line waiters, and
-  `inspect_lines_async`.
+  `wait_for_completion_with_output`, line collectors (sync and async), line waiters, and line
+  inspectors (sync and async).
 - Fixed line-oriented consumers to resynchronize after lossy gaps instead of joining bytes across
   dropped chunks.
 - Fixed `LineOverflowBehavior::DropAdditionalData` so discarding now persists across chunk
   boundaries until the next newline is observed.
-- Now requiring `bytes` in v0.11.1 to enforce a RUSTSEC-2026-0007 fixed version.
+- Now requiring `bytes` in v1.11.1 to enforce a RUSTSEC-2026-0007 fixed version.
 
 ### Removed
 
