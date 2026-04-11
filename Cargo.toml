@@ -10,6 +10,14 @@ keywords = ["tokio", "process", "subprocess", "command", "output"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 authors = ["Lukas Potthast <privat@lukas-potthast.de>"]
+exclude = [
+    "/.idea",
+    "/.claude",
+    "/AGENTS.md",
+    "/Justfile",
+    "/TODO.md",
+]
+
 
 [dependencies]
 atomic-take = "1.1.0"
