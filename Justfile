@@ -16,4 +16,4 @@ test:
 bench:
     cargo bench
 
-verify: fmt-check lint test bench
+verify: fmt-check lint test
