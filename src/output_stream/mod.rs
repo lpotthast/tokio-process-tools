@@ -40,14 +40,13 @@ pub(crate) use collection::{
 pub(crate) use config::{
     StreamConfig, StreamConfigBuilder, StreamConfigMaxBufferedChunksBuilder,
     StreamConfigReadChunkSizeBuilder, StreamConfigReadyBuilder, StreamConfigReplayBuilder,
-    StreamConfigSealedReplayBehaviorBuilder,
 };
 pub(crate) use event::StreamEvent;
 pub(crate) use line::{LineParserState, LineParsingOptions, LineWriteMode};
 pub(crate) use options::NumBytes;
 pub(crate) use policy::{
     BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, ReliableDelivery, Replay,
-    ReplayEnabled, ReplayRetention, ReplaySubscribeError, SealedReplayBehavior,
+    ReplayEnabled, ReplayRetention,
 };
 
 /// We support the following implementations:

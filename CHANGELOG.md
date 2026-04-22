@@ -11,25 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `StreamConfig` and a required type-state `StreamConfig::builder()` API for direct stream
   construction and process stdout/stderr stream configuration. The builder requires selecting
-  delivery, replay, read chunk size, maximum buffered chunks, and sealed-replay behavior for
-  replay-enabled modes.
+  delivery, replay, read chunk size, and maximum buffered chunks.
 - Added sealed typed delivery and replay policy markers: `BestEffortDelivery`, `ReliableDelivery`,
-  `NoReplay`, `ReplayEnabled`, `Delivery`, `Replay`, `DeliveryGuarantee`, `ReplayRetention`,
-  `SealedReplayBehavior`, and `ReplaySubscribeError`.
+  `NoReplay`, `ReplayEnabled`, `Delivery`, `Replay`, `DeliveryGuarantee`, and
+  `ReplayRetention`.
 - Added typed process spawning with `.stdout_and_stderr(...)`, `.stdout(...)`, and `.stderr(...)`
   stream configuration stages. Stdout and stderr may now use different backends and, for broadcast
   streams, different delivery and replay mode types.
 - Added broadcast stream delivery and replay configuration via `stream.broadcast()`, including
   `.best_effort_delivery()`, `.reliable_for_active_subscribers()`, `.no_replay()`,
-  `.replay_last_chunks(...)`, `.replay_last_bytes(...)`, `.replay_all()`, and
-  `.sealed_replay_behavior(...)`.
+  `.replay_last_chunks(...)`, `.replay_last_bytes(...)`, and `.replay_all()`.
 - Added single-subscriber stream delivery and replay configuration via
   `stream.single_subscriber()` while keeping the lower-overhead single-consumer backend and
   second-consumer rejection behavior.
-- Added replay-enabled stream APIs for retained output and replay-from-start line waits:
-  `seal_replay`, `is_replay_sealed`, `try_wait_for_line_from_start_with_timeout`, and
-  `wait_for_line_from_start_with_timeout`. Replay-retention metadata uses
-  `Option<ReplayRetention>` to represent disabled replay.
+- Added replay-enabled stream APIs for retained output and replay sealing: `seal_replay` and
+  `is_replay_sealed`. Replay-retention metadata uses `Option<ReplayRetention>` to represent
+  disabled replay.
 - Added handle-level replay sealing helpers. Broadcast handles expose `seal_stdout_replay` and
   `seal_stderr_replay` only when the relevant typed stream has replay enabled, and
   `seal_output_replay` only when both broadcast streams have replay enabled. Single-subscriber
@@ -77,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Changed `wait_for_line` and `wait_for_line_with_timeout` to return a `LineWaiter`
   future whose output is `Result<WaitForLineResult, StreamReadError>`. The stream subscription or
   single-subscriber receiver claim is created before the returned future is first polled.
+- **Breaking:** Changed normal stream consumers to subscribe from the earliest output currently
+  available. Replay-enabled unsealed streams may provide retained past output; no-replay or sealed
+  streams start future consumers at live output.
 - **Breaking:** Changed `wait_for_completion_or_terminate` to return the dedicated
   `WaitOrTerminateError` type, and changed output-collecting wait helpers to return dedicated
   compound error types instead of overloading `WaitError`.
@@ -90,6 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `collect_lines_into_write`, and `collect_lines_into_write_mapped` to require
   `WriteCollectionOptions`; `WriteCollectionOptions::fail_fast()` stops on the first sink write
   failure.
+- **Breaking:** Relaxed `Sink` to require only `Send`, allowing collectors and writer collectors
+  to use sinks that are not `Debug` and cannot be shared concurrently.
 - **Breaking:** Changed single-subscriber process spawning so delivery and replay must be selected
   explicitly. `.no_replay()` starts the sole consumer at live output instead of buffered startup
   output.
@@ -134,6 +136,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Removed `BackpressureControl` and
   `SingleSubscriberOutputStream::backpressure_control()`. Single-subscriber buffering behavior is
   now represented directly by `DeliveryGuarantee`.
+- **Breaking:** Removed `SealedReplayBehavior`, `ReplaySubscribeError`, and the explicit
+  replay-from-start line wait APIs. Replay retention and sealing now control what output is
+  available to the normal consumer APIs.
 - Removed the atomic-take dependency.
 
 ## [0.8.1] - 2026-04-11

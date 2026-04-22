@@ -79,6 +79,11 @@ When spawning a process, choose the stream settings that match how output will b
 - Use bounded collection options for untrusted output, and reserve `*_trusted` helpers for processes
   whose output volume is known and controlled.
 
+New consumers start at the earliest output the stream can currently provide. With `.no_replay()`,
+that is live output. With replay enabled and unsealed, it is the oldest retained output. After
+`seal_replay()` or `seal_output_replay()`, future consumers start at live output while active
+consumers keep consuming any unread data required by the delivery policy.
+
 ## Examples
 
 Examples use `use tokio_process_tools::*;` so the code stays focused on subprocess
@@ -142,7 +147,6 @@ async fn main() {
                 .single_subscriber()
                 .best_effort_delivery()
                 .replay_last_bytes(1.megabytes())
-                .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                 .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                 .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
         })
@@ -197,7 +201,6 @@ async fn main() {
                 .single_subscriber()
                 .best_effort_delivery()
                 .replay_last_bytes(1.megabytes())
-                .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                 .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                 .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
         })
@@ -250,10 +253,10 @@ to use different backends when that is useful.
 - 💡 **Use when**: You only need one active way to consume output at a time
 
 For `stream.single_subscriber()`, choose delivery, replay, and stream settings in the builder chain:
-`.best_effort_delivery().no_replay().read_chunk_size(...).max_buffered_chunks(...)` starts each consumer at live output
-and keeps output reading non-blocking when the active consumer lags. Dropping, canceling, timing
-out, or completing a collector, inspector, or line waiter releases the stream so another consumer
-can attach later. Use
+`.best_effort_delivery().no_replay().read_chunk_size(...).max_buffered_chunks(...)` starts each
+consumer at live output and keeps output reading non-blocking when the active consumer lags.
+Dropping, canceling, timing out, or completing a collector, inspector, or line waiter releases the
+stream so another consumer can attach later. Use
 `.reliable_for_active_subscribers()` when the active consumer must not miss chunks inside the
 library, and choose a replay-enabled mode when output produced before or between consumers must be
 retained. Replay may let a later sequential consumer observe retained output that an earlier
@@ -288,8 +291,8 @@ is the maximum unread chunk lag an active subscriber can have before output read
 You cannot have bounded memory, lossless replay for future subscribers, and guaranteed non-blocking
 process output at the same time.
 
-For correctness-sensitive startup waits, retain replay only until the process has passed its
-readiness phase:
+For correctness-sensitive startup waits, create the waiter before sealing replay, then retain replay
+only until the process has passed its readiness phase:
 
 ```rust ,no_run
 use std::time::Duration;
@@ -305,7 +308,6 @@ async fn main() {
                 .broadcast()
                 .reliable_for_active_subscribers()
                 .replay_last_bytes(1.megabytes())
-                .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                 .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                 .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
         })
@@ -322,7 +324,7 @@ async fn main() {
         LineParsingOptions::default(),
     );
 
-    let ready = stdout.wait_for_line_from_start_with_timeout(
+    let ready = stdout.wait_for_line_with_timeout(
         |line| line.contains("Server listening on"),
         LineParsingOptions::default(),
         Duration::from_secs(30),
@@ -418,7 +420,6 @@ async fn main() {
                 .single_subscriber()
                 .best_effort_delivery()
                 .replay_last_bytes(1.megabytes())
-                .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                 .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                 .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
         })
@@ -464,7 +465,6 @@ async fn main() {
                 .broadcast()
                 .best_effort_delivery()
                 .replay_last_bytes(1.megabytes())
-                .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                 .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                 .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
         })
@@ -548,7 +548,6 @@ async fn main() {
                 .broadcast()
                 .best_effort_delivery()
                 .replay_last_bytes(1.megabytes())
-                .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                 .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                 .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
         })

@@ -1,9 +1,9 @@
 use crate::output_stream::backend::broadcast::BroadcastOutputStream;
 use crate::output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
 use crate::output_stream::{
-    BestEffortDelivery, Delivery, OutputStream, ReliableDelivery, Replay, StreamConfig,
-    StreamConfigBuilder, StreamConfigMaxBufferedChunksBuilder, StreamConfigReadChunkSizeBuilder,
-    StreamConfigReadyBuilder, StreamConfigReplayBuilder, StreamConfigSealedReplayBehaviorBuilder,
+    BestEffortDelivery, Delivery, OutputStream, ReliableDelivery, Replay, ReplayEnabled,
+    StreamConfig, StreamConfigBuilder, StreamConfigMaxBufferedChunksBuilder,
+    StreamConfigReadChunkSizeBuilder, StreamConfigReadyBuilder, StreamConfigReplayBuilder,
 };
 use std::marker::PhantomData;
 use tokio::io::AsyncRead;
@@ -131,7 +131,7 @@ where
     pub fn replay_last_chunks(
         self,
         chunks: usize,
-    ) -> ProcessStreamConfigStage<Backend, StreamConfigSealedReplayBehaviorBuilder<D>> {
+    ) -> ProcessStreamConfigStage<Backend, StreamConfigReadChunkSizeBuilder<D, ReplayEnabled>> {
         ProcessStreamConfigStage::new(self.stage.replay_last_chunks(chunks))
     }
 
@@ -140,7 +140,7 @@ where
     pub fn replay_last_bytes(
         self,
         bytes: crate::NumBytes,
-    ) -> ProcessStreamConfigStage<Backend, StreamConfigSealedReplayBehaviorBuilder<D>> {
+    ) -> ProcessStreamConfigStage<Backend, StreamConfigReadChunkSizeBuilder<D, ReplayEnabled>> {
         ProcessStreamConfigStage::new(self.stage.replay_last_bytes(bytes))
     }
 
@@ -148,23 +148,8 @@ where
     #[must_use]
     pub fn replay_all(
         self,
-    ) -> ProcessStreamConfigStage<Backend, StreamConfigSealedReplayBehaviorBuilder<D>> {
+    ) -> ProcessStreamConfigStage<Backend, StreamConfigReadChunkSizeBuilder<D, ReplayEnabled>> {
         ProcessStreamConfigStage::new(self.stage.replay_all())
-    }
-}
-
-impl<Backend, D> ProcessStreamConfigStage<Backend, StreamConfigSealedReplayBehaviorBuilder<D>>
-where
-    D: Delivery,
-{
-    /// Selects how explicit replay-from-start subscriptions behave after replay has been sealed.
-    #[must_use]
-    pub fn sealed_replay_behavior(
-        self,
-        sealed_replay_behavior: crate::SealedReplayBehavior,
-    ) -> ProcessStreamConfigStage<Backend, StreamConfigReadChunkSizeBuilder<D, crate::ReplayEnabled>>
-    {
-        ProcessStreamConfigStage::new(self.stage.sealed_replay_behavior(sealed_replay_behavior))
     }
 }
 

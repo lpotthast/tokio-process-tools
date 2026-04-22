@@ -381,9 +381,7 @@ where
 mod tests {
     use super::*;
     use crate::panic_on_drop::PanicOnDrop;
-    use crate::{
-        DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytesExt, SealedReplayBehavior,
-    };
+    use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytesExt};
     use assertr::prelude::*;
 
     #[cfg(windows)]
@@ -583,7 +581,6 @@ fn main() {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -614,7 +611,6 @@ fn main() {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -644,7 +640,6 @@ fn main() {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -654,7 +649,7 @@ fn main() {
 
         let ready = process
             .stdout()
-            .wait_for_line_from_start_with_timeout(
+            .wait_for_line_with_timeout(
                 |line| line == "ready",
                 crate::LineParsingOptions::default(),
                 Duration::from_secs(5),
@@ -687,7 +682,6 @@ fn main() {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -697,7 +691,7 @@ fn main() {
 
         let ready = process
             .stdout()
-            .wait_for_line_from_start_with_timeout(
+            .wait_for_line_with_timeout(
                 |line| line == "ready",
                 crate::LineParsingOptions::default(),
                 Duration::from_secs(5),

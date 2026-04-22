@@ -130,7 +130,7 @@ where
     ///     AsyncChunkCollector, AsyncLineCollector, AutoNameSettings, Chunk, Collector,
     ///     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, DeliveryGuarantee, LineCollectionOptions,
     ///     LineOverflowBehavior, LineParsingOptions, LineWriteMode, Next, NumBytesExt, Process,
-    ///     ProcessHandle, ProcessOutput, RawCollectionOptions, SealedReplayBehavior, Sink,
+    ///     ProcessHandle, ProcessOutput, RawCollectionOptions, Sink,
     ///     StreamConfig, TerminateOnDrop, WaitForLineResult,
     /// };
     /// # use tokio::io::AsyncWriteExt;
@@ -188,7 +188,6 @@ mod tests {
     use crate::{
         CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
         LineCollectionOptions, LineOverflowBehavior, LineParsingOptions, NumBytesExt,
-        SealedReplayBehavior,
     };
     use assertr::prelude::*;
     use std::time::Duration;
@@ -241,7 +240,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -308,7 +306,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -348,7 +345,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })

@@ -5,8 +5,8 @@ use crate::output_stream::subscription::EventSubscription;
 use crate::output_stream::{
     BestEffortDelivery, Chunk, CollectedBytes, CollectedLines, Delivery, DeliveryGuarantee,
     LineCollectionOptions, LineParsingOptions, LineWriteMode, Next, NoReplay, OutputStream,
-    RawCollectionOptions, Replay, ReplayEnabled, ReplayRetention, ReplaySubscribeError,
-    SealedReplayBehavior, SinkWriteErrorHandler, StreamConfig, StreamEvent, WriteCollectionOptions,
+    RawCollectionOptions, Replay, ReplayEnabled, ReplayRetention, SinkWriteErrorHandler,
+    StreamConfig, StreamEvent, WriteCollectionOptions,
 };
 use crate::{NumBytes, StreamReadError};
 use std::borrow::Cow;
@@ -25,7 +25,7 @@ mod subscription;
 pub use crate::output_stream::line_waiter::LineWaiter;
 use reader::{read_chunked_fast, read_chunked_shared};
 use state::{Shared, evict_locked};
-use subscription::{FastSubscription, SharedSubscription, Subscription, SubscriptionStart};
+use subscription::{FastSubscription, SharedSubscription, Subscription};
 
 struct FastClosureState {
     closed: bool,
@@ -279,48 +279,6 @@ where
             .expect("broadcast state poisoned")
             .replay_sealed
     }
-
-    /// Attempts to create a replay-from-start line waiter with a timeout.
-    ///
-    /// The subscription is created before this method returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReplaySubscribeError`] when replay-from-start is no longer possible.
-    pub fn try_wait_for_line_from_start_with_timeout(
-        &self,
-        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
-        options: LineParsingOptions,
-        timeout: Duration,
-    ) -> Result<LineWaiter, ReplaySubscribeError> {
-        let subscription = self.subscribe(SubscriptionStart::ReplayFromStart)?;
-        Ok(wait_for_line(
-            subscription,
-            predicate,
-            options,
-            Some(timeout),
-        ))
-    }
-
-    /// Creates a replay-from-start line waiter with a timeout.
-    ///
-    /// The subscription is created before this method returns. Use
-    /// [`BroadcastOutputStream::try_wait_for_line_from_start_with_timeout`] if replay rejection should
-    /// be handled without panicking.
-    ///
-    /// # Panics
-    ///
-    /// Panics if replay-from-start is no longer available.
-    #[must_use]
-    pub fn wait_for_line_from_start_with_timeout(
-        &self,
-        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
-        options: LineParsingOptions,
-        timeout: Duration,
-    ) -> LineWaiter {
-        self.try_wait_for_line_from_start_with_timeout(predicate, options, timeout)
-            .expect("broadcast replay-from-start subscription failed")
-    }
 }
 
 impl<D, R> BroadcastOutputStream<D, R>
@@ -328,56 +286,31 @@ where
     D: Delivery,
     R: Replay,
 {
-    fn subscribe(
-        &self,
-        start: SubscriptionStart,
-    ) -> Result<Subscription<D, R>, ReplaySubscribeError> {
+    fn subscribe(&self) -> Subscription<D, R> {
         let Backend::Shared(backend) = &self.backend else {
-            return Err(ReplaySubscribeError::ReplayUnavailable);
+            panic!("shared broadcast subscription requested for fast backend");
         };
         let mut state = backend
             .shared
             .state
             .lock()
             .expect("broadcast state poisoned");
-        let cursor = match start {
-            SubscriptionStart::ReplayAvailable => match backend.options.replay_retention() {
-                None => state.next_seq,
-                Some(
-                    ReplayRetention::LastChunks(_)
-                    | ReplayRetention::LastBytes(_)
-                    | ReplayRetention::All,
-                ) if state.replay_sealed => state.next_seq,
-                Some(
-                    ReplayRetention::LastChunks(_)
-                    | ReplayRetention::LastBytes(_)
-                    | ReplayRetention::All,
-                ) => state.replay_start_seq,
-            },
-            SubscriptionStart::ReplayFromStart => {
-                if state.replay_sealed {
-                    match backend.options.sealed_replay_behavior() {
-                        Some(SealedReplayBehavior::StartAtLiveOutput) => state.next_seq,
-                        Some(SealedReplayBehavior::RejectReplaySubscribers) => {
-                            return Err(ReplaySubscribeError::ReplaySealed);
-                        }
-                        None => return Err(ReplaySubscribeError::ReplayUnavailable),
-                    }
-                } else if state.replay_start_seq != 0 {
-                    return Err(ReplaySubscribeError::ReplayUnavailable);
-                } else {
-                    0
-                }
-            }
+        let cursor = match backend.options.replay_retention() {
+            Some(
+                ReplayRetention::LastChunks(_)
+                | ReplayRetention::LastBytes(_)
+                | ReplayRetention::All,
+            ) if !state.replay_sealed => state.replay_start_seq,
+            None | Some(_) => state.next_seq,
         };
 
         let id = state.add_subscriber(cursor);
-        Ok(Subscription::Shared(SharedSubscription {
+        Subscription::Shared(SharedSubscription {
             shared: Arc::clone(&backend.shared),
             id,
             options: backend.options,
             done: false,
-        }))
+        })
     }
 
     fn subscribe_normal(&self) -> Subscription<D, R> {
@@ -402,9 +335,7 @@ where
                     emit_terminal_event,
                 })
             }
-            Backend::Shared(_) => self
-                .subscribe(SubscriptionStart::ReplayAvailable)
-                .expect("normal broadcast subscription must not fail"),
+            Backend::Shared(_) => self.subscribe(),
         }
     }
 
@@ -672,6 +603,10 @@ where
     }
 
     /// Waits for a line that matches the given predicate.
+    ///
+    /// The waiter starts at the earliest output currently available to new consumers. With replay
+    /// enabled and unsealed, that can include retained past output; otherwise it starts at live
+    /// output.
     #[must_use]
     pub fn wait_for_line(
         &self,
@@ -683,6 +618,10 @@ where
     }
 
     /// Waits for a line that matches the given predicate, with a timeout.
+    ///
+    /// The waiter starts at the earliest output currently available to new consumers. With replay
+    /// enabled and unsealed, that can include retained past output; otherwise it starts at live
+    /// output.
     #[must_use]
     pub fn wait_for_line_with_timeout(
         &self,

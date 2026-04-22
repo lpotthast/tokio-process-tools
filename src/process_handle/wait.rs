@@ -193,7 +193,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(crate::SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })

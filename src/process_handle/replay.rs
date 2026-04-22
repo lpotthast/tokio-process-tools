@@ -73,7 +73,7 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
 mod tests {
     use crate::{
         DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytesExt, Process,
-        SealedReplayBehavior, WaitForCompletionOptions,
+        WaitForCompletionOptions,
     };
     use assertr::prelude::*;
     use tokio::process::Command;
@@ -90,7 +90,6 @@ mod tests {
                     .broadcast()
                     .reliable_for_active_subscribers()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })

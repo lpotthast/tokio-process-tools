@@ -2,7 +2,7 @@ use crate::NumBytes;
 use crate::output_stream::options::assert_max_buffered_chunks_non_zero;
 use crate::output_stream::policy::{
     BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, ReliableDelivery, Replay,
-    ReplayEnabled, ReplayRetention, SealedReplayBehavior,
+    ReplayEnabled, ReplayRetention,
 };
 
 /// Shared output stream configuration for all stream backends.
@@ -114,23 +114,29 @@ where
 
     /// Keeps the latest number of chunks for future subscribers.
     #[must_use]
-    pub fn replay_last_chunks(self, chunks: usize) -> StreamConfigSealedReplayBehaviorBuilder<D> {
+    pub fn replay_last_chunks(
+        self,
+        chunks: usize,
+    ) -> StreamConfigReadChunkSizeBuilder<D, ReplayEnabled> {
         let replay_retention = ReplayRetention::LastChunks(chunks);
         replay_retention.assert_non_zero("chunks");
-        StreamConfigSealedReplayBehaviorBuilder {
+        StreamConfigReadChunkSizeBuilder {
             delivery: self.delivery,
-            replay_retention,
+            replay: ReplayEnabled::new(replay_retention),
         }
     }
 
     /// Keeps whole chunks covering at least the latest number of bytes.
     #[must_use]
-    pub fn replay_last_bytes(self, bytes: NumBytes) -> StreamConfigSealedReplayBehaviorBuilder<D> {
+    pub fn replay_last_bytes(
+        self,
+        bytes: NumBytes,
+    ) -> StreamConfigReadChunkSizeBuilder<D, ReplayEnabled> {
         let replay_retention = ReplayRetention::LastBytes(bytes);
         replay_retention.assert_non_zero("bytes");
-        StreamConfigSealedReplayBehaviorBuilder {
+        StreamConfigReadChunkSizeBuilder {
             delivery: self.delivery,
-            replay_retention,
+            replay: ReplayEnabled::new(replay_retention),
         }
     }
 
@@ -141,37 +147,10 @@ where
     /// Make sure to call `seal_replay()` on the stream when all subscribers were created. This
     /// allows the system to free up memory for data already replayed to all subscribers.
     #[must_use]
-    pub fn replay_all(self) -> StreamConfigSealedReplayBehaviorBuilder<D> {
-        StreamConfigSealedReplayBehaviorBuilder {
-            delivery: self.delivery,
-            replay_retention: ReplayRetention::All,
-        }
-    }
-}
-
-/// Builder stage that requires selecting sealed-replay behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamConfigSealedReplayBehaviorBuilder<D>
-where
-    D: Delivery,
-{
-    delivery: D,
-    replay_retention: ReplayRetention,
-}
-
-impl<D> StreamConfigSealedReplayBehaviorBuilder<D>
-where
-    D: Delivery,
-{
-    /// Selects how explicit replay-from-start subscriptions behave after replay has been sealed.
-    #[must_use]
-    pub fn sealed_replay_behavior(
-        self,
-        sealed_replay_behavior: SealedReplayBehavior,
-    ) -> StreamConfigReadChunkSizeBuilder<D, ReplayEnabled> {
+    pub fn replay_all(self) -> StreamConfigReadChunkSizeBuilder<D, ReplayEnabled> {
         StreamConfigReadChunkSizeBuilder {
             delivery: self.delivery,
-            replay: ReplayEnabled::new(self.replay_retention, sealed_replay_behavior),
+            replay: ReplayEnabled::new(ReplayRetention::All),
         }
     }
 }
@@ -286,12 +265,6 @@ where
         self.replay.replay_retention()
     }
 
-    /// Returns the sealed-replay behavior represented by this configuration.
-    #[must_use]
-    pub fn sealed_replay_behavior(self) -> Option<SealedReplayBehavior> {
-        self.replay.sealed_replay_behavior()
-    }
-
     /// Returns whether this configuration enables replay-specific APIs.
     #[must_use]
     pub fn replay_enabled(self) -> bool {
@@ -322,16 +295,6 @@ where
         self.replay.replay_retention = replay_retention;
         self
     }
-
-    /// Returns this replay-enabled configuration with custom sealed-replay behavior.
-    #[must_use]
-    pub fn with_sealed_replay_behavior(
-        mut self,
-        sealed_replay_behavior: SealedReplayBehavior,
-    ) -> Self {
-        self.replay.sealed_replay_behavior = sealed_replay_behavior;
-        self
-    }
 }
 
 #[cfg(test)]
@@ -360,7 +323,6 @@ mod tests {
         assert_that!(config.delivery_guarantee()).is_equal_to(DeliveryGuarantee::BestEffort);
         assert_that!(config.replay_enabled()).is_false();
         assert_that!(config.replay_retention()).is_none();
-        assert_that!(config.sealed_replay_behavior()).is_none();
         assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
         assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
     }
@@ -377,7 +339,6 @@ mod tests {
             .is_equal_to(DeliveryGuarantee::ReliableForActiveSubscribers);
         assert_that!(config.replay_enabled()).is_false();
         assert_that!(config.replay_retention()).is_none();
-        assert_that!(config.sealed_replay_behavior()).is_none();
     }
 
     #[test]
@@ -385,14 +346,11 @@ mod tests {
         let config: StreamConfig<BestEffortDelivery, ReplayEnabled> = default_builder(
             StreamConfig::builder()
                 .best_effort_delivery()
-                .replay_last_chunks(2)
-                .sealed_replay_behavior(SealedReplayBehavior::RejectReplaySubscribers),
+                .replay_last_chunks(2),
         );
 
         assert_that!(config.delivery_guarantee()).is_equal_to(DeliveryGuarantee::BestEffort);
         assert_that!(config.replay_retention()).is_equal_to(Some(ReplayRetention::LastChunks(2)));
-        assert_that!(config.sealed_replay_behavior())
-            .is_equal_to(Some(SealedReplayBehavior::RejectReplaySubscribers));
     }
 
     #[test]
@@ -400,8 +358,7 @@ mod tests {
         let config: StreamConfig<ReliableDelivery, ReplayEnabled> = default_builder(
             StreamConfig::builder()
                 .reliable_for_active_subscribers()
-                .replay_last_bytes(16.bytes())
-                .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput),
+                .replay_last_bytes(16.bytes()),
         );
 
         assert_that!(config.delivery_guarantee())
@@ -448,10 +405,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "replay_retention must retain at least one chunk")]
     fn replay_enabled_rejects_zero_replay_retention() {
-        let _replay = ReplayEnabled::new(
-            ReplayRetention::LastChunks(0),
-            SealedReplayBehavior::StartAtLiveOutput,
-        );
+        let _replay = ReplayEnabled::new(ReplayRetention::LastChunks(0));
     }
 
     #[test]
@@ -460,7 +414,6 @@ mod tests {
         let config = StreamConfig::builder()
             .best_effort_delivery()
             .replay_all()
-            .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
             .read_chunk_size(8.bytes())
             .max_buffered_chunks(2)
             .build();
@@ -477,7 +430,6 @@ mod tests {
             delivery: BestEffortDelivery,
             replay: ReplayEnabled {
                 replay_retention: ReplayRetention::LastBytes(NumBytes::zero()),
-                sealed_replay_behavior: SealedReplayBehavior::StartAtLiveOutput,
             },
         };
 

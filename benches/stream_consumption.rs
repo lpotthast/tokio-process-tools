@@ -14,9 +14,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
 use tokio_process_tools::{
     AsyncLineCollector, BestEffortDelivery, DeliveryGuarantee, LineParsingOptions, LineWriteMode,
-    Next, NoReplay, NumBytesExt, ReliableDelivery, ReplayEnabled, ReplayRetention,
-    SealedReplayBehavior, StreamConfig, WaitForLineResult, WriteCollectionOptions,
-    broadcast::BroadcastOutputStream, single_subscriber::SingleSubscriberOutputStream,
+    Next, NoReplay, NumBytesExt, ReliableDelivery, ReplayEnabled, ReplayRetention, StreamConfig,
+    WaitForLineResult, WriteCollectionOptions, broadcast::BroadcastOutputStream,
+    single_subscriber::SingleSubscriberOutputStream,
 };
 
 const CHANNEL_CAPACITY: usize = 256;
@@ -293,7 +293,6 @@ fn best_effort_replay_mode(
         ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
         ReplayRetention::All => builder.replay_all(),
     }
-    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
     .read_chunk_size(stream_chunk_size.bytes())
     .max_buffered_chunks(CHANNEL_CAPACITY)
     .build()
@@ -309,7 +308,6 @@ fn reliable_replay_mode(
         ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
         ReplayRetention::All => builder.replay_all(),
     }
-    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
     .read_chunk_size(stream_chunk_size.bytes())
     .max_buffered_chunks(CHANNEL_CAPACITY)
     .build()

@@ -1,5 +1,4 @@
 use super::{ActiveSubscriber, ConfiguredShared, read_chunked};
-use crate::ReplaySubscribeError;
 use crate::output_stream::Chunk;
 use crate::output_stream::StreamEvent;
 use crate::output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
@@ -7,9 +6,7 @@ use crate::output_stream::backend::test_support::{
     FailingWrite, ReadErrorAfterBytes, write_test_data,
 };
 use crate::output_stream::consumer;
-use crate::output_stream::{
-    DeliveryGuarantee, LineWriteMode, Next, ReplayRetention, SealedReplayBehavior, StreamConfig,
-};
+use crate::output_stream::{DeliveryGuarantee, LineWriteMode, Next, ReplayRetention, StreamConfig};
 use crate::{AsyncChunkCollector, AsyncLineCollector};
 use crate::{
     CollectionOverflowBehavior, CollectorError, DEFAULT_MAX_BUFFERED_CHUNKS,
@@ -21,13 +18,14 @@ use assertr::prelude::*;
 use bytes::Bytes;
 use mockall::{automock, predicate};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing_test::traced_test;
@@ -65,7 +63,6 @@ fn reliable_replay_options(
         ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
         ReplayRetention::All => builder.replay_all(),
     }
-    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
     .read_chunk_size(4.bytes())
     .max_buffered_chunks(4)
     .build()
@@ -195,6 +192,38 @@ impl AsyncChunkCollector<Vec<u8>> for ExtendChunks {
     async fn collect<'a>(&'a mut self, chunk: Chunk, seen: &'a mut Vec<u8>) -> Next {
         seen.extend_from_slice(chunk.as_ref());
         Next::Continue
+    }
+}
+
+#[derive(Default)]
+struct SendOnlyLineSink {
+    lines: Vec<String>,
+    line_count: Cell<usize>,
+}
+
+#[derive(Default)]
+struct SendOnlyWrite {
+    bytes: Vec<u8>,
+    write_calls: Cell<usize>,
+}
+
+impl AsyncWrite for SendOnlyWrite {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.write_calls.set(self.write_calls.get() + 1);
+        self.bytes.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -595,7 +624,7 @@ async fn configured_second_subscriber_panic_does_not_poison_state_or_stop_reader
     let collector = stream.collect_all_chunks_into_vec_trusted();
 
     assert_that_panic_by(|| {
-        let _waiter = stream.try_wait_for_line_from_start_with_timeout(
+        let _waiter = stream.wait_for_line_with_timeout(
             |_line| false,
             LineParsingOptions::default(),
             Duration::from_millis(25),
@@ -637,12 +666,11 @@ async fn typed_replay_last_chunks_starts_at_retention_boundary() {
 }
 
 #[tokio::test]
-async fn typed_replay_from_start_after_seal_can_be_rejected() {
+async fn typed_wait_after_seal_starts_live() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let options = StreamConfig::builder()
         .reliable_for_active_subscribers()
         .replay_all()
-        .sealed_replay_behavior(SealedReplayBehavior::RejectReplaySubscribers)
         .read_chunk_size(4.bytes())
         .max_buffered_chunks(4)
         .build();
@@ -653,20 +681,16 @@ async fn typed_replay_from_start_after_seal_can_be_rejected() {
     sleep(Duration::from_millis(25)).await;
     stream.seal_replay();
 
-    let result = stream.try_wait_for_line_from_start_with_timeout(
-        |line| line == "ready",
+    let waiter = stream.wait_for_line_with_timeout(
+        |line| line == "live",
         LineParsingOptions::default(),
-        Duration::from_millis(25),
+        Duration::from_secs(1),
     );
 
-    match result {
-        Err(err) => {
-            assert_that!(err).is_equal_to(ReplaySubscribeError::ReplaySealed);
-        }
-        Ok(_waiter) => {
-            assert_that!(()).fail("replay should be rejected");
-        }
-    }
+    write_half.write_all(b"live\n").await.unwrap();
+    drop(write_half);
+
+    assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Matched));
 }
 
 #[tokio::test]
@@ -1402,6 +1426,35 @@ async fn collect_lines_accepts_stateful_callback() {
 }
 
 #[tokio::test]
+async fn collect_lines_accepts_send_only_sink() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
+        read_half,
+        "custom",
+        DeliveryGuarantee::BestEffort,
+        DEFAULT_READ_CHUNK_SIZE,
+        DEFAULT_MAX_BUFFERED_CHUNKS,
+    );
+
+    let collector = os.collect_lines(
+        SendOnlyLineSink::default(),
+        |line, sink| {
+            sink.lines.push(line.into_owned());
+            sink.line_count.set(sink.line_count.get() + 1);
+            Next::Continue
+        },
+        LineParsingOptions::default(),
+    );
+
+    write_half.write_all(b"alpha\nbeta").await.unwrap();
+    drop(write_half);
+
+    let sink = collector.wait().await.unwrap();
+    assert_that!(sink.lines).is_equal_to(vec!["alpha".to_string(), "beta".to_string()]);
+    assert_that!(sink.line_count.get()).is_equal_to(2);
+}
+
+#[tokio::test]
 async fn collect_lines_async_to_file() {
     let (read_half, write_half) = tokio::io::duplex(64);
     let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
@@ -1452,6 +1505,30 @@ async fn collect_lines_into_write_respects_requested_line_delimiter_mode() {
     temp_file.read_to_string(&mut contents).await.unwrap();
 
     assert_that!(contents).is_equal_to("Cargo.lockCargo.tomlREADME.mdsrctarget");
+}
+
+#[tokio::test]
+async fn collect_chunks_into_write_accepts_send_only_writer() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
+        read_half,
+        "custom",
+        DeliveryGuarantee::BestEffort,
+        DEFAULT_READ_CHUNK_SIZE,
+        DEFAULT_MAX_BUFFERED_CHUNKS,
+    );
+
+    let collector = os.collect_chunks_into_write(
+        SendOnlyWrite::default(),
+        WriteCollectionOptions::fail_fast(),
+    );
+
+    write_half.write_all(b"abcdef").await.unwrap();
+    drop(write_half);
+
+    let writer = collector.wait().await.unwrap();
+    assert_that!(writer.bytes).is_equal_to(b"abcdef".to_vec());
+    assert_that!(writer.write_calls.get()).is_greater_than(0);
 }
 
 #[tokio::test]

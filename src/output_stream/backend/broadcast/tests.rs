@@ -1,12 +1,11 @@
-use super::{Backend, BroadcastOutputStream, SharedBackend, SubscriptionStart};
+use super::{Backend, BroadcastOutputStream, SharedBackend};
 use crate::output_stream::StreamEvent;
 use crate::output_stream::backend::test_support::{FailingWrite, ReadErrorAfterBytes};
 use crate::{
     BestEffortDelivery, CollectionOverflowBehavior, CollectorError, Delivery, InspectorError,
     LineCollectionOptions, LineParsingOptions, Next, NumBytes, NumBytesExt, RawCollectionOptions,
-    ReliableDelivery, Replay, ReplayEnabled, ReplayRetention, ReplaySubscribeError,
-    SealedReplayBehavior, SinkWriteErrorAction, StreamConfig, WaitForLineResult,
-    WriteCollectionOptions,
+    ReliableDelivery, Replay, ReplayEnabled, ReplayRetention, SinkWriteErrorAction, StreamConfig,
+    WaitForLineResult, WriteCollectionOptions,
 };
 use assertr::prelude::*;
 use bytes::Bytes;
@@ -87,7 +86,6 @@ fn reliable_options_with(
         ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
         ReplayRetention::All => builder.replay_all(),
     }
-    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
     .read_chunk_size(read_chunk_size)
     .max_buffered_chunks(max_buffered_chunks)
     .build()
@@ -111,7 +109,6 @@ fn best_effort_options_with(
         ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
         ReplayRetention::All => builder.replay_all(),
     }
-    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
     .read_chunk_size(read_chunk_size)
     .max_buffered_chunks(max_buffered_chunks)
     .build()
@@ -349,7 +346,7 @@ async fn late_subscriber_receives_startup_line_with_replay_all() {
     sleep(Duration::from_millis(20)).await;
 
     let result = stream
-        .wait_for_line_from_start_with_timeout(
+        .wait_for_line_with_timeout(
             |line| line == "ready",
             LineParsingOptions::default(),
             Duration::from_secs(1),
@@ -470,7 +467,7 @@ async fn replay_wait_for_line_returns_read_error_after_stream_read_fails() {
         tokio::task::yield_now().await;
     }
 
-    let waiter = stream.wait_for_line_from_start_with_timeout(
+    let waiter = stream.wait_for_line_with_timeout(
         |line| line == "partial",
         LineParsingOptions::default(),
         Duration::from_secs(1),
@@ -522,33 +519,7 @@ async fn collector_and_inspector_return_read_error_when_stream_read_fails() {
 }
 
 #[tokio::test]
-async fn explicit_replay_subscriber_after_seal_fails_when_configured_to_reject() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let stream = BroadcastOutputStream::from_stream(
-        read_half,
-        "custom",
-        reliable_options(ReplayRetention::All)
-            .with_sealed_replay_behavior(SealedReplayBehavior::RejectReplaySubscribers),
-    );
-
-    write_half.write_all(b"old\n").await.unwrap();
-    write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(20)).await;
-    stream.seal_replay();
-
-    let result = stream.try_wait_for_line_from_start_with_timeout(
-        |line| line == "old",
-        LineParsingOptions::default(),
-        Duration::from_secs(1),
-    );
-
-    assert_that!(result.err())
-        .is_some()
-        .is_equal_to(ReplaySubscribeError::ReplaySealed);
-}
-
-#[tokio::test]
-async fn explicit_replay_subscriber_after_seal_starts_live_when_configured() {
+async fn subscriber_after_seal_starts_live() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream = BroadcastOutputStream::from_stream(
         read_half,
@@ -561,13 +532,11 @@ async fn explicit_replay_subscriber_after_seal_starts_live_when_configured() {
     sleep(Duration::from_millis(20)).await;
     stream.seal_replay();
 
-    let waiter = stream
-        .try_wait_for_line_from_start_with_timeout(
-            |line| line == "live",
-            LineParsingOptions::default(),
-            Duration::from_secs(1),
-        )
-        .unwrap();
+    let waiter = stream.wait_for_line_with_timeout(
+        |line| line == "live",
+        LineParsingOptions::default(),
+        Duration::from_secs(1),
+    );
 
     write_half.write_all(b"live\n").await.unwrap();
     drop(write_half);
@@ -583,16 +552,14 @@ async fn explicit_replay_after_seal_ignores_history_retained_for_active_subscrib
         "custom",
         reliable_options(ReplayRetention::All),
     );
-    let _active = stream
-        .subscribe(SubscriptionStart::ReplayAvailable)
-        .unwrap();
+    let _active = stream.subscribe();
 
     write_half.write_all(b"old\n").await.unwrap();
     write_half.flush().await.unwrap();
     sleep(Duration::from_millis(20)).await;
     stream.seal_replay();
 
-    let waiter = stream.wait_for_line_from_start_with_timeout(
+    let waiter = stream.wait_for_line_with_timeout(
         |line| line == "old",
         LineParsingOptions::default(),
         Duration::from_millis(50),
@@ -627,9 +594,7 @@ async fn block_until_subscribers_catch_up_waits_before_active_lag_exceeds_capaci
         "custom",
         reliable_no_replay_options_with(1.bytes(), 1),
     );
-    let mut subscription = stream
-        .subscribe(SubscriptionStart::ReplayAvailable)
-        .unwrap();
+    let mut subscription = stream.subscribe();
 
     write_half.write_all(b"ab").await.unwrap();
     write_half.flush().await.unwrap();
@@ -777,9 +742,7 @@ async fn drop_oldest_emits_gap_for_slow_subscriber() {
         "custom",
         best_effort_options_with(ReplayRetention::LastChunks(1), 3.bytes(), 1),
     );
-    let mut subscription = stream
-        .subscribe(SubscriptionStart::ReplayAvailable)
-        .unwrap();
+    let mut subscription = stream.subscribe();
 
     write_half.write_all(b"ready\n").await.unwrap();
     drop(write_half);
@@ -848,9 +811,7 @@ async fn dropping_slow_subscriber_after_seal_frees_retained_history() {
         "custom",
         reliable_options_with(ReplayRetention::All, 8.bytes(), 8),
     );
-    let slow = stream
-        .subscribe(SubscriptionStart::ReplayAvailable)
-        .unwrap();
+    let slow = stream.subscribe();
 
     write_half.write_all(b"old\n").await.unwrap();
     write_half.flush().await.unwrap();
@@ -889,12 +850,8 @@ async fn dropping_slow_reliable_subscriber_unpins_buffer() {
         "custom",
         reliable_no_replay_options_with(1.bytes(), 1),
     );
-    let slow = stream
-        .subscribe(SubscriptionStart::ReplayAvailable)
-        .unwrap();
-    let mut fast = stream
-        .subscribe(SubscriptionStart::ReplayAvailable)
-        .unwrap();
+    let slow = stream.subscribe();
+    let mut fast = stream.subscribe();
 
     write_half.write_all(b"a").await.unwrap();
     write_half.flush().await.unwrap();
@@ -965,16 +922,14 @@ async fn replay_last_chunks_starts_at_retention_boundary() {
 }
 
 #[tokio::test]
-async fn from_start_replay_is_rejected_when_bounded_replay_window_is_past_start() {
+async fn wait_starts_at_bounded_replay_window_when_start_evicted() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream = BroadcastOutputStream::from_stream(
         read_half,
         "custom",
         reliable_options_with(ReplayRetention::LastChunks(1), 1.bytes(), 4),
     );
-    let _pinned_subscription = stream
-        .subscribe(SubscriptionStart::ReplayAvailable)
-        .unwrap();
+    let _pinned_subscription = stream.subscribe();
 
     write_half.write_all(b"ab").await.unwrap();
     write_half.flush().await.unwrap();
@@ -990,15 +945,14 @@ async fn from_start_replay_is_rejected_when_bounded_replay_window_is_past_start(
         assert_that!(state.replay_start_seq).is_equal_to(1);
     }
 
-    let result = stream.try_wait_for_line_from_start_with_timeout(
-        |_line| false,
+    let waiter = stream.wait_for_line_with_timeout(
+        |line| line == "b",
         LineParsingOptions::default(),
-        Duration::from_millis(25),
+        Duration::from_secs(1),
     );
+    drop(write_half);
 
-    assert_that!(result.err())
-        .is_some()
-        .is_equal_to(ReplaySubscribeError::ReplayUnavailable);
+    assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Matched));
 }
 
 #[tokio::test]
@@ -1026,9 +980,7 @@ async fn dropping_slow_subscriber_unblocks_stream_consumption() {
         "custom",
         reliable_no_replay_options_with(2.bytes(), 1),
     );
-    let subscription = stream
-        .subscribe(SubscriptionStart::ReplayAvailable)
-        .unwrap();
+    let subscription = stream.subscribe();
 
     write_half.write_all(b"a\nb\n").await.unwrap();
     write_half.flush().await.unwrap();
@@ -1047,7 +999,7 @@ async fn dropping_slow_subscriber_unblocks_stream_consumption() {
 }
 
 #[tokio::test]
-async fn wait_for_line_from_start_with_timeout_subscribes_before_polling() {
+async fn wait_for_line_with_timeout_subscribes_before_polling() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream = BroadcastOutputStream::from_stream(
         read_half,
@@ -1055,7 +1007,7 @@ async fn wait_for_line_from_start_with_timeout_subscribes_before_polling() {
         reliable_options(ReplayRetention::LastBytes(1.megabytes())),
     );
 
-    let waiter = stream.wait_for_line_from_start_with_timeout(
+    let waiter = stream.wait_for_line_with_timeout(
         |line| line == "ready",
         LineParsingOptions::default(),
         Duration::from_secs(1),
@@ -1079,19 +1031,14 @@ async fn replay_last_bytes_bounds_replay_and_clears_on_seal() {
     write_half.flush().await.unwrap();
     sleep(Duration::from_millis(20)).await;
 
-    match stream.try_wait_for_line_from_start_with_timeout(
-        |line| line == "aa",
+    let waiter = stream.wait_for_line_with_timeout(
+        |line| line == "bb",
         LineParsingOptions::default(),
         Duration::from_secs(1),
-    ) {
-        Err(err) => {
-            assert_that!(err).is_equal_to(ReplaySubscribeError::ReplayUnavailable);
-        }
-        Ok(_) => {
-            assert_that!(())
-                .fail("replay-from-start should be unavailable after bounded replay eviction");
-        }
-    }
+    );
+    drop(write_half);
+
+    assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Matched));
 
     stream.seal_replay();
 
@@ -1128,7 +1075,7 @@ async fn leptos_browser_test_shaped_startup_race() {
     write_half.flush().await.unwrap();
     sleep(Duration::from_millis(20)).await;
 
-    let ready = stream.wait_for_line_from_start_with_timeout(
+    let ready = stream.wait_for_line_with_timeout(
         |line| line == "ready",
         LineParsingOptions::default(),
         Duration::from_secs(1),

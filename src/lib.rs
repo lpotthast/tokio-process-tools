@@ -30,7 +30,6 @@ pub use output_stream::collection::{
 pub use output_stream::config::{
     StreamConfig, StreamConfigBuilder, StreamConfigMaxBufferedChunksBuilder,
     StreamConfigReadChunkSizeBuilder, StreamConfigReadyBuilder, StreamConfigReplayBuilder,
-    StreamConfigSealedReplayBehaviorBuilder,
 };
 pub use output_stream::line::{LineOverflowBehavior, LineParsingOptions, LineWriteMode};
 pub use output_stream::options::{
@@ -38,7 +37,7 @@ pub use output_stream::options::{
 };
 pub use output_stream::policy::{
     BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, ReliableDelivery, Replay,
-    ReplayEnabled, ReplayRetention, ReplaySubscribeError, SealedReplayBehavior,
+    ReplayEnabled, ReplayRetention,
 };
 pub use output_stream::{Chunk, Next, OutputStream};
 pub use process::{

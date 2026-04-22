@@ -79,9 +79,6 @@ pub trait Replay:
     /// Returns the replay retention represented by this marker.
     fn replay_retention(self) -> Option<ReplayRetention>;
 
-    /// Returns the sealed-replay behavior represented by this marker.
-    fn sealed_replay_behavior(self) -> Option<SealedReplayBehavior>;
-
     /// Returns whether replay-specific APIs are enabled for this marker.
     fn replay_enabled(self) -> bool;
 }
@@ -118,10 +115,6 @@ impl Replay for NoReplay {
         None
     }
 
-    fn sealed_replay_behavior(self) -> Option<SealedReplayBehavior> {
-        None
-    }
-
     fn replay_enabled(self) -> bool {
         false
     }
@@ -132,23 +125,14 @@ impl Replay for NoReplay {
 pub struct ReplayEnabled {
     /// Replay history retained for subscribers created after output has already arrived.
     pub replay_retention: ReplayRetention,
-
-    /// How explicit replay-from-start subscriptions behave after replay is sealed.
-    pub sealed_replay_behavior: SealedReplayBehavior,
 }
 
 impl ReplayEnabled {
-    /// Creates a replay-enabled marker with the given retention and sealed-replay behavior.
+    /// Creates a replay-enabled marker with the given retention.
     #[must_use]
-    pub fn new(
-        replay_retention: ReplayRetention,
-        sealed_replay_behavior: SealedReplayBehavior,
-    ) -> Self {
+    pub fn new(replay_retention: ReplayRetention) -> Self {
         replay_retention.assert_non_zero("replay_retention");
-        Self {
-            replay_retention,
-            sealed_replay_behavior,
-        }
+        Self { replay_retention }
     }
 }
 
@@ -157,10 +141,6 @@ impl sealed::ReplaySealed for ReplayEnabled {}
 impl Replay for ReplayEnabled {
     fn replay_retention(self) -> Option<ReplayRetention> {
         Some(self.replay_retention)
-    }
-
-    fn sealed_replay_behavior(self) -> Option<SealedReplayBehavior> {
-        Some(self.sealed_replay_behavior)
     }
 
     fn replay_enabled(self) -> bool {
@@ -208,24 +188,4 @@ impl ReplayRetention {
             | ReplayRetention::All => {}
         }
     }
-}
-
-/// Explicit replay-from-start subscription behavior after replay history has been sealed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SealedReplayBehavior {
-    /// Explicit replay-from-start subscribers created after replay is sealed start at live output.
-    StartAtLiveOutput,
-
-    /// Explicit replay-from-start subscribers created after replay is sealed are rejected.
-    RejectReplaySubscribers,
-}
-
-/// Error returned when an explicit replay subscription cannot be created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplaySubscribeError {
-    /// Replay history was sealed and the stream was configured to reject replay subscribers.
-    ReplaySealed,
-
-    /// The requested replay start is no longer retained.
-    ReplayUnavailable,
 }

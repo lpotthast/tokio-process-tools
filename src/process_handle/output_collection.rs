@@ -361,9 +361,8 @@ mod tests {
     use crate::{
         CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
         LineCollectionOptions, LineOutputOptions, LineOverflowBehavior, LineParsingOptions,
-        NumBytesExt, RawCollectionOptions, RawOutputOptions, SealedReplayBehavior,
-        WaitForCompletionOptions, WaitForCompletionOrTerminateOptions,
-        WaitForCompletionOrTerminateWithOutputOptions,
+        NumBytesExt, RawCollectionOptions, RawOutputOptions, WaitForCompletionOptions,
+        WaitForCompletionOrTerminateOptions, WaitForCompletionOrTerminateWithOutputOptions,
         WaitForCompletionOrTerminateWithRawOutputOptions,
         WaitForCompletionOrTerminateWithTrustedLineOutputOptions,
         WaitForCompletionWithOutputOptions, WaitForCompletionWithRawOutputOptions,
@@ -488,7 +487,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -520,7 +518,6 @@ mod tests {
                     .single_subscriber()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -559,7 +556,6 @@ mod tests {
                     .single_subscriber()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -605,7 +601,6 @@ mod tests {
                     .single_subscriber()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -646,7 +641,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -677,7 +671,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -718,7 +711,6 @@ mod tests {
                     .single_subscriber()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -750,7 +742,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -782,7 +773,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -812,7 +802,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -846,7 +835,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -879,7 +867,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
@@ -911,7 +898,6 @@ mod tests {
                     .broadcast()
                     .best_effort_delivery()
                     .replay_last_bytes(1.megabytes())
-                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })

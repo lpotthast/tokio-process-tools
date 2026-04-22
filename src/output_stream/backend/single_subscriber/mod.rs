@@ -4,8 +4,8 @@ use crate::output_stream::consumer;
 use crate::output_stream::subscription::EventSubscription;
 use crate::output_stream::{
     Chunk, CollectedBytes, CollectedLines, Delivery, LineCollectionOptions, LineWriteMode, Next,
-    OutputStream, RawCollectionOptions, Replay, ReplayRetention, ReplaySubscribeError,
-    SealedReplayBehavior, SinkWriteErrorHandler, StreamConfig, StreamEvent, WriteCollectionOptions,
+    OutputStream, RawCollectionOptions, Replay, ReplayRetention, SinkWriteErrorHandler,
+    StreamConfig, StreamEvent, WriteCollectionOptions,
 };
 use crate::{LineParsingOptions, NumBytes};
 use std::borrow::Cow;
@@ -27,7 +27,7 @@ use crate::DeliveryGuarantee;
 pub use crate::output_stream::line_waiter::LineWaiter;
 use reader::read_chunked;
 use state::{ActiveSubscriber, ConfiguredShared};
-use subscription::{ConfiguredSubscription, SingleSubscription, SubscriptionStart};
+use subscription::{ConfiguredSubscription, SingleSubscription};
 
 impl EventSubscription for mpsc::Receiver<StreamEvent> {
     fn next_event(&mut self) -> impl Future<Output = Option<StreamEvent>> + Send + '_ {
@@ -57,9 +57,6 @@ pub struct SingleSubscriberOutputStream {
 
     /// Replay retention for typed single-subscriber configurations.
     replay_retention: Option<ReplayRetention>,
-
-    /// Sealed replay behavior for typed single-subscriber configurations.
-    sealed_replay_behavior: Option<SealedReplayBehavior>,
 
     /// Whether replay-specific APIs are enabled.
     replay_enabled: bool,
@@ -147,7 +144,6 @@ impl SingleSubscriberOutputStream {
         let active_rx = shared.subscribe_active();
         let delivery_guarantee = options.delivery_guarantee();
         let replay_retention = options.replay_retention();
-        let sealed_replay_behavior = options.sealed_replay_behavior();
         let replay_enabled = options.replay_enabled();
 
         let stream_reader = tokio::spawn(read_chunked(
@@ -166,7 +162,6 @@ impl SingleSubscriberOutputStream {
             max_buffered_chunks: options.max_buffered_chunks,
             configured_shared: Some(shared),
             replay_retention,
-            sealed_replay_behavior,
             replay_enabled,
             name: stream_name,
         }
@@ -194,16 +189,12 @@ impl SingleSubscriberOutputStream {
     }
 
     fn take_subscription(&self) -> SingleSubscription {
-        self.take_configured_subscription(SubscriptionStart::ReplayAvailable)
-            .expect("normal single-subscriber subscription must not fail")
+        self.take_configured_subscription()
     }
 
-    fn take_configured_subscription(
-        &self,
-        start: SubscriptionStart,
-    ) -> Result<SingleSubscription, ReplaySubscribeError> {
+    fn take_configured_subscription(&self) -> SingleSubscription {
         let Some(shared) = &self.configured_shared else {
-            return Err(ReplaySubscribeError::ReplayUnavailable);
+            panic!("configured single-subscriber subscription requested without shared state");
         };
 
         let (sender, receiver) = mpsc::channel(self.max_buffered_chunks);
@@ -218,36 +209,10 @@ impl SingleSubscriberOutputStream {
                 self.panic_on_multiple_consumers();
             }
 
-            if matches!(start, SubscriptionStart::ReplayFromStart) {
-                if state.replay_sealed {
-                    if matches!(
-                        self.sealed_replay_behavior,
-                        Some(SealedReplayBehavior::RejectReplaySubscribers)
-                    ) {
-                        return Err(ReplaySubscribeError::ReplaySealed);
-                    } else if self.sealed_replay_behavior.is_none() {
-                        return Err(ReplaySubscribeError::ReplayUnavailable);
-                    }
-                } else if state.replay_start_evicted {
-                    return Err(ReplaySubscribeError::ReplayUnavailable);
-                }
-            }
-
-            let replay = match start {
-                SubscriptionStart::ReplayAvailable => {
-                    if state.replay_sealed || self.replay_retention.is_none() {
-                        VecDeque::default()
-                    } else {
-                        state.snapshot_events()
-                    }
-                }
-                SubscriptionStart::ReplayFromStart => {
-                    if state.replay_sealed {
-                        VecDeque::default()
-                    } else {
-                        state.snapshot_events()
-                    }
-                }
+            let replay = if state.replay_sealed || self.replay_retention.is_none() {
+                VecDeque::default()
+            } else {
+                state.snapshot_events()
             };
             let id = state.attach_subscriber();
             shared
@@ -256,13 +221,13 @@ impl SingleSubscriberOutputStream {
             (id, replay, state.terminal_event.clone())
         };
 
-        Ok(ConfiguredSubscription {
+        ConfiguredSubscription {
             id,
             shared: Arc::clone(shared),
             replay,
             terminal_event,
             live_receiver: Some(receiver),
-        })
+        }
     }
 
     /// Seals replay history for future subscribers.
@@ -299,49 +264,6 @@ impl SingleSubscriberOutputStream {
             .lock()
             .expect("single-subscriber state poisoned")
             .replay_sealed
-    }
-
-    /// Attempts to create a replay-from-start line waiter with a timeout.
-    ///
-    /// The subscription is created before this method returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReplaySubscribeError`] when replay-from-start is no longer possible.
-    pub fn try_wait_for_line_from_start_with_timeout(
-        &self,
-        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
-        options: LineParsingOptions,
-        timeout: Duration,
-    ) -> Result<LineWaiter, ReplaySubscribeError> {
-        if !self.replay_enabled {
-            return Err(ReplaySubscribeError::ReplayUnavailable);
-        }
-        let subscription = self.take_configured_subscription(SubscriptionStart::ReplayFromStart)?;
-        Ok(LineWaiter::new(
-            consumer::wait_for_line_with_optional_timeout(
-                subscription,
-                predicate,
-                options,
-                Some(timeout),
-            ),
-        ))
-    }
-
-    /// Creates a replay-from-start line waiter with a timeout.
-    ///
-    /// # Panics
-    ///
-    /// Panics if replay-from-start is unavailable.
-    #[must_use]
-    pub fn wait_for_line_from_start_with_timeout(
-        &self,
-        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
-        options: LineParsingOptions,
-        timeout: Duration,
-    ) -> LineWaiter {
-        self.try_wait_for_line_from_start_with_timeout(predicate, options, timeout)
-            .expect("single-subscriber replay-from-start subscription failed")
     }
 }
 
@@ -743,6 +665,9 @@ impl SingleSubscriberOutputStream {
     /// This method claims the single-subscriber stream while the returned waiter is active. Once
     /// the waiter completes or is dropped, another consumer can attach. Use the broadcast stream
     /// implementation if you need multiple concurrent consumers.
+    /// The waiter starts at the earliest output currently available to new consumers. With replay
+    /// enabled and unsealed, that can include retained past output; otherwise it starts at live
+    /// output.
     ///
     /// When chunks are dropped in [`crate::DeliveryGuarantee::BestEffort`] mode, this waiter
     /// discards any partial line in progress and resynchronizes at the next newline instead of
@@ -771,6 +696,9 @@ impl SingleSubscriberOutputStream {
     /// This method claims the single-subscriber stream while the returned waiter is active. Once
     /// the waiter completes, times out, or is dropped, another consumer can attach. Use the
     /// broadcast stream implementation if you need multiple concurrent consumers.
+    /// The waiter starts at the earliest output currently available to new consumers. With replay
+    /// enabled and unsealed, that can include retained past output; otherwise it starts at live
+    /// output.
     ///
     /// When chunks are dropped in [`crate::DeliveryGuarantee::BestEffort`] mode, this waiter
     /// discards any partial line in progress and resynchronizes at the next newline instead of

@@ -45,9 +45,3 @@ impl Drop for ConfiguredSubscription {
 }
 
 pub(super) type SingleSubscription = ConfiguredSubscription;
-
-#[derive(Debug, Clone, Copy)]
-pub(super) enum SubscriptionStart {
-    ReplayAvailable,
-    ReplayFromStart,
-}

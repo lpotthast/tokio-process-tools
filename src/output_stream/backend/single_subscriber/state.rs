@@ -17,7 +17,6 @@ pub(super) struct ReplayState {
     pub(super) events: VecDeque<StreamEvent>,
     chunk_count: usize,
     byte_count: usize,
-    pub(super) replay_start_evicted: bool,
     pub(super) replay_sealed: bool,
     pub(super) terminal_event: Option<StreamEvent>,
     pub(super) active_id: Option<SubscriberId>,
@@ -30,7 +29,6 @@ impl ReplayState {
             events: VecDeque::new(),
             chunk_count: 0,
             byte_count: 0,
-            replay_start_evicted: false,
             replay_sealed: false,
             terminal_event: None,
             active_id: None,
@@ -69,7 +67,6 @@ impl ReplayState {
             self.chunk_count -= 1;
             self.byte_count -= chunk.as_ref().len();
         }
-        self.replay_start_evicted = true;
         Some(event)
     }
 

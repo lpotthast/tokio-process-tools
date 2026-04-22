@@ -1,7 +1,6 @@
 use crate::StreamReadError;
 use crate::output_stream::{Chunk, Next};
 use std::borrow::Cow;
-use std::fmt::Debug;
 use std::future::Future;
 use std::io;
 use thiserror::Error;
@@ -59,10 +58,10 @@ impl From<StreamReadError> for CollectorTaskError {
 
 /// A trait for types that can act as sinks for collected stream data.
 ///
-/// This is automatically implemented for any type that is `Debug + Send + Sync + 'static`.
-pub trait Sink: Debug + Send + Sync + 'static {}
+/// This is automatically implemented for any type that is `Send + 'static`.
+pub trait Sink: Send + 'static {}
 
-impl<T> Sink for T where T: Debug + Send + Sync + 'static {}
+impl<T> Sink for T where T: Send + 'static {}
 
 /// An async collector for raw output chunks.
 ///

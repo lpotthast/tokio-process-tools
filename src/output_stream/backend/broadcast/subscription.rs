@@ -166,9 +166,3 @@ where
         async move { self.recv().await }
     }
 }
-
-#[derive(Debug, Clone, Copy)]
-pub(super) enum SubscriptionStart {
-    ReplayAvailable,
-    ReplayFromStart,
-}
