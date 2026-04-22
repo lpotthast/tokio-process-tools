@@ -6,17 +6,17 @@ use std::borrow::Cow;
 use std::hint::black_box;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
-use tokio_process_tools::broadcast::BroadcastOutputStream;
-use tokio_process_tools::single_subscriber::SingleSubscriberOutputStream;
 use tokio_process_tools::{
-    AsyncLineCollector, BackpressureControl, FromStreamOptions, LineParsingOptions, LineWriteMode,
-    Next, NumBytesExt, WaitForLineResult,
+    AsyncLineCollector, BestEffortDelivery, DeliveryGuarantee, LineParsingOptions, LineWriteMode,
+    Next, NoReplay, NumBytesExt, ReliableDelivery, ReplayEnabled, ReplayRetention,
+    SealedReplayBehavior, StreamConfig, WaitForLineResult, WriteCollectionOptions,
+    broadcast::BroadcastOutputStream, single_subscriber::SingleSubscriberOutputStream,
 };
 
 const CHANNEL_CAPACITY: usize = 256;
@@ -69,6 +69,66 @@ impl AsyncRead for ChunkedReader {
         }
 
         Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StartGate {
+    started: Arc<AtomicBool>,
+    waker: Arc<Mutex<Option<Waker>>>,
+}
+
+impl StartGate {
+    fn open(&self) {
+        self.started.store(true, Ordering::Release);
+        if let Some(waker) = self.waker.lock().expect("start gate poisoned").take() {
+            waker.wake();
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    fn store_waker(&self, waker: &Waker) {
+        *self.waker.lock().expect("start gate poisoned") = Some(waker.clone());
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GatedChunkedReader {
+    inner: ChunkedReader,
+    gate: StartGate,
+}
+
+impl GatedChunkedReader {
+    fn new(chunks: &[Bytes]) -> (Self, StartGate) {
+        let gate = StartGate::default();
+        (
+            Self {
+                inner: ChunkedReader::new(chunks),
+                gate: gate.clone(),
+            },
+            gate,
+        )
+    }
+}
+
+impl AsyncRead for GatedChunkedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.gate.is_open() {
+            self.gate.store_waker(cx.waker());
+            // Recheck after registering the waker to avoid losing a concurrent open().
+            if !self.gate.is_open() {
+                return Poll::Pending;
+            }
+        }
+
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -166,37 +226,196 @@ fn split_bytes(bytes: &[u8], read_chunk_size: usize) -> Vec<Bytes> {
 fn single_stream(
     chunks: &[Bytes],
     stream_chunk_size: usize,
-    backpressure: BackpressureControl,
+    delivery: DeliveryGuarantee,
 ) -> SingleSubscriberOutputStream {
-    SingleSubscriberOutputStream::from_stream(
-        ChunkedReader::new(chunks),
-        "bench",
-        backpressure,
-        FromStreamOptions {
-            chunk_size: stream_chunk_size.bytes(),
-            channel_capacity: CHANNEL_CAPACITY,
-        },
-    )
+    match delivery {
+        DeliveryGuarantee::BestEffort => SingleSubscriberOutputStream::from_stream(
+            ChunkedReader::new(chunks),
+            "bench",
+            StreamConfig::builder()
+                .best_effort_delivery()
+                .no_replay()
+                .read_chunk_size(stream_chunk_size.bytes())
+                .max_buffered_chunks(CHANNEL_CAPACITY)
+                .build(),
+        ),
+        DeliveryGuarantee::ReliableForActiveSubscribers => {
+            SingleSubscriberOutputStream::from_stream(
+                ChunkedReader::new(chunks),
+                "bench",
+                StreamConfig::builder()
+                    .reliable_for_active_subscribers()
+                    .no_replay()
+                    .read_chunk_size(stream_chunk_size.bytes())
+                    .max_buffered_chunks(CHANNEL_CAPACITY)
+                    .build(),
+            )
+        }
+    }
 }
 
 fn broadcast_stream(chunks: &[Bytes], stream_chunk_size: usize) -> BroadcastOutputStream {
     BroadcastOutputStream::from_stream(
         ChunkedReader::new(chunks),
         "bench",
-        FromStreamOptions {
-            chunk_size: stream_chunk_size.bytes(),
-            channel_capacity: CHANNEL_CAPACITY,
-        },
+        StreamConfig::builder()
+            .best_effort_delivery()
+            .no_replay()
+            .read_chunk_size(stream_chunk_size.bytes())
+            .max_buffered_chunks(CHANNEL_CAPACITY)
+            .build(),
     )
+}
+
+fn reliable_broadcast_stream(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+) -> BroadcastOutputStream<ReliableDelivery, NoReplay> {
+    BroadcastOutputStream::from_stream(
+        ChunkedReader::new(chunks),
+        "bench",
+        StreamConfig::builder()
+            .reliable_for_active_subscribers()
+            .no_replay()
+            .read_chunk_size(stream_chunk_size.bytes())
+            .max_buffered_chunks(CHANNEL_CAPACITY)
+            .build(),
+    )
+}
+
+fn best_effort_replay_mode(
+    stream_chunk_size: usize,
+    replay_retention: ReplayRetention,
+) -> StreamConfig<BestEffortDelivery, ReplayEnabled> {
+    let builder = StreamConfig::builder().best_effort_delivery();
+    match replay_retention {
+        ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
+        ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
+        ReplayRetention::All => builder.replay_all(),
+    }
+    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
+    .read_chunk_size(stream_chunk_size.bytes())
+    .max_buffered_chunks(CHANNEL_CAPACITY)
+    .build()
+}
+
+fn reliable_replay_mode(
+    stream_chunk_size: usize,
+    replay_retention: ReplayRetention,
+) -> StreamConfig<ReliableDelivery, ReplayEnabled> {
+    let builder = StreamConfig::builder().reliable_for_active_subscribers();
+    match replay_retention {
+        ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
+        ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
+        ReplayRetention::All => builder.replay_all(),
+    }
+    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
+    .read_chunk_size(stream_chunk_size.bytes())
+    .max_buffered_chunks(CHANNEL_CAPACITY)
+    .build()
+}
+
+fn best_effort_broadcast_mode_stream(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+    replay_retention: ReplayRetention,
+) -> BroadcastOutputStream<BestEffortDelivery, ReplayEnabled> {
+    BroadcastOutputStream::from_stream(
+        ChunkedReader::new(chunks),
+        "bench",
+        best_effort_replay_mode(stream_chunk_size, replay_retention),
+    )
+}
+
+fn reliable_broadcast_mode_stream(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+    replay_retention: ReplayRetention,
+) -> BroadcastOutputStream<ReliableDelivery, ReplayEnabled> {
+    BroadcastOutputStream::from_stream(
+        ChunkedReader::new(chunks),
+        "bench",
+        reliable_replay_mode(stream_chunk_size, replay_retention),
+    )
+}
+
+fn gated_broadcast_stream(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+) -> (BroadcastOutputStream, StartGate) {
+    let (reader, gate) = GatedChunkedReader::new(chunks);
+    let stream = BroadcastOutputStream::from_stream(
+        reader,
+        "bench",
+        StreamConfig::builder()
+            .best_effort_delivery()
+            .no_replay()
+            .read_chunk_size(stream_chunk_size.bytes())
+            .max_buffered_chunks(CHANNEL_CAPACITY)
+            .build(),
+    );
+    (stream, gate)
+}
+
+fn gated_reliable_broadcast_stream(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+) -> (BroadcastOutputStream<ReliableDelivery, NoReplay>, StartGate) {
+    let (reader, gate) = GatedChunkedReader::new(chunks);
+    let stream = BroadcastOutputStream::from_stream(
+        reader,
+        "bench",
+        StreamConfig::builder()
+            .reliable_for_active_subscribers()
+            .no_replay()
+            .read_chunk_size(stream_chunk_size.bytes())
+            .max_buffered_chunks(CHANNEL_CAPACITY)
+            .build(),
+    );
+    (stream, gate)
+}
+
+fn gated_best_effort_broadcast_mode_stream(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+    replay_retention: ReplayRetention,
+) -> (
+    BroadcastOutputStream<BestEffortDelivery, ReplayEnabled>,
+    StartGate,
+) {
+    let (reader, gate) = GatedChunkedReader::new(chunks);
+    let stream = BroadcastOutputStream::from_stream(
+        reader,
+        "bench",
+        best_effort_replay_mode(stream_chunk_size, replay_retention),
+    );
+    (stream, gate)
+}
+
+fn gated_reliable_broadcast_mode_stream(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+    replay_retention: ReplayRetention,
+) -> (
+    BroadcastOutputStream<ReliableDelivery, ReplayEnabled>,
+    StartGate,
+) {
+    let (reader, gate) = GatedChunkedReader::new(chunks);
+    let stream = BroadcastOutputStream::from_stream(
+        reader,
+        "bench",
+        reliable_replay_mode(stream_chunk_size, replay_retention),
+    );
+    (stream, gate)
 }
 
 async fn collect_single_chunks(
     chunks: &[Bytes],
     stream_chunk_size: usize,
-    backpressure: BackpressureControl,
+    delivery: DeliveryGuarantee,
 ) -> usize {
-    single_stream(chunks, stream_chunk_size, backpressure)
-        .collect_chunks_into_vec()
+    single_stream(chunks, stream_chunk_size, delivery)
+        .collect_all_chunks_into_vec_trusted()
         .wait()
         .await
         .unwrap()
@@ -205,21 +424,185 @@ async fn collect_single_chunks(
 
 async fn collect_broadcast_chunks(chunks: &[Bytes], stream_chunk_size: usize) -> usize {
     broadcast_stream(chunks, stream_chunk_size)
-        .collect_chunks_into_vec()
+        .collect_all_chunks_into_vec_trusted()
         .wait()
         .await
         .unwrap()
         .len()
 }
 
+async fn collect_broadcast_mode_chunks(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+    replay_retention: Option<ReplayRetention>,
+    delivery: DeliveryGuarantee,
+) -> usize {
+    match (delivery, replay_retention) {
+        (DeliveryGuarantee::BestEffort, Some(replay_retention)) => {
+            best_effort_broadcast_mode_stream(chunks, stream_chunk_size, replay_retention)
+                .collect_all_chunks_into_vec_trusted()
+                .wait()
+                .await
+                .unwrap()
+                .len()
+        }
+        (DeliveryGuarantee::BestEffort, None) => broadcast_stream(chunks, stream_chunk_size)
+            .collect_all_chunks_into_vec_trusted()
+            .wait()
+            .await
+            .unwrap()
+            .len(),
+        (DeliveryGuarantee::ReliableForActiveSubscribers, Some(replay_retention)) => {
+            reliable_broadcast_mode_stream(chunks, stream_chunk_size, replay_retention)
+                .collect_all_chunks_into_vec_trusted()
+                .wait()
+                .await
+                .unwrap()
+                .len()
+        }
+        (DeliveryGuarantee::ReliableForActiveSubscribers, None) => {
+            reliable_broadcast_stream(chunks, stream_chunk_size)
+                .collect_all_chunks_into_vec_trusted()
+                .wait()
+                .await
+                .unwrap()
+                .len()
+        }
+    }
+}
+
+async fn collect_broadcast_chunks_for_subscribers(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+    subscriber_count: usize,
+) -> usize {
+    let (stream, gate) = gated_broadcast_stream(chunks, stream_chunk_size);
+    let collectors = (0..subscriber_count)
+        .map(|_| {
+            stream.collect_chunks_into_write(
+                CountingWrite::default(),
+                WriteCollectionOptions::fail_fast(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    gate.open();
+
+    let mut bytes_written = 0;
+    for collector in collectors {
+        bytes_written += collector.wait().await.unwrap().bytes_written;
+    }
+
+    bytes_written
+}
+
+async fn collect_broadcast_mode_chunks_for_subscribers(
+    chunks: &[Bytes],
+    stream_chunk_size: usize,
+    subscriber_count: usize,
+    replay_retention: Option<ReplayRetention>,
+    delivery: DeliveryGuarantee,
+) -> usize {
+    let expected_bytes = chunks.iter().map(Bytes::len).sum::<usize>() * subscriber_count;
+    let bytes_written = match (delivery, replay_retention) {
+        (DeliveryGuarantee::BestEffort, Some(replay_retention)) => {
+            let (stream, gate) = gated_best_effort_broadcast_mode_stream(
+                chunks,
+                stream_chunk_size,
+                replay_retention,
+            );
+            let collectors = (0..subscriber_count)
+                .map(|_| {
+                    stream.collect_chunks_into_write(
+                        CountingWrite::default(),
+                        WriteCollectionOptions::fail_fast(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            gate.open();
+
+            let mut bytes_written = 0;
+            for collector in collectors {
+                bytes_written += collector.wait().await.unwrap().bytes_written;
+            }
+            bytes_written
+        }
+        (DeliveryGuarantee::BestEffort, None) => {
+            let (stream, gate) = gated_broadcast_stream(chunks, stream_chunk_size);
+            let collectors = (0..subscriber_count)
+                .map(|_| {
+                    stream.collect_chunks_into_write(
+                        CountingWrite::default(),
+                        WriteCollectionOptions::fail_fast(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            gate.open();
+
+            let mut bytes_written = 0;
+            for collector in collectors {
+                bytes_written += collector.wait().await.unwrap().bytes_written;
+            }
+            bytes_written
+        }
+        (DeliveryGuarantee::ReliableForActiveSubscribers, Some(replay_retention)) => {
+            let (stream, gate) =
+                gated_reliable_broadcast_mode_stream(chunks, stream_chunk_size, replay_retention);
+            let collectors = (0..subscriber_count)
+                .map(|_| {
+                    stream.collect_chunks_into_write(
+                        CountingWrite::default(),
+                        WriteCollectionOptions::fail_fast(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            gate.open();
+
+            let mut bytes_written = 0;
+            for collector in collectors {
+                bytes_written += collector.wait().await.unwrap().bytes_written;
+            }
+            bytes_written
+        }
+        (DeliveryGuarantee::ReliableForActiveSubscribers, None) => {
+            let (stream, gate) = gated_reliable_broadcast_stream(chunks, stream_chunk_size);
+            let collectors = (0..subscriber_count)
+                .map(|_| {
+                    stream.collect_chunks_into_write(
+                        CountingWrite::default(),
+                        WriteCollectionOptions::fail_fast(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            gate.open();
+
+            let mut bytes_written = 0;
+            for collector in collectors {
+                bytes_written += collector.wait().await.unwrap().bytes_written;
+            }
+            bytes_written
+        }
+    };
+
+    if matches!(delivery, DeliveryGuarantee::ReliableForActiveSubscribers) {
+        assert_eq!(bytes_written, expected_bytes);
+    }
+
+    bytes_written
+}
+
 async fn collect_single_lines(
     chunks: &[Bytes],
     stream_chunk_size: usize,
-    backpressure: BackpressureControl,
+    delivery: DeliveryGuarantee,
     options: LineParsingOptions,
 ) -> usize {
-    single_stream(chunks, stream_chunk_size, backpressure)
-        .collect_lines_into_vec(options)
+    single_stream(chunks, stream_chunk_size, delivery)
+        .collect_all_lines_into_vec_trusted(options)
         .wait()
         .await
         .unwrap()
@@ -232,7 +615,7 @@ async fn collect_broadcast_lines(
     options: LineParsingOptions,
 ) -> usize {
     broadcast_stream(chunks, stream_chunk_size)
-        .collect_lines_into_vec(options)
+        .collect_all_lines_into_vec_trusted(options)
         .wait()
         .await
         .unwrap()
@@ -242,10 +625,13 @@ async fn collect_broadcast_lines(
 async fn collect_single_chunks_into_write(
     chunks: &[Bytes],
     stream_chunk_size: usize,
-    backpressure: BackpressureControl,
+    delivery: DeliveryGuarantee,
 ) -> usize {
-    single_stream(chunks, stream_chunk_size, backpressure)
-        .collect_chunks_into_write(CountingWrite::default())
+    single_stream(chunks, stream_chunk_size, delivery)
+        .collect_chunks_into_write(
+            CountingWrite::default(),
+            WriteCollectionOptions::fail_fast(),
+        )
         .wait()
         .await
         .unwrap()
@@ -254,7 +640,10 @@ async fn collect_single_chunks_into_write(
 
 async fn collect_broadcast_chunks_into_write(chunks: &[Bytes], stream_chunk_size: usize) -> usize {
     broadcast_stream(chunks, stream_chunk_size)
-        .collect_chunks_into_write(CountingWrite::default())
+        .collect_chunks_into_write(
+            CountingWrite::default(),
+            WriteCollectionOptions::fail_fast(),
+        )
         .wait()
         .await
         .unwrap()
@@ -264,10 +653,14 @@ async fn collect_broadcast_chunks_into_write(chunks: &[Bytes], stream_chunk_size
 async fn collect_single_chunks_into_write_mapped(
     chunks: &[Bytes],
     stream_chunk_size: usize,
-    backpressure: BackpressureControl,
+    delivery: DeliveryGuarantee,
 ) -> usize {
-    single_stream(chunks, stream_chunk_size, backpressure)
-        .collect_chunks_into_write_mapped(CountingWrite::default(), |chunk| chunk)
+    single_stream(chunks, stream_chunk_size, delivery)
+        .collect_chunks_into_write_mapped(
+            CountingWrite::default(),
+            |chunk| chunk,
+            WriteCollectionOptions::fail_fast(),
+        )
         .wait()
         .await
         .unwrap()
@@ -279,7 +672,11 @@ async fn collect_broadcast_chunks_into_write_mapped(
     stream_chunk_size: usize,
 ) -> usize {
     broadcast_stream(chunks, stream_chunk_size)
-        .collect_chunks_into_write_mapped(CountingWrite::default(), |chunk| chunk)
+        .collect_chunks_into_write_mapped(
+            CountingWrite::default(),
+            |chunk| chunk,
+            WriteCollectionOptions::fail_fast(),
+        )
         .wait()
         .await
         .unwrap()
@@ -295,9 +692,14 @@ async fn collect_single_lines_into_write(
     single_stream(
         chunks,
         stream_chunk_size,
-        BackpressureControl::BlockUntilBufferHasSpace,
+        DeliveryGuarantee::ReliableForActiveSubscribers,
     )
-    .collect_lines_into_write(CountingWrite::default(), options, mode)
+    .collect_lines_into_write(
+        CountingWrite::default(),
+        options,
+        mode,
+        WriteCollectionOptions::fail_fast(),
+    )
     .wait()
     .await
     .unwrap()
@@ -311,7 +713,12 @@ async fn collect_broadcast_lines_into_write(
     mode: LineWriteMode,
 ) -> usize {
     broadcast_stream(chunks, stream_chunk_size)
-        .collect_lines_into_write(CountingWrite::default(), options, mode)
+        .collect_lines_into_write(
+            CountingWrite::default(),
+            options,
+            mode,
+            WriteCollectionOptions::fail_fast(),
+        )
         .wait()
         .await
         .unwrap()
@@ -327,13 +734,14 @@ async fn collect_single_lines_into_write_mapped(
     single_stream(
         chunks,
         stream_chunk_size,
-        BackpressureControl::BlockUntilBufferHasSpace,
+        DeliveryGuarantee::ReliableForActiveSubscribers,
     )
     .collect_lines_into_write_mapped(
         CountingWrite::default(),
         |line| line.into_owned().into_bytes(),
         options,
         mode,
+        WriteCollectionOptions::fail_fast(),
     )
     .wait()
     .await
@@ -353,6 +761,7 @@ async fn collect_broadcast_lines_into_write_mapped(
             |line| line.into_owned().into_bytes(),
             options,
             mode,
+            WriteCollectionOptions::fail_fast(),
         )
         .wait()
         .await
@@ -368,7 +777,7 @@ async fn collect_single_lines_async(
     single_stream(
         chunks,
         stream_chunk_size,
-        BackpressureControl::BlockUntilBufferHasSpace,
+        DeliveryGuarantee::ReliableForActiveSubscribers,
     )
     .collect_lines_async(0_usize, CountLineBytes, options)
     .wait()
@@ -396,7 +805,7 @@ async fn inspect_single_lines_async(
     let stream = single_stream(
         chunks,
         stream_chunk_size,
-        BackpressureControl::BlockUntilBufferHasSpace,
+        DeliveryGuarantee::ReliableForActiveSubscribers,
     );
     let byte_count = Arc::new(AtomicUsize::new(0));
     let byte_count_in_callback = Arc::clone(&byte_count);
@@ -451,12 +860,13 @@ async fn inspect_broadcast_lines_async(
 async fn wait_for_line_single(
     chunks: &[Bytes],
     stream_chunk_size: usize,
-    backpressure: BackpressureControl,
+    delivery: DeliveryGuarantee,
     options: LineParsingOptions,
 ) -> WaitForLineResult {
-    single_stream(chunks, stream_chunk_size, backpressure)
+    single_stream(chunks, stream_chunk_size, delivery)
         .wait_for_line(|line| line.starts_with(READY_PREFIX), options)
         .await
+        .expect("benchmark stream should not fail")
 }
 
 async fn wait_for_line_broadcast(
@@ -467,17 +877,19 @@ async fn wait_for_line_broadcast(
     broadcast_stream(chunks, stream_chunk_size)
         .wait_for_line(|line| line.starts_with(READY_PREFIX), options)
         .await
+        .expect("benchmark stream should not fail")
 }
 
 async fn wait_for_line_single_gap(chunks: &[Bytes], stream_chunk_size: usize) -> WaitForLineResult {
     let stream = SingleSubscriberOutputStream::from_stream(
         ChunkedReader::new(chunks),
         "bench",
-        BackpressureControl::DropLatestIncomingIfBufferFull,
-        FromStreamOptions {
-            chunk_size: stream_chunk_size.bytes(),
-            channel_capacity: 1,
-        },
+        StreamConfig::builder()
+            .best_effort_delivery()
+            .no_replay()
+            .read_chunk_size(stream_chunk_size.bytes())
+            .max_buffered_chunks(1)
+            .build(),
     );
 
     for _ in 0..4 {
@@ -490,6 +902,7 @@ async fn wait_for_line_single_gap(chunks: &[Bytes], stream_chunk_size: usize) ->
             LineParsingOptions::default(),
         )
         .await
+        .expect("benchmark stream should not fail")
 }
 
 fn bench_chunk_collection(c: &mut Criterion) {
@@ -512,7 +925,7 @@ fn bench_chunk_collection(c: &mut Criterion) {
                         collect_single_chunks(
                             chunks,
                             stream_chunk_size,
-                            BackpressureControl::DropLatestIncomingIfBufferFull,
+                            DeliveryGuarantee::BestEffort,
                         )
                         .await,
                     )
@@ -529,7 +942,7 @@ fn bench_chunk_collection(c: &mut Criterion) {
                         collect_single_chunks(
                             chunks,
                             stream_chunk_size,
-                            BackpressureControl::BlockUntilBufferHasSpace,
+                            DeliveryGuarantee::ReliableForActiveSubscribers,
                         )
                         .await,
                     )
@@ -546,6 +959,135 @@ fn bench_chunk_collection(c: &mut Criterion) {
                 });
             },
         );
+
+        group.bench_with_input(
+            BenchmarkId::new("broadcast_best_effort", stream_chunk_size),
+            &chunks,
+            |b, chunks| {
+                b.to_async(&rt).iter(|| async {
+                    black_box(
+                        collect_broadcast_mode_chunks(
+                            chunks,
+                            stream_chunk_size,
+                            None,
+                            DeliveryGuarantee::BestEffort,
+                        )
+                        .await,
+                    )
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("broadcast_reliable_active", stream_chunk_size),
+            &chunks,
+            |b, chunks| {
+                b.to_async(&rt).iter(|| async {
+                    black_box(
+                        collect_broadcast_mode_chunks(
+                            chunks,
+                            stream_chunk_size,
+                            None,
+                            DeliveryGuarantee::ReliableForActiveSubscribers,
+                        )
+                        .await,
+                    )
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_broadcast_mode_subscriber_throughput(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("broadcast_mode_subscriber_throughput");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    for stream_chunk_size in [16 * 1024, 64 * 1024] {
+        let total_bytes = 512 * 1024;
+        let chunks = build_chunk_payload(total_bytes, stream_chunk_size);
+
+        for subscriber_count in [1, 2, 4] {
+            group.throughput(Throughput::Bytes((total_bytes * subscriber_count) as u64));
+            let parameter = format!("{stream_chunk_size}_bytes/{subscriber_count}_subscribers");
+
+            group.bench_with_input(
+                BenchmarkId::new("broadcast_lossy", &parameter),
+                &chunks,
+                |b, chunks| {
+                    b.to_async(&rt).iter(|| async {
+                        black_box(
+                            collect_broadcast_chunks_for_subscribers(
+                                chunks,
+                                stream_chunk_size,
+                                subscriber_count,
+                            )
+                            .await,
+                        )
+                    });
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("broadcast_best_effort", &parameter),
+                &chunks,
+                |b, chunks| {
+                    b.to_async(&rt).iter(|| async {
+                        black_box(
+                            collect_broadcast_mode_chunks_for_subscribers(
+                                chunks,
+                                stream_chunk_size,
+                                subscriber_count,
+                                None,
+                                DeliveryGuarantee::BestEffort,
+                            )
+                            .await,
+                        )
+                    });
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("broadcast_reliable_active", &parameter),
+                &chunks,
+                |b, chunks| {
+                    b.to_async(&rt).iter(|| async {
+                        black_box(
+                            collect_broadcast_mode_chunks_for_subscribers(
+                                chunks,
+                                stream_chunk_size,
+                                subscriber_count,
+                                None,
+                                DeliveryGuarantee::ReliableForActiveSubscribers,
+                            )
+                            .await,
+                        )
+                    });
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("broadcast_reliable_replay_all", &parameter),
+                &chunks,
+                |b, chunks| {
+                    b.to_async(&rt).iter(|| async {
+                        black_box(
+                            collect_broadcast_mode_chunks_for_subscribers(
+                                chunks,
+                                stream_chunk_size,
+                                subscriber_count,
+                                Some(ReplayRetention::All),
+                                DeliveryGuarantee::ReliableForActiveSubscribers,
+                            )
+                            .await,
+                        )
+                    });
+                },
+            );
+        }
     }
 
     group.finish();
@@ -577,7 +1119,7 @@ fn bench_line_collection(c: &mut Criterion) {
                         collect_single_lines(
                             chunks,
                             stream_chunk_size,
-                            BackpressureControl::BlockUntilBufferHasSpace,
+                            DeliveryGuarantee::ReliableForActiveSubscribers,
                             options,
                         )
                         .await,
@@ -624,7 +1166,7 @@ fn bench_writer_helpers(c: &mut Criterion) {
                         collect_single_chunks_into_write(
                             chunks,
                             stream_chunk_size,
-                            BackpressureControl::BlockUntilBufferHasSpace,
+                            DeliveryGuarantee::ReliableForActiveSubscribers,
                         )
                         .await,
                     )
@@ -641,7 +1183,7 @@ fn bench_writer_helpers(c: &mut Criterion) {
                         collect_single_chunks_into_write_mapped(
                             chunks,
                             stream_chunk_size,
-                            BackpressureControl::BlockUntilBufferHasSpace,
+                            DeliveryGuarantee::ReliableForActiveSubscribers,
                         )
                         .await,
                     )
@@ -840,7 +1382,7 @@ fn bench_wait_for_line(c: &mut Criterion) {
                         wait_for_line_single(
                             chunks,
                             4 * 1024,
-                            BackpressureControl::BlockUntilBufferHasSpace,
+                            DeliveryGuarantee::ReliableForActiveSubscribers,
                             options,
                         )
                         .await,
@@ -876,6 +1418,6 @@ fn bench_wait_for_line(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config = Criterion::default().warm_up_time(Duration::from_secs(1));
-    targets = bench_chunk_collection, bench_line_collection, bench_writer_helpers, bench_async_line_processing, bench_wait_for_line
+    targets = bench_chunk_collection, bench_broadcast_mode_subscriber_throughput, bench_line_collection, bench_writer_helpers, bench_async_line_processing, bench_wait_for_line
 );
 criterion_main!(benches);

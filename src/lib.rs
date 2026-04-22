@@ -1,5 +1,3 @@
-#![warn(missing_docs)]
-
 //!
 #![doc = include_str!("../README.md")]
 //!
@@ -17,44 +15,133 @@ mod signal;
 mod terminate_on_drop;
 
 pub use collector::{AsyncChunkCollector, AsyncLineCollector, Collector, CollectorError, Sink};
-pub use error::{SpawnError, TerminationError, WaitError, WaitForLineResult};
-pub use inspector::{Inspector, InspectorError};
-pub use output::{Output, RawOutput};
-pub use output_stream::{
-    BackpressureControl, Chunk, DEFAULT_CHANNEL_CAPACITY, DEFAULT_CHUNK_SIZE, FromStreamOptions,
-    LineOverflowBehavior, LineParsingOptions, LineWriteMode, Next, NumBytes, NumBytesExt,
-    OutputStream, broadcast, single_subscriber,
+pub use error::{
+    SpawnError, StreamReadError, TerminationError, WaitError, WaitForCompletionWithOutputError,
+    WaitForCompletionWithOutputOrTerminateError, WaitForLineResult, WaitOrTerminateError,
 };
-pub use process::{AutoName, AutoNameSettings, Process, ProcessName};
-pub use process_handle::{ProcessHandle, RunningState, Stdin};
+pub use inspector::{Inspector, InspectorError};
+pub use output::ProcessOutput;
+pub use output_stream::backend::{broadcast, single_subscriber};
+pub use output_stream::collection::{
+    CollectedBytes, CollectedLines, CollectionOverflowBehavior, FailOnSinkWriteError,
+    LineCollectionOptions, LogAndContinueSinkWriteErrors, RawCollectionOptions, SinkWriteError,
+    SinkWriteErrorAction, SinkWriteErrorHandler, SinkWriteOperation, WriteCollectionOptions,
+};
+pub use output_stream::config::{
+    StreamConfig, StreamConfigBuilder, StreamConfigMaxBufferedChunksBuilder,
+    StreamConfigReadChunkSizeBuilder, StreamConfigReadyBuilder, StreamConfigReplayBuilder,
+    StreamConfigSealedReplayBehaviorBuilder,
+};
+pub use output_stream::line::{LineOverflowBehavior, LineParsingOptions, LineWriteMode};
+pub use output_stream::options::{
+    DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytes, NumBytesExt,
+};
+pub use output_stream::policy::{
+    BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, ReliableDelivery, Replay,
+    ReplayEnabled, ReplayRetention, ReplaySubscribeError, SealedReplayBehavior,
+};
+pub use output_stream::{Chunk, Next, OutputStream};
+pub use process::{
+    AutoName, AutoNameSettings, ConfiguredProcessBuilder, NamedProcess, Process,
+    ProcessBuilderWithStderr, ProcessBuilderWithStdout, ProcessName, ProcessStreamBuilder,
+    ProcessStreamConfig,
+};
+pub use process_handle::{
+    BroadcastProcessHandle, LineOutputOptions, ProcessHandle, RawOutputOptions, RunningState,
+    Stdin, WaitForCompletionOptions, WaitForCompletionOrTerminateOptions,
+    WaitForCompletionOrTerminateWithOutputOptions,
+    WaitForCompletionOrTerminateWithRawOutputOptions,
+    WaitForCompletionOrTerminateWithTrustedLineOutputOptions, WaitForCompletionWithOutputOptions,
+    WaitForCompletionWithRawOutputOptions, WaitForCompletionWithTrustedLineOutputOptions,
+};
 pub use terminate_on_drop::TerminateOnDrop;
 
 #[allow(dead_code)]
 trait SendSync: Send + Sync {}
-impl SendSync for broadcast::BroadcastOutputStream {}
+impl<D, R> SendSync for broadcast::BroadcastOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
+}
 impl SendSync for single_subscriber::SingleSubscriberOutputStream {}
-impl<O: OutputStream + SendSync> SendSync for ProcessHandle<O> {}
+impl<Stdout, Stderr> SendSync for ProcessHandle<Stdout, Stderr>
+where
+    Stdout: OutputStream + SendSync,
+    Stderr: OutputStream + SendSync,
+{
+}
 
 #[cfg(test)]
 mod test {
-    use crate::output::Output;
-    use crate::{LineParsingOptions, Next, Process, RunningState};
+    use crate::output::ProcessOutput;
+    use crate::{
+        AutoName, AutoNameSettings, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS,
+        DEFAULT_READ_CHUNK_SIZE, LineCollectionOptions, LineOutputOptions, LineOverflowBehavior,
+        LineParsingOptions, Next, NumBytesExt, Process, RunningState, WaitForCompletionOptions,
+        WaitForCompletionWithOutputOptions,
+    };
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::process::Command;
 
+    fn wait_options(timeout: Option<Duration>) -> WaitForCompletionOptions {
+        WaitForCompletionOptions::builder().timeout(timeout).build()
+    }
+
+    fn line_parsing_options() -> LineParsingOptions {
+        LineParsingOptions::builder()
+            .max_line_length(16.kilobytes())
+            .overflow_behavior(LineOverflowBehavior::default())
+            .build()
+    }
+
+    fn line_collection_options() -> LineCollectionOptions {
+        LineCollectionOptions::builder()
+            .max_bytes(1.megabytes())
+            .max_lines(1024)
+            .overflow_behavior(CollectionOverflowBehavior::default())
+            .build()
+    }
+
+    fn line_output_options() -> LineOutputOptions {
+        let line_collection_options = line_collection_options();
+        LineOutputOptions::builder()
+            .line_parsing_options(line_parsing_options())
+            .stdout_collection_options(line_collection_options)
+            .stderr_collection_options(line_collection_options)
+            .build()
+    }
+
+    fn wait_with_line_output_options(
+        timeout: Option<Duration>,
+    ) -> WaitForCompletionWithOutputOptions {
+        WaitForCompletionWithOutputOptions::builder()
+            .timeout(timeout)
+            .line_output_options(line_output_options())
+            .build()
+    }
+
     #[tokio::test]
     async fn wait_with_output() {
         let mut process = Process::new(Command::new("ls"))
-            .name("ls")
-            .spawn_broadcast()
+            .with_auto_name(AutoName::Using(AutoNameSettings::program_only()))
+            .stdout_and_stderr(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .no_replay()
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
             .expect("Failed to spawn `ls` command");
-        let Output {
+        let ProcessOutput {
             status,
             stdout,
             stderr,
         } = process
-            .wait_for_completion_with_output(None, LineParsingOptions::default())
+            .wait_for_completion_with_output(wait_with_line_output_options(None))
             .await
             .unwrap();
         assert_that!(status.success()).is_true();
@@ -67,19 +154,28 @@ mod test {
             "src",
             "target",
         ] {
-            assert!(
-                stdout.iter().any(|entry| entry == expected),
-                "expected ls output to contain {expected:?}, got {stdout:?}"
-            );
+            assert_that!(stdout.lines().iter().any(|entry| entry == expected))
+                .with_detail_message(format!(
+                    "expected ls output to contain {expected:?}, got {stdout:?}"
+                ))
+                .is_true();
         }
-        assert_that!(stderr).is_empty();
+        assert_that!(stderr.lines().is_empty()).is_true();
     }
 
     #[tokio::test]
     async fn single_subscriber_panics_on_multiple_consumers() {
         let mut process = Process::new(Command::new("ls"))
-            .name("ls")
-            .spawn_single_subscriber()
+            .with_auto_name(AutoName::Using(AutoNameSettings::program_only()))
+            .stdout_and_stderr(|stream| {
+                stream
+                    .single_subscriber()
+                    .best_effort_delivery()
+                    .no_replay()
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
             .expect("Failed to spawn `ls` command");
 
         let _inspector = process
@@ -92,9 +188,12 @@ mod test {
                 .inspect_lines(|_line| Next::Continue, LineParsingOptions::default());
         })
         .has_type::<String>()
-        .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'stdout'). Only one inspector or collector can be active at a time. Use .spawn_broadcast() instead of .spawn_single_subscriber() to support multiple consumers.");
+        .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'stdout'). Only one inspector or collector can be active at a time. Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.");
 
-        process.wait_for_completion(None).await.unwrap();
+        process
+            .wait_for_completion(wait_options(None))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -102,8 +201,16 @@ mod test {
         let mut cmd = Command::new("sleep");
         cmd.arg("1");
         let mut process = Process::new(cmd)
-            .name("sleep")
-            .spawn_broadcast()
+            .with_auto_name(AutoName::Using(AutoNameSettings::program_only()))
+            .stdout_and_stderr(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .no_replay()
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
             .expect("Failed to spawn `sleep` command");
 
         match process.is_running() {
@@ -116,7 +223,10 @@ mod test {
             }
         }
 
-        let _exit_status = process.wait_for_completion(None).await.unwrap();
+        let _exit_status = process
+            .wait_for_completion(wait_options(None))
+            .await
+            .unwrap();
 
         match process.is_running() {
             RunningState::Running => {
@@ -137,8 +247,16 @@ mod test {
         let mut cmd = Command::new("sleep");
         cmd.arg("1000");
         let mut process = Process::new(cmd)
-            .name("sleep")
-            .spawn_broadcast()
+            .with_auto_name(AutoName::Using(AutoNameSettings::program_only()))
+            .stdout_and_stderr(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .no_replay()
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
             .expect("Failed to spawn `sleep` command");
         process
             .terminate(Duration::from_secs(1), Duration::from_secs(1))

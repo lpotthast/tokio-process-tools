@@ -1,0 +1,283 @@
+use super::ProcessHandle;
+use crate::output_stream::OutputStream;
+use crate::panic_on_drop::PanicOnDrop;
+use crate::terminate_on_drop::TerminateOnDrop;
+use std::time::Duration;
+
+impl<Stdout, Stderr> Drop for ProcessHandle<Stdout, Stderr>
+where
+    Stdout: OutputStream,
+    Stderr: OutputStream,
+{
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            // We want users to explicitly await or terminate spawned processes.
+            // If not done so, kill the process now to have some sort of last-resort cleanup.
+            // A separate panic-on-drop guard may additionally raise a panic to signal the misuse.
+            if let Err(err) = self.child.start_kill() {
+                tracing::warn!(
+                    process = %self.name,
+                    error = %err,
+                    "Failed to kill process while dropping an armed ProcessHandle"
+                );
+            }
+        }
+    }
+}
+
+impl<Stdout, Stderr> ProcessHandle<Stdout, Stderr>
+where
+    Stdout: OutputStream,
+    Stderr: OutputStream,
+{
+    /// Sets a panic-on-drop mechanism for this `ProcessHandle`.
+    ///
+    /// This method enables a safeguard that ensures that the process represented by this
+    /// `ProcessHandle` is properly terminated or awaited before being dropped.
+    /// If `must_be_terminated` is set and the `ProcessHandle` is
+    /// dropped without invoking `terminate()` or `wait()`, an intentional panic will occur to
+    /// prevent silent failure-states, ensuring that system resources are handled correctly.
+    ///
+    /// You typically do not need to call this, as every `ProcessHandle` is marked by default.
+    /// Call `must_not_be_terminated` to clear this safeguard to explicitly allow dropping the
+    /// process without terminating it.
+    ///
+    /// # Panic
+    ///
+    /// If the `ProcessHandle` is dropped without being awaited or terminated
+    /// after calling this method, a panic will occur with a descriptive message
+    /// to inform about the incorrect usage.
+    pub fn must_be_terminated(&mut self) {
+        self.cleanup_on_drop = true;
+        self.panic_on_drop = Some(PanicOnDrop::new(
+            "tokio_process_tools::ProcessHandle",
+            "The process was not terminated.",
+            "Call `wait_for_completion` or `terminate` before the type is dropped!",
+        ));
+    }
+
+    /// Disables the kill/panic-on-drop safeguards for this handle.
+    ///
+    /// Dropping the handle after calling this method will no longer signal, kill, or panic.
+    /// However, this does **not** keep the library-owned stdio pipes alive. If the child still
+    /// depends on stdin, stdout, or stderr being open, dropping the handle may still affect it.
+    ///
+    /// Use plain [`tokio::process::Command`] directly when you need a child process that can
+    /// outlive the original handle without depending on captured stdio pipes.
+    pub fn must_not_be_terminated(&mut self) {
+        self.cleanup_on_drop = false;
+        self.defuse_drop_panic();
+    }
+
+    pub(super) fn defuse_drop_panic(&mut self) {
+        if let Some(mut it) = self.panic_on_drop.take() {
+            it.defuse();
+        }
+    }
+
+    /// Wrap this process handle in a `TerminateOnDrop` instance, terminating the controlled process
+    /// automatically when this handle is dropped.
+    ///
+    /// **SAFETY: This only works when your code is running in a multithreaded tokio runtime!**
+    ///
+    /// Prefer manual termination of the process or awaiting it and relying on the (automatically
+    /// configured) `must_be_terminated` logic, raising a panic when a process was neither awaited
+    /// nor terminated before being dropped.
+    pub fn terminate_on_drop(
+        self,
+        graceful_termination_timeout: Duration,
+        forceful_termination_timeout: Duration,
+    ) -> TerminateOnDrop<Stdout, Stderr> {
+        TerminateOnDrop {
+            process_handle: self,
+            interrupt_timeout: graceful_termination_timeout,
+            terminate_timeout: forceful_termination_timeout,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, WaitForCompletionOptions};
+    use assertr::prelude::*;
+
+    fn wait_options(timeout: Option<Duration>) -> WaitForCompletionOptions {
+        WaitForCompletionOptions::builder().timeout(timeout).build()
+    }
+
+    #[tokio::test]
+    async fn test_defusing_drop_panic_keeps_cleanup_guard_armed() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("5");
+
+        let mut process = crate::Process::new(cmd)
+            .name("sleep")
+            .stdout_and_stderr(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .no_replay()
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .unwrap();
+
+        assert_that!(process.cleanup_on_drop).is_true();
+        assert_that!(
+            process
+                .panic_on_drop
+                .as_ref()
+                .is_some_and(PanicOnDrop::is_armed)
+        )
+        .is_true();
+
+        process.defuse_drop_panic();
+
+        assert_that!(process.cleanup_on_drop).is_true();
+        assert_that!(&process.panic_on_drop).is_none();
+
+        process.kill().await.unwrap();
+        process
+            .wait_for_completion(wait_options(None))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_must_not_be_terminated_allows_process_to_survive_handle_drop() {
+        use nix::errno::Errno;
+        use nix::sys::signal::{self, Signal};
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("5");
+
+        let mut process = crate::Process::new(cmd)
+            .name("sleep")
+            .stdout_and_stderr(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .no_replay()
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .unwrap();
+        let pid = process.id().unwrap();
+
+        process.must_not_be_terminated();
+        assert_that!(process.cleanup_on_drop).is_false();
+        assert_that!(&process.panic_on_drop).is_none();
+        drop(process);
+
+        let pid = Pid::from_raw(pid.cast_signed());
+        assert_that!(signal::kill(pid, None).is_ok()).is_true();
+
+        signal::kill(pid, Signal::SIGKILL).unwrap();
+        match waitpid(pid, None) {
+            Ok(_) | Err(Errno::ECHILD) => {}
+            Err(err) => {
+                assert_that!(err).fail(format_args!("waitpid failed: {err}"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_must_not_be_terminated_still_closes_stdin_on_drop() {
+        use nix::errno::Errno;
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let output_file = temp_dir.path().join("stdin-result.txt");
+        let output_file = output_file.to_str().unwrap().replace('\'', "'\"'\"'");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("cat >/dev/null; printf eof > '{output_file}'"));
+
+        let mut process = crate::Process::new(cmd)
+            .name("sh")
+            .stdout_and_stderr(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .no_replay()
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(process.id().unwrap().cast_signed());
+
+        process.must_not_be_terminated();
+        drop(process);
+
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || waitpid(pid, None)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        {
+            Ok(_) | Err(Errno::ECHILD) => {}
+            Err(err) => {
+                assert_that!(err).fail(format_args!("waitpid failed: {err}"));
+            }
+        }
+
+        assert_that!(fs::read_to_string(temp_dir.path().join("stdin-result.txt")).unwrap())
+            .is_equal_to("eof");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_must_not_be_terminated_does_not_keep_stdout_pipe_alive() {
+        use nix::errno::Errno;
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+
+        let mut cmd = tokio::process::Command::new("yes");
+        cmd.arg("tick");
+
+        let mut process = crate::Process::new(cmd)
+            .name("yes")
+            .stdout_and_stderr(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .no_replay()
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(process.id().unwrap().cast_signed());
+
+        process.must_not_be_terminated();
+        drop(process);
+
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || waitpid(pid, None)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        {
+            Ok(_) | Err(Errno::ECHILD) => {}
+            Err(err) => {
+                assert_that!(err).fail(format_args!("waitpid failed: {err}"));
+            }
+        }
+    }
+}

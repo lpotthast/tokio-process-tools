@@ -29,27 +29,39 @@ use std::time::Duration;
 /// terminated before being dropped. If checking the current process state fails, it still attempts
 /// best-effort termination. If termination fails, a panic is raised.
 #[derive(Debug)]
-pub struct TerminateOnDrop<O: OutputStream> {
-    pub(crate) process_handle: ProcessHandle<O>,
+pub struct TerminateOnDrop<Stdout: OutputStream, Stderr: OutputStream = Stdout> {
+    pub(crate) process_handle: ProcessHandle<Stdout, Stderr>,
     pub(crate) interrupt_timeout: Duration,
     pub(crate) terminate_timeout: Duration,
 }
 
-impl<O: OutputStream> Deref for TerminateOnDrop<O> {
-    type Target = ProcessHandle<O>;
+impl<Stdout, Stderr> Deref for TerminateOnDrop<Stdout, Stderr>
+where
+    Stdout: OutputStream,
+    Stderr: OutputStream,
+{
+    type Target = ProcessHandle<Stdout, Stderr>;
 
     fn deref(&self) -> &Self::Target {
         &self.process_handle
     }
 }
 
-impl<O: OutputStream> DerefMut for TerminateOnDrop<O> {
+impl<Stdout, Stderr> DerefMut for TerminateOnDrop<Stdout, Stderr>
+where
+    Stdout: OutputStream,
+    Stderr: OutputStream,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.process_handle
     }
 }
 
-impl<O: OutputStream> Drop for TerminateOnDrop<O> {
+impl<Stdout, Stderr> Drop for TerminateOnDrop<Stdout, Stderr>
+where
+    Stdout: OutputStream,
+    Stderr: OutputStream,
+{
     fn drop(&mut self) {
         async_drop::run_future(async {
             match self.process_handle.is_running() {

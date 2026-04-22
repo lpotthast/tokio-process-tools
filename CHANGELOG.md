@@ -5,6 +5,118 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## 0.9.0
+
+### Added
+
+- Added `StreamConfig` and a required type-state `StreamConfig::builder()` API for direct stream
+  construction and process stream configuration. The builder requires selecting delivery, replay,
+  sealed-replay behavior for replay-enabled modes, read chunk size, and maximum buffered chunks.
+- Added sealed typed delivery and replay policy markers: `BestEffortDelivery`, `ReliableDelivery`,
+  `NoReplay`, `ReplayEnabled`, `Delivery`, `Replay`, `DeliveryGuarantee`, `ReplayRetention`,
+  `SealedReplayBehavior`, and `ReplaySubscribeError`.
+- Added typed broadcast spawning via `.broadcast()` builder stages, with explicit per-stream
+  delivery guarantees, replay retention, sealed-replay behavior, and stream read sizing.
+- Added single-subscriber delivery and replay spawning via `.single_subscriber()` builder stages
+  while keeping `tokio::sync::mpsc` as the live delivery primitive.
+- Added explicit replay selection. Use `.no_replay()` for streams without replay APIs, or choose
+  `replay_last_chunks(...)`, `replay_last_bytes(...)`, or `replay_all()` for replay-enabled
+  streams. Replay-retention metadata uses `Option<ReplayRetention>` to represent disabled replay.
+- Added replay-enabled stream APIs for retained output and replay-from-start line waits, plus
+  handle-level replay sealing helpers. Broadcast handles expose `seal_stdout_replay` and
+  `seal_stderr_replay` only when the relevant typed stream has replay enabled, and
+  `seal_output_replay` only when both broadcast streams have replay enabled. Single-subscriber
+  handles expose matching helpers for the single-subscriber backend.
+- Added `BroadcastProcessHandle` as a readable alias for broadcast process handles with typed
+  stdout and stderr streams.
+- Added bounded in-memory output collection options and truncation metadata for process output
+  convenience helpers.
+- Added `WriteCollectionOptions` and public sink write error handler types for configuring whether
+  writer collectors stop or continue after individual sink write failures. The options type remains
+  generic so custom handlers are statically dispatched and allocation-free.
+- Added `StreamReadError` so stream read failures can be surfaced by line waiters, collectors, and
+  inspectors.
+- Added broadcast mode benchmarks that compare default best-effort throughput with reliable
+  active-subscriber and replay-all configurations.
+
+### Changed
+
+- **Breaking:** Changed `Process` into a staged builder: name the process, configure stdout and
+  stderr with `.broadcast()` or `.single_subscriber()` stream builders, then call `.spawn()`.
+- **Breaking:** Replaced the backend-specific `BroadcastStreamConfig*` and
+  `SingleSubscriberStreamConfig*` builder families with the shared `StreamConfig*` type-state
+  builder. Process spawning still chooses the backend explicitly with `.broadcast()` or
+  `.single_subscriber()`.
+- **Breaking:** Changed direct `BroadcastOutputStream::from_stream` and
+  `SingleSubscriberOutputStream::from_stream` construction to accept `StreamConfig<D, R>`.
+- **Breaking:** Changed `ProcessHandle<O>` to `ProcessHandle<Stdout, Stderr = Stdout>`, with
+  `stdout()` and `stderr()` returning their independently typed streams.
+- **Breaking:** Changed `TerminateOnDrop<O>` to mirror the
+  `ProcessHandle<Stdout, Stderr = Stdout>` generic shape.
+- **Breaking:** Renamed stream sizing from chunk size/channel capacity to read chunk size/maximum
+  buffered chunks, including `OutputStream::read_chunk_size()`,
+  `OutputStream::max_buffered_chunks()`, `DEFAULT_READ_CHUNK_SIZE`, and
+  `DEFAULT_MAX_BUFFERED_CHUNKS`.
+- **Breaking:** Replaced `Output` and `RawOutput` with
+  `ProcessOutput<Stdout, Stderr = Stdout>`. Existing helpers now return
+  `ProcessOutput<CollectedLines>`, `ProcessOutput<CollectedBytes>`,
+  `ProcessOutput<Vec<String>>`, or `ProcessOutput<Vec<u8>>`.
+- **Breaking:** Replaced positional `wait_for_completion*` timeout and output arguments with
+  required-field `TypedBuilder` option structs, including concrete line, raw, and trusted-line
+  output wait options.
+- **Breaking:** Changed `wait_for_line` and `wait_for_line_with_timeout` to return a `LineWaiter`
+  future whose output is `Result<WaitForLineResult, StreamReadError>`. The stream subscription is
+  created before the future is first polled.
+- **Breaking:** Changed `wait_for_completion_or_terminate` to return the dedicated
+  `WaitOrTerminateError` type, and changed output-collecting wait helpers to return dedicated
+  compound error types instead of overloading `WaitError`.
+- **Breaking:** Changed `collect_chunks_into_vec`, `collect_lines_into_vec`,
+  `wait_for_completion_with_output`, and `wait_for_completion_with_raw_output` to require explicit
+  collection limits. Trusted-output-only variants preserve the previous unbounded behavior under
+  explicit `*_trusted` method names.
+- **Breaking:** Changed `ProcessHandle::into_inner()` to return `(Child, Stdin, Stdout, Stderr)` so
+  callers retain control of piped stdin instead of implicitly closing it and sending EOF.
+- **Breaking:** Changed `collect_chunks_into_write`, `collect_chunks_into_write_mapped`,
+  `collect_lines_into_write`, and `collect_lines_into_write_mapped` to require
+  `WriteCollectionOptions`; `WriteCollectionOptions::fail_fast()` stops on the first sink write
+  failure.
+- **Breaking:** Made `LineCollectionOptions::builder()` require `overflow_behavior(...)` and added
+  a required-field builder for `LineParsingOptions`.
+- Changed single-subscriber process spawning so delivery and replay must be selected explicitly;
+  `.no_replay()` starts the sole consumer at live output.
+- Changed default automatic process names to include only the program name, avoiding accidental
+  logging of command arguments that may contain secrets.
+
+### Fixed
+
+- Fixed `ProcessHandle::kill()` so a successful kill-and-wait disarms the drop cleanup and panic
+  guards, allowing the handle to be dropped safely afterward.
+- Rejected zero broadcast and single-subscriber maximum buffered chunk counts before spawning a
+  child process, avoiding Tokio channel-construction panics after process creation.
+- Preserved non-timeout wait errors from `wait_for_completion_or_terminate` while still attempting
+  cleanup termination after every wait failure.
+- Fixed writer collectors so sink write errors are no longer silently suppressed unless explicitly
+  accepted by the configured write error handler.
+- Relaxed single-subscriber inspect and collect callback bounds to accept stateful `FnMut`
+  closures, matching the broadcast backend.
+- Prepared Windows children as separate process groups so console control events target the spawned
+  child instead of the current process group.
+
+### Removed
+
+- **Breaking:** Removed `Process::spawn_broadcast()` and `Process::spawn_single_subscriber()` in
+  favor of the staged `.broadcast()`/`.single_subscriber()` stream builders.
+- **Breaking:** Removed the old `Process` stream-sizing and single-subscriber backpressure setter
+  methods. Read chunk size, maximum buffered chunks, delivery, and replay are now configured on the
+  per-stream builder.
+- **Breaking:** Removed `FromStreamOptions`, `DEFAULT_CHUNK_SIZE`, and `DEFAULT_CHANNEL_CAPACITY`;
+  direct stream construction now uses `StreamConfig`.
+- **Breaking:** Removed `BackpressureControl` and
+  `SingleSubscriberOutputStream::backpressure_control()`. Single-subscriber buffering behavior is
+  now represented directly by `DeliveryGuarantee`.
+
 ## [0.8.1] - 2026-04-11
 
 ### Changed
@@ -28,10 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `RawOutput` plus `wait_for_completion_with_raw_output` and
   `wait_for_completion_with_raw_output_or_terminate` on both process handle backends for collecting
   stdout and stderr as raw bytes.
-- Made `BroadcastOutputStream::from_stream` public and re-exported `FromStreamOptions` for custom
-  stream construction.
-- Re-exported `BackpressureControl`, `Chunk`, `FromStreamOptions`, `LineWriteMode`, and
-  `RawOutput` from the crate root.
+- Made `BroadcastOutputStream::from_stream` public for custom stream construction.
+- Re-exported `BackpressureControl`, `Chunk`, `LineWriteMode`, and `RawOutput` from the crate root.
 - Added this `CHANGELOG.md` in Keep a Changelog format.
 
 ### Changed
@@ -102,11 +212,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added the `Process` builder with explicit `.spawn_broadcast()` and
+- Added the `Process` builder with explicit `.spawn_broadcast(StreamConfig::best_effort())` and
   `.spawn_single_subscriber()` entry points.
 - Added process naming configuration via `ProcessName`, `AutoName`, and `AutoNameSettings`.
 - Added centralized error types via `SpawnError` and `OutputError`.
-- Exported `DEFAULT_CHUNK_SIZE` and `DEFAULT_CHANNEL_CAPACITY`.
+- Exported `DEFAULT_READ_CHUNK_SIZE` and `DEFAULT_MAX_BUFFERED_CHUNKS`.
 
 ### Changed
 

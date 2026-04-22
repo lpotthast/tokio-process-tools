@@ -1,3 +1,4 @@
+use crate::StreamReadError;
 use thiserror::Error;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
@@ -15,6 +16,17 @@ pub enum InspectorError {
         #[source]
         source: tokio::task::JoinError,
     },
+
+    /// The underlying stream failed while being read.
+    #[error("Failed to read from stream '{stream_name}': {source}")]
+    StreamRead {
+        /// The name of the stream this inspector operates on.
+        stream_name: &'static str,
+
+        /// The source error.
+        #[source]
+        source: StreamReadError,
+    },
 }
 
 /// An inspector for stream data, inspecting it chunk by chunk.
@@ -31,7 +43,7 @@ pub struct Inspector {
     /// The name of the stream this inspector operates on.
     pub(crate) stream_name: &'static str,
 
-    pub(crate) task: Option<JoinHandle<()>>,
+    pub(crate) task: Option<JoinHandle<Result<(), StreamReadError>>>,
     pub(crate) task_termination_sender: Option<Sender<()>>,
 }
 
@@ -56,7 +68,8 @@ impl Inspector {
     ///
     /// # Errors
     ///
-    /// Returns [`InspectorError::TaskJoin`] if the inspector task cannot be joined.
+    /// Returns [`InspectorError::TaskJoin`] if the inspector task cannot be joined, or
+    /// [`InspectorError::StreamRead`] if the underlying stream fails while being read.
     ///
     /// # Panics
     ///
@@ -75,6 +88,10 @@ impl Inspector {
             .map_err(|err| InspectorError::TaskJoin {
                 stream_name: self.stream_name,
                 source: err,
+            })?
+            .map_err(|err| InspectorError::StreamRead {
+                stream_name: self.stream_name,
+                source: err,
             });
 
         // Drop the termination sender, we don't need it. Task is now terminated.
@@ -87,7 +104,9 @@ impl Inspector {
     ///
     /// # Errors
     ///
-    /// Returns [`InspectorError::TaskJoin`] if the inspector task cannot be joined.
+    /// Returns [`InspectorError::TaskJoin`] if the inspector task cannot be joined, or
+    /// [`InspectorError::StreamRead`] if the underlying stream fails while being read before the
+    /// cancellation is observed.
     ///
     /// # Panics
     ///

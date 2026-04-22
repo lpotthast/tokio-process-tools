@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "tokio-process-tools"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "assertr",
  "atomic-take",
@@ -1090,6 +1090,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "tracing-test",
+ "typed-builder",
  "windows-sys",
 ]
 
@@ -1181,6 +1182,26 @@ version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad06847b7afb65c7866a36664b75c40b895e318cea4f71299f013fb22965329d"
 dependencies = [
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "typed-builder"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31aa81521b70f94402501d848ccc0ecaa8f93c8eb6999eb9747e72287757ffda"
+dependencies = [
+ "typed-builder-macro",
+]
+
+[[package]]
+name = "typed-builder-macro"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "076a02dc54dd46795c2e9c8282ed40bcfb1e22747e955de9389a1de28190fb26"
+dependencies = [
+ "proc-macro2",
  "quote",
  "syn",
 ]

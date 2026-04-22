@@ -1,7 +1,9 @@
+use crate::StreamReadError;
 use crate::output_stream::{Chunk, Next};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::future::Future;
+use std::io;
 use thiserror::Error;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
@@ -19,6 +21,40 @@ pub enum CollectorError {
         #[source]
         source: tokio::task::JoinError,
     },
+
+    /// The underlying stream failed while being read.
+    #[error("Failed to read from stream '{stream_name}': {source}")]
+    StreamRead {
+        /// The name of the stream this collector operates on.
+        stream_name: &'static str,
+
+        /// The source error.
+        #[source]
+        source: StreamReadError,
+    },
+
+    /// The sink rejected output written by a writer-backed collector.
+    #[error("Failed to write collected output from stream '{stream_name}' to sink: {source}")]
+    SinkWrite {
+        /// The name of the stream this collector operates on.
+        stream_name: &'static str,
+
+        /// The source error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum CollectorTaskError {
+    StreamRead(StreamReadError),
+    SinkWrite(io::Error),
+}
+
+impl From<StreamReadError> for CollectorTaskError {
+    fn from(source: StreamReadError) -> Self {
+        Self::StreamRead(source)
+    }
 }
 
 /// A trait for types that can act as sinks for collected stream data.
@@ -81,7 +117,7 @@ pub struct Collector<S: Sink> {
     /// The name of the stream this collector operates on.
     pub(crate) stream_name: &'static str,
 
-    pub(crate) task: Option<JoinHandle<S>>,
+    pub(crate) task: Option<JoinHandle<Result<S, CollectorTaskError>>>,
     pub(crate) task_termination_sender: Option<Sender<()>>,
 }
 
@@ -91,7 +127,7 @@ impl<S: Sink> Collector<S> {
     pub fn is_finished(&self) -> bool {
         self.task
             .as_ref()
-            .is_none_or(tokio::task::JoinHandle::is_finished)
+            .is_none_or(JoinHandle::is_finished)
     }
 
     /// Wait for the collector to terminate naturally.
@@ -110,11 +146,32 @@ impl<S: Sink> Collector<S> {
     /// ```rust, no_run
     /// # async fn test() {
     /// # use std::time::Duration;
-    /// # use tokio_process_tools::{LineParsingOptions, Process};
+    /// # use tokio_process_tools::{
+    /// #     CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
+    /// #     LineCollectionOptions, LineParsingOptions, NumBytesExt, Process,
+    /// # };
     ///
     /// # let cmd = tokio::process::Command::new("ls");
-    /// let mut process = Process::new(cmd).spawn_broadcast().unwrap();
-    /// let collector = process.stdout().collect_lines_into_vec(LineParsingOptions::default());
+    /// let mut process = Process::new(cmd)
+    ///     .auto_name()
+    ///     .stdout_and_stderr(|stream| {
+    ///         stream
+    ///             .broadcast()
+    ///             .best_effort_delivery()
+    ///             .no_replay()
+    ///             .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+    ///             .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+    ///     })
+    ///     .spawn()
+    ///     .unwrap();
+    /// let collector = process.stdout().collect_lines_into_vec(
+    ///     LineParsingOptions::default(),
+    ///     LineCollectionOptions::builder()
+    ///         .max_bytes(1.megabytes())
+    ///         .max_lines(1024)
+    ///         .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
+    ///         .build(),
+    /// );
     /// process.terminate(Duration::from_secs(1), Duration::from_secs(1)).await.unwrap();
     /// let collected = collector.wait().await.unwrap(); // This will return immediately.
     /// # }
@@ -122,7 +179,10 @@ impl<S: Sink> Collector<S> {
     ///
     /// # Errors
     ///
-    /// Returns [`CollectorError::TaskJoin`] if the collector task cannot be joined.
+    /// Returns [`CollectorError::TaskJoin`] if the collector task cannot be joined,
+    /// [`CollectorError::StreamRead`] if the underlying stream fails while being read, or
+    /// [`CollectorError::SinkWrite`] if a writer-backed collector stops after a sink write
+    /// failure.
     ///
     /// # Panics
     ///
@@ -141,6 +201,16 @@ impl<S: Sink> Collector<S> {
             .map_err(|err| CollectorError::TaskJoin {
                 stream_name: self.stream_name,
                 source: err,
+            })?
+            .map_err(|err| match err {
+                CollectorTaskError::StreamRead(source) => CollectorError::StreamRead {
+                    stream_name: self.stream_name,
+                    source,
+                },
+                CollectorTaskError::SinkWrite(source) => CollectorError::SinkWrite {
+                    stream_name: self.stream_name,
+                    source,
+                },
             });
 
         // Drop the termination sender, we don't need it. Task is now terminated.
@@ -153,7 +223,10 @@ impl<S: Sink> Collector<S> {
     ///
     /// # Errors
     ///
-    /// Returns [`CollectorError::TaskJoin`] if the collector task cannot be joined.
+    /// Returns [`CollectorError::TaskJoin`] if the collector task cannot be joined,
+    /// [`CollectorError::StreamRead`] if the underlying stream fails while being read before the
+    /// cancellation is observed, or [`CollectorError::SinkWrite`] if a writer-backed collector
+    /// stops after a sink write failure before cancellation is observed.
     ///
     /// # Panics
     ///

@@ -1,10 +1,53 @@
+/// Prepare a command so platform-specific signal delivery targets the spawned child safely.
+///
+/// On Windows, targetable console control events are sent to process groups. Creating a new
+/// process group for the child avoids accidentally targeting the current process group.
+pub(crate) fn prepare_command_for_signalling(
+    command: &mut tokio::process::Command,
+) -> &mut tokio::process::Command {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP)
+    }
+    #[cfg(not(windows))]
+    {
+        command
+    }
+}
+
+#[cfg(unix)]
+pub(crate) const INTERRUPT_SIGNAL_NAME: &str = "SIGINT";
+#[cfg(windows)]
+pub(crate) const INTERRUPT_SIGNAL_NAME: &str = "CTRL_BREAK_EVENT";
+#[cfg(all(not(windows), not(unix)))]
+pub(crate) const INTERRUPT_SIGNAL_NAME: &str = "interrupt";
+
+#[cfg(unix)]
+pub(crate) const TERMINATE_SIGNAL_NAME: &str = "SIGTERM";
+#[cfg(windows)]
+pub(crate) const TERMINATE_SIGNAL_NAME: &str = "CTRL_BREAK_EVENT";
+#[cfg(all(not(windows), not(unix)))]
+pub(crate) const TERMINATE_SIGNAL_NAME: &str = "terminate";
+
+#[cfg(unix)]
+pub(crate) const KILL_SIGNAL_NAME: &str = "SIGKILL";
+#[cfg(windows)]
+pub(crate) const KILL_SIGNAL_NAME: &str = "TerminateProcess";
+#[cfg(all(not(windows), not(unix)))]
+pub(crate) const KILL_SIGNAL_NAME: &str = "kill";
+
 /// Ask the `child` to terminate gracefully.
 /// This signal is typically sent to a process by its controlling terminal when a user wishes to
 /// interrupt the process, initiated by pressing `Ctrl+C`.
 ///
 /// - on `cfg(unix)`: Sends a `SIGINT` to the process.
-/// - on `cfg(windows)`: Sends a `CTRL_C_EVENT` to the process.
+/// - on `cfg(windows)`: Sends a `CTRL_BREAK_EVENT` to the process group.
 /// - raises a panic on any other platform!
+///
+/// Windows cannot target `CTRL_C_EVENT` at a nonzero process group. Since this crate creates a
+/// process group for each child on Windows, `CTRL_BREAK_EVENT` is the targetable graceful
+/// interrupt event.
 pub(crate) fn send_interrupt(child: &tokio::process::Child) -> std::io::Result<()> {
     let Some(pid) = child.id() else {
         // Returns `None` if child was already "polled to completion".
@@ -23,10 +66,10 @@ pub(crate) fn send_interrupt(child: &tokio::process::Child) -> std::io::Result<(
 
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Console::CTRL_C_EVENT;
+        use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
         use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
 
-        let success = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid) };
+        let success = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
         if success == 0 {
             return Err(std::io::Error::last_os_error());
         }

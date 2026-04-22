@@ -2,35 +2,17 @@ use std::process::ExitStatus;
 
 /// Full output of a process that terminated.
 ///
-/// Both it's `stdout` and `stderr` streams were collected as individual lines. Depending on the
-/// [`crate::LineParsingOptions`] used, content might have been lost.
+/// `Stdout` and `Stderr` describe the collected payload type for each stream. For example,
+/// bounded line collection uses `ProcessOutput<CollectedLines>`, bounded raw byte collection uses
+/// `ProcessOutput<CollectedBytes>`, and trusted unbounded collection uses `ProcessOutput<Vec<_>>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Output {
+pub struct ProcessOutput<Stdout, Stderr = Stdout> {
     /// Status the process exited with.
     pub status: ExitStatus,
 
-    /// The processes entire output on its `stdout` stream, collected into individual lines.
-    ///
-    /// Depending on the [`crate::LineParsingOptions`] used, content might have been lost.
-    pub stdout: Vec<String>,
+    /// The process's collected output on its `stdout` stream.
+    pub stdout: Stdout,
 
-    /// The processes entire output on its `stderr` stream, collected into individual lines.
-    ///
-    /// Depending on the [`crate::LineParsingOptions`] used, content might have been lost.
-    pub stderr: Vec<String>,
-}
-
-/// Full raw byte output of a process that terminated.
-///
-/// Both its `stdout` and `stderr` streams were collected as bytes without line parsing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawOutput {
-    /// Status the process exited with.
-    pub status: ExitStatus,
-
-    /// The process's entire output on its `stdout` stream, collected as raw bytes.
-    pub stdout: Vec<u8>,
-
-    /// The process's entire output on its `stderr` stream, collected as raw bytes.
-    pub stderr: Vec<u8>,
+    /// The process's collected output on its `stderr` stream.
+    pub stderr: Stderr,
 }
