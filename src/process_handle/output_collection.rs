@@ -544,6 +544,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_subscriber_timed_output_wait_can_be_retried_after_process_finishes() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(
+            "printf 'early-out\n'; printf 'early-err\n' >&2; \
+             sleep 0.2; \
+             printf 'late-out\n'; printf 'late-err\n' >&2",
+        );
+
+        let mut process = crate::Process::new(cmd)
+            .name("sh")
+            .stdout_and_stderr(|stream| {
+                stream
+                    .single_subscriber()
+                    .best_effort_delivery()
+                    .replay_last_bytes(1.megabytes())
+                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .unwrap();
+
+        let first = process
+            .wait_for_completion_with_output(wait_with_line_output_options(Some(
+                Duration::from_millis(25),
+            )))
+            .await;
+        assert_that!(first.is_err()).is_true();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let output = process
+            .wait_for_completion_with_output(wait_with_line_output_options(Some(
+                Duration::from_secs(2),
+            )))
+            .await
+            .unwrap();
+
+        assert_that!(output.status.success()).is_true();
+        assert_that!(output.stdout.lines().iter().map(String::as_str))
+            .contains_exactly(["early-out", "late-out"]);
+        assert_that!(output.stderr.lines().iter().map(String::as_str))
+            .contains_exactly(["early-err", "late-err"]);
+    }
+
+    #[tokio::test]
+    async fn single_subscriber_timed_raw_output_wait_can_be_retried_after_process_finishes() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(
+            "printf 'early-out'; printf 'early-err' >&2; \
+             sleep 0.2; \
+             printf 'late-out'; printf 'late-err' >&2",
+        );
+
+        let mut process = crate::Process::new(cmd)
+            .name("sh")
+            .stdout_and_stderr(|stream| {
+                stream
+                    .single_subscriber()
+                    .best_effort_delivery()
+                    .replay_last_bytes(1.megabytes())
+                    .sealed_replay_behavior(SealedReplayBehavior::StartAtLiveOutput)
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .unwrap();
+
+        let first = process
+            .wait_for_completion_with_raw_output(wait_with_raw_output_options(Some(
+                Duration::from_millis(25),
+            )))
+            .await;
+        assert_that!(first.is_err()).is_true();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let output = process
+            .wait_for_completion_with_raw_output(wait_with_raw_output_options(Some(
+                Duration::from_secs(2),
+            )))
+            .await
+            .unwrap();
+
+        assert_that!(output.status.success()).is_true();
+        assert_that!(output.stdout.bytes).is_equal_to(b"early-outlate-out".to_vec());
+        assert_that!(output.stderr.bytes).is_equal_to(b"early-errlate-err".to_vec());
+    }
+
+    #[tokio::test]
     async fn test_broadcast_wait_for_completion_with_raw_output_preserves_bytes() {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")

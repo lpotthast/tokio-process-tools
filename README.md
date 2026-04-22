@@ -244,16 +244,20 @@ to use different backends when that is useful.
 
 - ✅ More efficient (lower memory footprint)
 - ✅ Configurable delivery behavior
-- ✅ Optional replay for the sole subscriber when it attaches after output already arrived
-- ⚠️ **Only one consumer allowed** - creating a second inspector/collector will panic
-- 💡 **Use when**: You only need one way to consume output (e.g., just collecting OR just monitoring)
+- ✅ Optional replay for later subscribers when they attach after output already arrived
+- ⚠️ **Only one active consumer allowed** - creating a second inspector/collector while one is
+  still active will panic
+- 💡 **Use when**: You only need one active way to consume output at a time
 
 For `stream.single_subscriber()`, choose delivery, replay, and stream settings in the builder chain:
-`.best_effort_delivery().no_replay().read_chunk_size(...).max_buffered_chunks(...)` starts the sole consumer at live output
-and keeps output reading non-blocking when the active consumer lags. Use
+`.best_effort_delivery().no_replay().read_chunk_size(...).max_buffered_chunks(...)` starts each consumer at live output
+and keeps output reading non-blocking when the active consumer lags. Dropping, canceling, timing
+out, or completing a collector, inspector, or line waiter releases the stream so another consumer
+can attach later. Use
 `.reliable_for_active_subscribers()` when the active consumer must not miss chunks inside the
-library, and choose a replay-enabled mode when output produced before the sole consumer attaches
-must be retained.
+library, and choose a replay-enabled mode when output produced before or between consumers must be
+retained. Replay may let a later sequential consumer observe retained output that an earlier
+consumer also saw; `.no_replay()` discards output drained while no consumer is active.
 
 The process builder intentionally has no defaults for delivery or replay. Pick
 `.best_effort_delivery().no_replay()` for the fastest live-only path, or choose reliable delivery
@@ -389,10 +393,10 @@ async fn main() {
 Perfect for integration tests or ensuring services are ready:
 
 Note: `wait_for_line` and `wait_for_line_with_timeout` are stream consumers. When using
-`stream.single_subscriber()` for stdout or stderr, calling either method claims that stream's only
-receiver, so no other inspector or collector can be attached to the same stream afterward. Use
-`stream.broadcast()` if you need to wait for readiness and also inspect or collect the same stream
-elsewhere.
+`stream.single_subscriber()` for stdout or stderr, each method claims that stream while the returned
+future is active. Once it matches, times out, is dropped, or observes stream closure, another
+single-subscriber consumer can attach. Use `stream.broadcast()` if you need to wait for readiness
+and also inspect or collect the same stream concurrently.
 Also note: `wait_for_line(...)` only returns `Ok(Matched)` or `Ok(StreamClosed)`; `Ok(Timeout)` is
 only produced by `wait_for_line_with_timeout(...)`. Stream read failures are returned as
 `Err(StreamReadError)`.

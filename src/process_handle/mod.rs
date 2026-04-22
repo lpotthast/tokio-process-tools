@@ -166,8 +166,8 @@ where
     /// Returns a reference to the stdout stream.
     ///
     /// For `BroadcastOutputStream`, this allows creating multiple concurrent consumers.
-    /// For `SingleSubscriberOutputStream`, only one consumer can be created (subsequent
-    /// attempts will panic with a helpful error message).
+    /// For `SingleSubscriberOutputStream`, only one active consumer can exist at a time
+    /// (concurrent attempts will panic with a helpful error message).
     pub fn stdout(&self) -> &Stdout {
         &self.std_out_stream
     }
@@ -175,8 +175,8 @@ where
     /// Returns a reference to the stderr stream.
     ///
     /// For `BroadcastOutputStream`, this allows creating multiple concurrent consumers.
-    /// For `SingleSubscriberOutputStream`, only one consumer can be created (subsequent
-    /// attempts will panic with a helpful error message).
+    /// For `SingleSubscriberOutputStream`, only one active consumer can exist at a time
+    /// (concurrent attempts will panic with a helpful error message).
     pub fn stderr(&self) -> &Stderr {
         &self.std_err_stream
     }

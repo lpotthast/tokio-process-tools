@@ -1,37 +1,121 @@
-use super::state::ConfiguredShared;
+use super::state::{ActiveSubscriber, ConfiguredShared, SubscriberId};
 use crate::output_stream::{Chunk, DeliveryGuarantee, ReplayRetention, StreamEvent};
 use crate::{NumBytes, StreamReadError};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::error::{SendError, TrySendError};
+use tokio::sync::watch;
 
-fn store_or_deliver_live(
+fn record_for_later(
     shared: &ConfiguredShared,
-    event: StreamEvent,
+    event: &StreamEvent,
     replay_retention: Option<ReplayRetention>,
-) -> Option<StreamEvent> {
+) {
+    match event {
+        StreamEvent::Chunk(_) if replay_retention.is_some() => {}
+        StreamEvent::Eof | StreamEvent::ReadError(_) => {}
+        StreamEvent::Chunk(_) | StreamEvent::Gap => return,
+    }
+
     let mut state = shared
         .state
         .lock()
         .expect("single-subscriber state poisoned");
-    if state.consumer_attached {
-        Some(event)
-    } else {
-        state.push_pre_consumer(event, replay_retention);
-        None
+    state.push_replay_event(event.clone(), replay_retention);
+}
+
+fn refresh_cached_active(
+    cached_active: &mut Option<Arc<ActiveSubscriber>>,
+    active_rx: &mut watch::Receiver<Option<Arc<ActiveSubscriber>>>,
+) {
+    cached_active.clone_from(&active_rx.borrow_and_update());
+}
+
+async fn send_reliable_event(
+    mut event: StreamEvent,
+    shared: &ConfiguredShared,
+    cached_active: &mut Option<Arc<ActiveSubscriber>>,
+    active_rx: &mut watch::Receiver<Option<Arc<ActiveSubscriber>>>,
+    replay_retention: Option<ReplayRetention>,
+) {
+    record_for_later(shared, &event, replay_retention);
+
+    let mut retried = false;
+    loop {
+        let Some(active) = cached_active.clone() else {
+            return;
+        };
+
+        match active.sender.send(event).await {
+            Ok(()) => return,
+            Err(SendError(returned)) => {
+                shared.clear_active_if_current(active.id);
+                refresh_cached_active(cached_active, active_rx);
+                event = returned;
+                if retried {
+                    return;
+                }
+                retried = true;
+            }
+        }
     }
 }
 
-async fn send_live_event(event: StreamEvent, sender: &mpsc::Sender<StreamEvent>) -> Result<(), ()> {
-    sender.send(event).await.map_err(|_err| ())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BestEffortSend {
+    Delivered,
+    Full,
+    Inactive,
 }
 
-fn try_send_live_event(
-    event: StreamEvent,
-    sender: &mpsc::Sender<StreamEvent>,
-) -> Result<(), TrySendError<StreamEvent>> {
-    sender.try_send(event)
+fn try_send_best_effort_event(
+    mut event: StreamEvent,
+    shared: &ConfiguredShared,
+    cached_active: &mut Option<Arc<ActiveSubscriber>>,
+    active_rx: &mut watch::Receiver<Option<Arc<ActiveSubscriber>>>,
+    replay_retention: Option<ReplayRetention>,
+    retry_on_closed: bool,
+) -> BestEffortSend {
+    record_for_later(shared, &event, replay_retention);
+
+    let mut retried = false;
+    loop {
+        let Some(active) = cached_active.clone() else {
+            return BestEffortSend::Inactive;
+        };
+
+        match active.sender.try_send(event) {
+            Ok(()) => return BestEffortSend::Delivered,
+            Err(TrySendError::Full(_returned)) => return BestEffortSend::Full,
+            Err(TrySendError::Closed(returned)) => {
+                shared.clear_active_if_current(active.id);
+                refresh_cached_active(cached_active, active_rx);
+                event = returned;
+                if !retry_on_closed || retried {
+                    return BestEffortSend::Inactive;
+                }
+                retried = true;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BestEffortLag {
+    subscriber_id: Option<SubscriberId>,
+    lagged: usize,
+    gap_pending: bool,
+}
+
+impl BestEffortLag {
+    fn observe_active(&mut self, active: Option<&Arc<ActiveSubscriber>>) {
+        let subscriber_id = active.map(|active| active.id);
+        if self.subscriber_id != subscriber_id {
+            self.subscriber_id = subscriber_id;
+            self.lagged = 0;
+            self.gap_pending = false;
+        }
+    }
 }
 
 fn log_if_lagged(lagged: &mut usize) {
@@ -45,40 +129,102 @@ fn buffered_chunk_count(buffer_len: usize, chunk_size: NumBytes) -> usize {
     buffer_len.div_ceil(chunk_size.bytes())
 }
 
+async fn send_pending_gap_before_terminal(
+    shared: &ConfiguredShared,
+    cached_active: &mut Option<Arc<ActiveSubscriber>>,
+    active_rx: &mut watch::Receiver<Option<Arc<ActiveSubscriber>>>,
+    lag: &mut BestEffortLag,
+) {
+    if !lag.gap_pending {
+        return;
+    }
+
+    let Some(active) = cached_active.clone() else {
+        lag.observe_active(None);
+        return;
+    };
+
+    match active.sender.send(StreamEvent::Gap).await {
+        Ok(()) => {
+            log_if_lagged(&mut lag.lagged);
+            lag.gap_pending = false;
+        }
+        Err(SendError(_event)) => {
+            shared.clear_active_if_current(active.id);
+            refresh_cached_active(cached_active, active_rx);
+            lag.observe_active(cached_active.as_ref());
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the reader keeps the read/chunk loop inline to preserve delivery invariants"
+)]
 pub(super) async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
     mut read: R,
     shared: Arc<ConfiguredShared>,
-    sender: mpsc::Sender<StreamEvent>,
+    mut active_rx: watch::Receiver<Option<Arc<ActiveSubscriber>>>,
     chunk_size: NumBytes,
     delivery_guarantee: DeliveryGuarantee,
     replay_retention: Option<ReplayRetention>,
     stream_name: &'static str,
 ) {
     let mut buf = bytes::BytesMut::with_capacity(chunk_size.bytes());
-    let mut lagged = 0_usize;
-    let mut gap_pending = false;
+    let mut cached_active = active_rx.borrow().clone();
+    let mut best_effort_lag = BestEffortLag::default();
+    best_effort_lag.observe_active(cached_active.as_ref());
 
-    let send_or_store =
-        |event: StreamEvent| store_or_deliver_live(&shared, event, replay_retention);
-
+    // A cached active sender does not need to poll shared active state while its receiver is
+    // alive: the mpsc sender remains valid until that consumer drops its receiver. A closed
+    // channel is the signal to refresh the cached active slot. Subscriber ids prevent a stale
+    // sender failure from clearing a newer active subscriber.
     'outer: loop {
         let _ = buf.try_reclaim(chunk_size.bytes());
-        match read.read_buf(&mut buf).await {
+
+        let read_result = if cached_active.is_none() {
+            tokio::select! {
+                result = read.read_buf(&mut buf) => {
+                    refresh_cached_active(&mut cached_active, &mut active_rx);
+                    best_effort_lag.observe_active(cached_active.as_ref());
+                    result
+                }
+                changed = active_rx.changed() => {
+                    if changed.is_ok() {
+                        refresh_cached_active(&mut cached_active, &mut active_rx);
+                        best_effort_lag.observe_active(cached_active.as_ref());
+                        continue 'outer;
+                    }
+                    read.read_buf(&mut buf).await
+                }
+            }
+        } else {
+            read.read_buf(&mut buf).await
+        };
+
+        match read_result {
             Ok(bytes_read) => {
                 let is_eof = bytes_read == 0;
 
                 if is_eof {
-                    if gap_pending
-                        && let Some(event) = send_or_store(StreamEvent::Gap)
-                        && send_live_event(event, &sender).await.is_err()
-                    {
-                        break 'outer;
+                    if matches!(delivery_guarantee, DeliveryGuarantee::BestEffort) {
+                        send_pending_gap_before_terminal(
+                            &shared,
+                            &mut cached_active,
+                            &mut active_rx,
+                            &mut best_effort_lag,
+                        )
+                        .await;
                     }
-                    if let Some(event) = send_or_store(StreamEvent::Eof)
-                        && send_live_event(event, &sender).await.is_err()
-                    {
-                        break 'outer;
-                    }
+
+                    send_reliable_event(
+                        StreamEvent::Eof,
+                        &shared,
+                        &mut cached_active,
+                        &mut active_rx,
+                        replay_retention,
+                    )
+                    .await;
                     break;
                 }
 
@@ -89,28 +235,41 @@ pub(super) async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
                             let chunk = Chunk(buf.split_to(split_to).freeze());
                             let event = StreamEvent::Chunk(chunk);
 
-                            let Some(event) = send_or_store(event) else {
-                                continue;
-                            };
-
-                            if send_live_event(event, &sender).await.is_err() {
-                                break 'outer;
-                            }
+                            send_reliable_event(
+                                event,
+                                &shared,
+                                &mut cached_active,
+                                &mut active_rx,
+                                replay_retention,
+                            )
+                            .await;
                         }
                         DeliveryGuarantee::BestEffort => {
-                            if gap_pending {
-                                match try_send_live_event(StreamEvent::Gap, &sender) {
-                                    Ok(()) => {
-                                        log_if_lagged(&mut lagged);
-                                        gap_pending = false;
+                            best_effort_lag.observe_active(cached_active.as_ref());
+
+                            if best_effort_lag.gap_pending {
+                                match try_send_best_effort_event(
+                                    StreamEvent::Gap,
+                                    &shared,
+                                    &mut cached_active,
+                                    &mut active_rx,
+                                    replay_retention,
+                                    false,
+                                ) {
+                                    BestEffortSend::Delivered => {
+                                        log_if_lagged(&mut best_effort_lag.lagged);
+                                        best_effort_lag.gap_pending = false;
                                     }
-                                    Err(TrySendError::Full(_event)) => {
-                                        lagged += buffered_chunk_count(buf.len(), chunk_size);
+                                    BestEffortSend::Full => {
+                                        best_effort_lag.lagged +=
+                                            buffered_chunk_count(buf.len(), chunk_size);
                                         buf.clear();
                                         tokio::task::yield_now().await;
                                         continue;
                                     }
-                                    Err(TrySendError::Closed(_event)) => break 'outer,
+                                    BestEffortSend::Inactive => {
+                                        best_effort_lag.observe_active(cached_active.as_ref());
+                                    }
                                 }
                             }
 
@@ -118,20 +277,25 @@ pub(super) async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
                             let chunk = Chunk(buf.split_to(split_to).freeze());
                             let event = StreamEvent::Chunk(chunk);
 
-                            let Some(event) = send_or_store(event) else {
-                                continue;
-                            };
-
-                            match try_send_live_event(event, &sender) {
-                                Ok(()) => {
-                                    log_if_lagged(&mut lagged);
+                            match try_send_best_effort_event(
+                                event,
+                                &shared,
+                                &mut cached_active,
+                                &mut active_rx,
+                                replay_retention,
+                                true,
+                            ) {
+                                BestEffortSend::Delivered => {
+                                    log_if_lagged(&mut best_effort_lag.lagged);
                                 }
-                                Err(TrySendError::Full(_event)) => {
-                                    lagged += 1;
-                                    gap_pending = true;
+                                BestEffortSend::Full => {
+                                    best_effort_lag.lagged += 1;
+                                    best_effort_lag.gap_pending = true;
                                     tokio::task::yield_now().await;
                                 }
-                                Err(TrySendError::Closed(_event)) => break 'outer,
+                                BestEffortSend::Inactive => {
+                                    best_effort_lag.observe_active(cached_active.as_ref());
+                                }
                             }
                         }
                     }
@@ -140,9 +304,14 @@ pub(super) async fn read_chunked<R: AsyncRead + Unpin + Send + 'static>(
             Err(err) => {
                 let err = StreamReadError::new(stream_name, err);
                 tracing::warn!(error = %err, "Could not read from stream");
-                if let Some(event) = send_or_store(StreamEvent::ReadError(err)) {
-                    let _ignored = send_live_event(event, &sender).await;
-                }
+                send_reliable_event(
+                    StreamEvent::ReadError(err),
+                    &shared,
+                    &mut cached_active,
+                    &mut active_rx,
+                    replay_retention,
+                )
+                .await;
                 break;
             }
         }

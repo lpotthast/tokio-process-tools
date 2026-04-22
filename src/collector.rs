@@ -125,9 +125,7 @@ impl<S: Sink> Collector<S> {
     /// Checks if this task has finished.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.task
-            .as_ref()
-            .is_none_or(JoinHandle::is_finished)
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// Wait for the collector to terminate naturally.

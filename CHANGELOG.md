@@ -7,32 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## 0.9.0
-
 ### Added
 
 - Added `StreamConfig` and a required type-state `StreamConfig::builder()` API for direct stream
-  construction and process stream configuration. The builder requires selecting delivery, replay,
-  sealed-replay behavior for replay-enabled modes, read chunk size, and maximum buffered chunks.
+  construction and process stdout/stderr stream configuration. The builder requires selecting
+  delivery, replay, read chunk size, maximum buffered chunks, and sealed-replay behavior for
+  replay-enabled modes.
 - Added sealed typed delivery and replay policy markers: `BestEffortDelivery`, `ReliableDelivery`,
   `NoReplay`, `ReplayEnabled`, `Delivery`, `Replay`, `DeliveryGuarantee`, `ReplayRetention`,
   `SealedReplayBehavior`, and `ReplaySubscribeError`.
-- Added typed broadcast spawning via `.broadcast()` builder stages, with explicit per-stream
-  delivery guarantees, replay retention, sealed-replay behavior, and stream read sizing.
-- Added single-subscriber delivery and replay spawning via `.single_subscriber()` builder stages
-  while keeping `tokio::sync::mpsc` as the live delivery primitive.
-- Added explicit replay selection. Use `.no_replay()` for streams without replay APIs, or choose
-  `replay_last_chunks(...)`, `replay_last_bytes(...)`, or `replay_all()` for replay-enabled
-  streams. Replay-retention metadata uses `Option<ReplayRetention>` to represent disabled replay.
-- Added replay-enabled stream APIs for retained output and replay-from-start line waits, plus
-  handle-level replay sealing helpers. Broadcast handles expose `seal_stdout_replay` and
+- Added typed process spawning with `.stdout_and_stderr(...)`, `.stdout(...)`, and `.stderr(...)`
+  stream configuration stages. Stdout and stderr may now use different backends and, for broadcast
+  streams, different delivery and replay mode types.
+- Added broadcast stream delivery and replay configuration via `stream.broadcast()`, including
+  `.best_effort_delivery()`, `.reliable_for_active_subscribers()`, `.no_replay()`,
+  `.replay_last_chunks(...)`, `.replay_last_bytes(...)`, `.replay_all()`, and
+  `.sealed_replay_behavior(...)`.
+- Added single-subscriber stream delivery and replay configuration via
+  `stream.single_subscriber()` while keeping the lower-overhead single-consumer backend and
+  second-consumer rejection behavior.
+- Added replay-enabled stream APIs for retained output and replay-from-start line waits:
+  `seal_replay`, `is_replay_sealed`, `try_wait_for_line_from_start_with_timeout`, and
+  `wait_for_line_from_start_with_timeout`. Replay-retention metadata uses
+  `Option<ReplayRetention>` to represent disabled replay.
+- Added handle-level replay sealing helpers. Broadcast handles expose `seal_stdout_replay` and
   `seal_stderr_replay` only when the relevant typed stream has replay enabled, and
   `seal_output_replay` only when both broadcast streams have replay enabled. Single-subscriber
   handles expose matching helpers for the single-subscriber backend.
 - Added `BroadcastProcessHandle` as a readable alias for broadcast process handles with typed
   stdout and stderr streams.
-- Added bounded in-memory output collection options and truncation metadata for process output
-  convenience helpers.
+- Added bounded in-memory output collection types and options: `RawCollectionOptions`,
+  `LineCollectionOptions`, `CollectedBytes`, `CollectedLines`, and
+  `CollectionOverflowBehavior`. Bounded collections expose truncation metadata, and trusted-output
+  helpers preserve the previous unbounded collection behavior under explicit method names.
+- Added required-field builders for `LineParsingOptions`, `LineCollectionOptions`, and process
+  wait/output option structs.
 - Added `WriteCollectionOptions` and public sink write error handler types for configuring whether
   writer collectors stop or continue after individual sink write failures. The options type remains
   generic so custom handlers are statically dispatched and allocation-free.
@@ -43,14 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** Changed `Process` into a staged builder: name the process, configure stdout and
-  stderr with `.broadcast()` or `.single_subscriber()` stream builders, then call `.spawn()`.
-- **Breaking:** Replaced the backend-specific `BroadcastStreamConfig*` and
-  `SingleSubscriberStreamConfig*` builder families with the shared `StreamConfig*` type-state
-  builder. Process spawning still chooses the backend explicitly with `.broadcast()` or
-  `.single_subscriber()`.
+- **Breaking:** Changed `Process` into a staged builder: name the process with `.name(...)`,
+  `.with_name(...)`, `.with_auto_name(...)`, or `.auto_name()`, configure stdout and stderr with
+  `.broadcast()` or `.single_subscriber()` stream builders, then call `.spawn()`.
 - **Breaking:** Changed direct `BroadcastOutputStream::from_stream` and
   `SingleSubscriberOutputStream::from_stream` construction to accept `StreamConfig<D, R>`.
+  Single-subscriber delivery is now selected through delivery markers and `DeliveryGuarantee`
+  instead of `BackpressureControl`.
 - **Breaking:** Changed `ProcessHandle<O>` to `ProcessHandle<Stdout, Stderr = Stdout>`, with
   `stdout()` and `stderr()` returning their independently typed streams.
 - **Breaking:** Changed `TerminateOnDrop<O>` to mirror the
@@ -67,8 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required-field `TypedBuilder` option structs, including concrete line, raw, and trusted-line
   output wait options.
 - **Breaking:** Changed `wait_for_line` and `wait_for_line_with_timeout` to return a `LineWaiter`
-  future whose output is `Result<WaitForLineResult, StreamReadError>`. The stream subscription is
-  created before the future is first polled.
+  future whose output is `Result<WaitForLineResult, StreamReadError>`. The stream subscription or
+  single-subscriber receiver claim is created before the returned future is first polled.
 - **Breaking:** Changed `wait_for_completion_or_terminate` to return the dedicated
   `WaitOrTerminateError` type, and changed output-collecting wait helpers to return dedicated
   compound error types instead of overloading `WaitError`.
@@ -82,12 +90,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `collect_lines_into_write`, and `collect_lines_into_write_mapped` to require
   `WriteCollectionOptions`; `WriteCollectionOptions::fail_fast()` stops on the first sink write
   failure.
-- **Breaking:** Made `LineCollectionOptions::builder()` require `overflow_behavior(...)` and added
-  a required-field builder for `LineParsingOptions`.
-- Changed single-subscriber process spawning so delivery and replay must be selected explicitly;
-  `.no_replay()` starts the sole consumer at live output.
+- **Breaking:** Changed single-subscriber process spawning so delivery and replay must be selected
+  explicitly. `.no_replay()` starts the sole consumer at live output instead of buffered startup
+  output.
 - Changed default automatic process names to include only the program name, avoiding accidental
   logging of command arguments that may contain secrets.
+- Single-subscriber streams now allow one active consumer at a time instead of one consumer for the
+  entire stream lifetime. After a collector, inspector, or line waiter completes, is canceled, is
+  dropped, or times out, another consumer can attach. Concurrent consumers still panic.
+- Replay-enabled single-subscriber streams retain configured replay history across sequential
+  consumers, including output produced while no consumer is active. `.no_replay()` continues to
+  discard output drained while no consumer is active.
 
 ### Fixed
 
@@ -97,12 +110,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child process, avoiding Tokio channel-construction panics after process creation.
 - Preserved non-timeout wait errors from `wait_for_completion_or_terminate` while still attempting
   cleanup termination after every wait failure.
+- Continued termination escalation when a graceful signal cannot be sent, and reported diagnostics
+  from all attempted shutdown phases.
 - Fixed writer collectors so sink write errors are no longer silently suppressed unless explicitly
   accepted by the configured write error handler.
-- Relaxed single-subscriber inspect and collect callback bounds to accept stateful `FnMut`
-  closures, matching the broadcast backend.
-- Prepared Windows children as separate process groups so console control events target the spawned
-  child instead of the current process group.
+- Relaxed single-subscriber `inspect_chunks`, `collect_chunks`, and `collect_lines` callback bounds
+  to accept stateful `FnMut` closures.
+- Fixed Windows graceful interrupt delivery to use targeted `CTRL_BREAK_EVENT` for child process
+  groups and enabled the `Win32_System_Threading` feature required for process-group creation.
+- Fixed timed `wait_for_completion_with_output` and `wait_for_completion_with_raw_output` on
+  single-subscriber streams so a timeout drops the temporary collectors without preventing a later
+  output wait or collector from attaching.
 
 ### Removed
 
@@ -116,6 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Removed `BackpressureControl` and
   `SingleSubscriberOutputStream::backpressure_control()`. Single-subscriber buffering behavior is
   now represented directly by `DeliveryGuarantee`.
+- Removed the atomic-take dependency.
 
 ## [0.8.1] - 2026-04-11
 
@@ -140,8 +159,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `RawOutput` plus `wait_for_completion_with_raw_output` and
   `wait_for_completion_with_raw_output_or_terminate` on both process handle backends for collecting
   stdout and stderr as raw bytes.
-- Made `BroadcastOutputStream::from_stream` public for custom stream construction.
-- Re-exported `BackpressureControl`, `Chunk`, `LineWriteMode`, and `RawOutput` from the crate root.
+- Made `BroadcastOutputStream::from_stream` public and re-exported `FromStreamOptions` for custom
+  stream construction.
+- Re-exported `BackpressureControl`, `Chunk`, `FromStreamOptions`, `LineWriteMode`, and
+  `RawOutput` from the crate root.
 - Added this `CHANGELOG.md` in Keep a Changelog format.
 
 ### Changed
@@ -212,11 +233,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added the `Process` builder with explicit `.spawn_broadcast(StreamConfig::best_effort())` and
+- Added the `Process` builder with explicit `.spawn_broadcast()` and
   `.spawn_single_subscriber()` entry points.
 - Added process naming configuration via `ProcessName`, `AutoName`, and `AutoNameSettings`.
 - Added centralized error types via `SpawnError` and `OutputError`.
-- Exported `DEFAULT_READ_CHUNK_SIZE` and `DEFAULT_MAX_BUFFERED_CHUNKS`.
+- Exported `DEFAULT_CHUNK_SIZE` and `DEFAULT_CHANNEL_CAPACITY`.
 
 ### Changed
 

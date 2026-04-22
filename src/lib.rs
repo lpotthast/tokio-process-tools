@@ -188,7 +188,7 @@ mod test {
                 .inspect_lines(|_line| Next::Continue, LineParsingOptions::default());
         })
         .has_type::<String>()
-        .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'stdout'). Only one inspector or collector can be active at a time. Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.");
+        .is_equal_to("Cannot create multiple active consumers on SingleSubscriberOutputStream (stream: 'stdout'). Only one active inspector, collector, or line waiter can be active at a time. Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.");
 
         process
             .wait_for_completion(wait_options(None))

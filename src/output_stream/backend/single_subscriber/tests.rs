@@ -1,4 +1,4 @@
-use super::{ConfiguredShared, read_chunked};
+use super::{ActiveSubscriber, ConfiguredShared, read_chunked};
 use crate::ReplaySubscribeError;
 use crate::output_stream::Chunk;
 use crate::output_stream::StreamEvent;
@@ -6,6 +6,7 @@ use crate::output_stream::backend::single_subscriber::SingleSubscriberOutputStre
 use crate::output_stream::backend::test_support::{
     FailingWrite, ReadErrorAfterBytes, write_test_data,
 };
+use crate::output_stream::consumer;
 use crate::output_stream::{
     DeliveryGuarantee, LineWriteMode, Next, ReplayRetention, SealedReplayBehavior, StreamConfig,
 };
@@ -17,7 +18,6 @@ use crate::{
     WriteCollectionOptions,
 };
 use assertr::prelude::*;
-use atomic_take::AtomicTake;
 use bytes::Bytes;
 use mockall::{automock, predicate};
 use std::borrow::Cow;
@@ -71,6 +71,8 @@ fn reliable_replay_options(
     .build()
 }
 
+const ACTIVE_CONSUMER_PANIC: &str = "Cannot create multiple active consumers on SingleSubscriberOutputStream (stream: 'custom'). Only one active inspector, collector, or line waiter can be active at a time. Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.";
+
 fn spawn_configured_reader<R>(
     read: R,
     delivery_guarantee: DeliveryGuarantee,
@@ -82,18 +84,22 @@ where
 {
     let (sender, receiver) = mpsc::channel(max_buffered_chunks);
     let shared = Arc::new(ConfiguredShared::new());
+    let active_rx = shared.subscribe_active();
     {
         let mut state = shared
             .state
             .lock()
             .expect("single-subscriber state poisoned");
-        state.consumer_attached = true;
+        let id = state.attach_subscriber();
+        shared
+            .active_tx
+            .send_replace(Some(Arc::new(ActiveSubscriber { id, sender })));
     }
 
     let stream_reader = tokio::spawn(read_chunked(
         read,
         shared,
-        sender,
+        active_rx,
         read_chunk_size,
         delivery_guarantee,
         None,
@@ -101,6 +107,24 @@ where
     ));
 
     (stream_reader, receiver)
+}
+
+async fn wait_for_no_active_consumer(stream: &SingleSubscriberOutputStream) {
+    let shared = Arc::clone(stream.configured_shared.as_ref().unwrap());
+    for _ in 0..50 {
+        {
+            let state = shared
+                .state
+                .lock()
+                .expect("single-subscriber state poisoned");
+            if state.active_id.is_none() {
+                return;
+            }
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_that!(()).fail("active consumer did not detach");
 }
 
 #[derive(Debug)]
@@ -243,7 +267,7 @@ async fn typed_replay_all_delivers_pre_consumer_output_before_live_output() {
 }
 
 #[tokio::test]
-async fn configured_subscription_takes_replay_buffer_from_shared_state() {
+async fn configured_subscription_snapshots_replay_buffer_from_shared_state() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream = SingleSubscriberOutputStream::from_stream(
         read_half,
@@ -271,7 +295,7 @@ async fn configured_subscription_takes_replay_buffer_from_shared_state() {
             .state
             .lock()
             .expect("single-subscriber state poisoned");
-        assert_that!(state.events.len()).is_equal_to(0);
+        assert_that!(state.events.len()).is_equal_to(1);
     }
 
     write_half.write_all(b"live").await.unwrap();
@@ -280,6 +304,242 @@ async fn configured_subscription_takes_replay_buffer_from_shared_state() {
 
     let bytes = collector.wait().await.unwrap();
     assert_that!(bytes).is_equal_to(b"oldlive".to_vec());
+}
+
+#[tokio::test]
+async fn collector_drop_allows_later_collector() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    drop(collector);
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    write_half.write_all(b"later").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes).is_equal_to(b"later".to_vec());
+}
+
+#[tokio::test]
+async fn collector_cancel_allows_later_collector() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    assert_that!(collector.cancel().await.unwrap()).is_empty();
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    write_half.write_all(b"later").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes).is_equal_to(b"later".to_vec());
+}
+
+#[tokio::test]
+async fn inspector_drop_allows_later_collector() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let inspector = stream.inspect_chunks(|_chunk| Next::Continue);
+    drop(inspector);
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    write_half.write_all(b"later").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes).is_equal_to(b"later".to_vec());
+}
+
+#[tokio::test]
+async fn wait_for_line_timeout_allows_later_collector() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let result = stream
+        .wait_for_line_with_timeout(
+            |line| line == "ready",
+            LineParsingOptions::default(),
+            Duration::from_millis(25),
+        )
+        .await;
+    assert_that!(result).is_equal_to(Ok(WaitForLineResult::Timeout));
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    write_half.write_all(b"ready\n").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes).is_equal_to(b"ready\n".to_vec());
+}
+
+#[tokio::test]
+async fn reader_drains_after_consumer_drop() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        StreamConfig::builder()
+            .reliable_for_active_subscribers()
+            .no_replay()
+            .read_chunk_size(16.bytes())
+            .max_buffered_chunks(1)
+            .build(),
+    );
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    drop(collector);
+    wait_for_no_active_consumer(&stream).await;
+
+    let idle_output = vec![b'x'; 4096];
+    tokio::time::timeout(Duration::from_secs(1), write_half.write_all(&idle_output))
+        .await
+        .expect("reader should keep draining with no active consumer")
+        .unwrap();
+    sleep(Duration::from_millis(25)).await;
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    write_half.write_all(b"tail").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes).is_equal_to(b"tail".to_vec());
+}
+
+#[tokio::test]
+async fn no_replay_discards_output_between_consumers() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    assert_that!(collector.cancel().await.unwrap()).is_empty();
+    wait_for_no_active_consumer(&stream).await;
+
+    write_half.write_all(b"idle").await.unwrap();
+    write_half.flush().await.unwrap();
+    sleep(Duration::from_millis(25)).await;
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes).is_empty();
+}
+
+#[tokio::test]
+async fn replay_retains_output_between_consumers() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        reliable_replay_options(ReplayRetention::All),
+    );
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    assert_that!(collector.cancel().await.unwrap()).is_empty();
+    wait_for_no_active_consumer(&stream).await;
+
+    write_half.write_all(b"idle").await.unwrap();
+    write_half.flush().await.unwrap();
+    sleep(Duration::from_millis(25)).await;
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes).is_equal_to(b"idle".to_vec());
+}
+
+#[tokio::test]
+async fn replay_retention_limits_later_consumer() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        reliable_replay_options(ReplayRetention::LastChunks(1)),
+    );
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    assert_that!(collector.cancel().await.unwrap()).is_empty();
+    wait_for_no_active_consumer(&stream).await;
+
+    write_half.write_all(b"aabbcc").await.unwrap();
+    write_half.flush().await.unwrap();
+    sleep(Duration::from_millis(25)).await;
+
+    let collector = stream.collect_all_chunks_into_vec_trusted();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes).is_equal_to(b"cc".to_vec());
+}
+
+#[tokio::test]
+async fn later_consumer_observes_eof() {
+    let (read_half, write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    drop(write_half);
+    sleep(Duration::from_millis(25)).await;
+
+    let bytes = stream
+        .collect_all_chunks_into_vec_trusted()
+        .wait()
+        .await
+        .unwrap();
+    assert_that!(bytes).is_empty();
+}
+
+#[tokio::test]
+async fn later_consumer_observes_read_error() {
+    let stream = SingleSubscriberOutputStream::from_stream(
+        ReadErrorAfterBytes::new(b"before-error", io::ErrorKind::BrokenPipe),
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    sleep(Duration::from_millis(25)).await;
+
+    match stream.collect_all_chunks_into_vec_trusted().wait().await {
+        Err(CollectorError::StreamRead { source, .. }) => {
+            assert_that!(source.stream_name()).is_equal_to("custom");
+            assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
+        }
+        other => {
+            assert_that!(&other).fail(format_args!("expected stream read error, got {other:?}"));
+        }
+    }
 }
 
 #[tokio::test]
@@ -335,14 +595,14 @@ async fn configured_second_subscriber_panic_does_not_poison_state_or_stop_reader
     let collector = stream.collect_all_chunks_into_vec_trusted();
 
     assert_that_panic_by(|| {
-            let _waiter = stream.try_wait_for_line_from_start_with_timeout(
-                |_line| false,
-                LineParsingOptions::default(),
-                Duration::from_millis(25),
-            );
-        })
-        .has_type::<String>()
-        .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'custom'). Only one inspector or collector can be active at a time. Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.");
+        let _waiter = stream.try_wait_for_line_from_start_with_timeout(
+            |_line| false,
+            LineParsingOptions::default(),
+            Duration::from_millis(25),
+        );
+    })
+    .has_type::<String>()
+    .is_equal_to(ACTIVE_CONSUMER_PANIC);
 
     assert_that!(stream.is_replay_sealed()).is_false();
 
@@ -721,11 +981,10 @@ async fn wait_for_line_claims_receiver_before_polling() {
     let _waiter = stream.wait_for_line(|_line| false, LineParsingOptions::default());
 
     assert_that_panic_by(|| {
-            let _second_waiter =
-                stream.wait_for_line(|_line| false, LineParsingOptions::default());
-        })
-        .has_type::<String>()
-        .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'custom'). Only one inspector or collector can be active at a time. Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.");
+        let _second_waiter = stream.wait_for_line(|_line| false, LineParsingOptions::default());
+    })
+    .has_type::<String>()
+    .is_equal_to(ACTIVE_CONSUMER_PANIC);
 }
 
 #[tokio::test]
@@ -805,9 +1064,8 @@ async fn wait_for_line_returns_stream_closed_when_stream_ends_after_writes_witho
     write_half.flush().await.unwrap();
     drop(write_half);
 
-    // No yield needed: `SingleSubscriberOutputStream` is built on an mpsc channel
-    // that buffers every chunk and the terminal EOF event regardless of when the
-    // consumer attaches, so this is race-free by construction.
+    // The terminal EOF event is retained even when chunk replay is disabled, so a later
+    // consumer still observes stream closure.
     let result = os
         .wait_for_line(|line| line.contains("ready"), LineParsingOptions::default())
         .await;
@@ -818,17 +1076,6 @@ async fn wait_for_line_returns_stream_closed_when_stream_ends_after_writes_witho
 #[tokio::test]
 async fn wait_for_line_does_not_match_across_explicit_gap_event() {
     let (tx, rx) = mpsc::channel::<StreamEvent>(4);
-    let os = SingleSubscriberOutputStream {
-        stream_reader: tokio::spawn(async {}),
-        receiver: AtomicTake::new(rx),
-        read_chunk_size: 4.bytes(),
-        max_buffered_chunks: 4,
-        configured_shared: None,
-        replay_retention: None,
-        sealed_replay_behavior: None,
-        replay_enabled: false,
-        name: "custom",
-    };
 
     tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"rea"))))
         .await
@@ -840,9 +1087,8 @@ async fn wait_for_line_does_not_match_across_explicit_gap_event() {
     tx.send(StreamEvent::Eof).await.unwrap();
     drop(tx);
 
-    let result = os
-        .wait_for_line(|line| line == "ready", LineParsingOptions::default())
-        .await;
+    let result =
+        consumer::wait_for_line(rx, |line| line == "ready", LineParsingOptions::default()).await;
 
     assert_that!(result).is_equal_to(Ok(WaitForLineResult::StreamClosed));
 }
@@ -1503,10 +1749,10 @@ async fn multiple_subscribers_are_not_possible() {
 
     // Doesn't matter if we call `inspect_lines` or some other "consuming" function instead.
     assert_that_panic_by(move || {
-            os.inspect_lines(|_line| Next::Continue, LineParsingOptions::default())
-        })
-        .has_type::<String>()
-        .is_equal_to("Cannot create multiple consumers on SingleSubscriberOutputStream (stream: 'custom'). Only one inspector or collector can be active at a time. Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.");
+        os.inspect_lines(|_line| Next::Continue, LineParsingOptions::default())
+    })
+    .has_type::<String>()
+    .is_equal_to(ACTIVE_CONSUMER_PANIC);
 }
 
 #[tokio::test]

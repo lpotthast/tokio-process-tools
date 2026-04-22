@@ -19,7 +19,6 @@ exclude = [
 ]
 
 [dependencies]
-atomic-take = "1.1.0"
 bytes = { version = "1.11.1", default-features = false, features = ["std"] }
 memchr = { version = "2.7.6", default-features = false }
 thiserror = { version = "2.0.17", default-features = false, features = ["std"] }
