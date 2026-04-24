@@ -1,20 +1,11 @@
-use crate::collector::{AsyncChunkCollector, AsyncLineCollector, Collector, Sink};
-use crate::inspector::Inspector;
-use crate::output_stream::consumer;
-use crate::output_stream::subscription::EventSubscription;
 use crate::output_stream::{
-    BestEffortDelivery, Chunk, CollectedBytes, CollectedLines, Delivery, DeliveryGuarantee,
-    LineCollectionOptions, LineParsingOptions, LineWriteMode, Next, NoReplay, OutputStream,
-    RawCollectionOptions, Replay, ReplayEnabled, ReplayRetention, SinkWriteErrorHandler,
-    StreamConfig, StreamEvent, WriteCollectionOptions,
+    BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, OutputStream, Replay, ReplayEnabled,
+    ReplayRetention, StreamConfig, StreamEvent,
 };
 use crate::{NumBytes, StreamReadError};
-use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
-use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::AsyncRead;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
@@ -148,23 +139,6 @@ where
         }
         debug.finish_non_exhaustive()
     }
-}
-
-fn wait_for_line<S>(
-    subscription: S,
-    predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
-    options: LineParsingOptions,
-    timeout: Option<Duration>,
-) -> LineWaiter
-where
-    S: EventSubscription,
-{
-    LineWaiter::new(consumer::wait_for_line_with_optional_timeout(
-        subscription,
-        predicate,
-        options,
-        timeout,
-    ))
 }
 
 impl<D, R> BroadcastOutputStream<D, R>
@@ -338,300 +312,24 @@ where
             Backend::Shared(_) => self.subscribe(),
         }
     }
+}
 
-    /// Inspects chunks of output from the stream without storing them.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_chunks(&self, f: impl FnMut(Chunk) -> Next + Send + 'static) -> Inspector {
-        consumer::inspect_chunks(self.name(), self.subscribe_normal(), f)
+impl<D, R> crate::output_stream::backend::consumer_api::SubscribableOutputStream
+    for BroadcastOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
+    fn subscribe_for_consumer(&self) -> impl crate::output_stream::subscription::EventSubscription {
+        self.subscribe_normal()
     }
+}
 
-    /// Inspects lines of output from the stream without storing them.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_lines(
-        &self,
-        f: impl FnMut(Cow<'_, str>) -> Next + Send + 'static,
-        options: LineParsingOptions,
-    ) -> Inspector {
-        consumer::inspect_lines(self.name(), self.subscribe_normal(), f, options)
-    }
-
-    /// Inspects lines of output from the stream without storing them, using an async closure.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the inspector effectively dies immediately. You can safely do a `let _inspector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_lines_async<Fut>(
-        &self,
-        f: impl FnMut(Cow<'_, str>) -> Fut + Send + 'static,
-        options: LineParsingOptions,
-    ) -> Inspector
+crate::output_stream::backend::consumer_api::impl_output_stream_consumer_api! {
+    impl<D, R> BroadcastOutputStream<D, R>
     where
-        Fut: Future<Output = Next> + Send,
-    {
-        consumer::inspect_lines_async(self.name(), self.subscribe_normal(), f, options)
-    }
-
-    /// Collects chunks from the stream into a sink.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks<S: Sink>(
-        &self,
-        into: S,
-        collect: impl FnMut(Chunk, &mut S) + Send + 'static,
-    ) -> Collector<S> {
-        consumer::collect_chunks(self.name(), self.subscribe_normal(), into, collect)
-    }
-
-    /// Collects chunks from the stream into a sink using an async collector.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_async<S, C>(&self, into: S, collect: C) -> Collector<S>
-    where
-        S: Sink,
-        C: AsyncChunkCollector<S>,
-    {
-        consumer::collect_chunks_async(self.name(), self.subscribe_normal(), into, collect)
-    }
-
-    /// Collects lines from the stream into a sink.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines<S: Sink>(
-        &self,
-        into: S,
-        collect: impl FnMut(Cow<'_, str>, &mut S) -> Next + Send + 'static,
-        options: LineParsingOptions,
-    ) -> Collector<S> {
-        consumer::collect_lines(self.name(), self.subscribe_normal(), into, collect, options)
-    }
-
-    /// Collects lines from the stream into a sink using an async collector.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_async<S, C>(
-        &self,
-        into: S,
-        collect: C,
-        options: LineParsingOptions,
-    ) -> Collector<S>
-    where
-        S: Sink,
-        C: AsyncLineCollector<S>,
-    {
-        consumer::collect_lines_async(self.name(), self.subscribe_normal(), into, collect, options)
-    }
-
-    /// Convenience method to collect chunks into a bounded byte vector.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_into_vec(
-        &self,
-        options: RawCollectionOptions,
-    ) -> Collector<CollectedBytes> {
-        self.collect_chunks(CollectedBytes::new(), move |chunk, collected| {
-            collected.push_chunk(chunk.as_ref(), options);
-        })
-    }
-
-    /// Trusted-output-only convenience method to collect all chunks into a `Vec<u8>`.
-    ///
-    /// This grows memory without a total output cap. Use it only when the child process and its
-    /// output volume are trusted.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_all_chunks_into_vec_trusted(&self) -> Collector<Vec<u8>> {
-        self.collect_chunks(Vec::new(), |chunk, vec| {
-            vec.extend_from_slice(chunk.as_ref());
-        })
-    }
-
-    /// Convenience method to collect lines into a bounded line buffer.
-    ///
-    /// `parsing_options.max_line_length` must be non-zero. An unbounded single-line parser can
-    /// allocate without limit before this collector receives any complete line.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `parsing_options.max_line_length` is zero.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_into_vec(
-        &self,
-        parsing_options: LineParsingOptions,
-        collection_options: LineCollectionOptions,
-    ) -> Collector<CollectedLines> {
-        assert!(
-            parsing_options.max_line_length.bytes() > 0,
-            "parsing_options.max_line_length must be greater than zero for bounded line collection"
-        );
-        self.collect_lines(
-            CollectedLines::new(),
-            move |line, collected| {
-                collected.push_line(line.into_owned(), collection_options);
-                Next::Continue
-            },
-            parsing_options,
-        )
-    }
-
-    /// Trusted-output-only convenience method to collect all lines into a `Vec<String>`.
-    ///
-    /// This grows memory without a total output cap. Use it only when the child process and its
-    /// output volume are trusted. `LineParsingOptions::max_line_length` still controls the maximum
-    /// size of one parsed line.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_all_lines_into_vec_trusted(
-        &self,
-        options: LineParsingOptions,
-    ) -> Collector<Vec<String>> {
-        self.collect_lines(
-            Vec::new(),
-            |line, vec| {
-                vec.push(line.into_owned());
-                Next::Continue
-            },
-            options,
-        )
-    }
-
-    /// Collects chunks into an async writer.
-    ///
-    /// Sink write failures are handled according to `write_options`. Use
-    /// `WriteCollectionOptions::fail_fast()` to stop collection and return
-    /// [`crate::CollectorError::SinkWrite`] from [`Collector::wait`] or
-    /// [`Collector::cancel`], `WriteCollectionOptions::log_and_continue()` to log each
-    /// failure and keep collecting, or `WriteCollectionOptions::with_error_handler(...)`
-    /// to make a per-error continue-or-stop decision.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_into_write<W, H>(
-        &self,
-        write: W,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Collector<W>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        H: SinkWriteErrorHandler,
-    {
-        consumer::collect_chunks_into_write(
-            self.name(),
-            self.subscribe_normal(),
-            write,
-            write_options,
-        )
-    }
-
-    /// Collects lines into an async writer.
-    ///
-    /// Sink write failures are handled according to `write_options`. Use
-    /// `WriteCollectionOptions::fail_fast()` to stop collection and return
-    /// [`crate::CollectorError::SinkWrite`] from [`Collector::wait`] or
-    /// [`Collector::cancel`], `WriteCollectionOptions::log_and_continue()` to log each
-    /// failure and keep collecting, or `WriteCollectionOptions::with_error_handler(...)`
-    /// to make a per-error continue-or-stop decision.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_into_write<W, H>(
-        &self,
-        write: W,
-        options: LineParsingOptions,
-        mode: LineWriteMode,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Collector<W>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        H: SinkWriteErrorHandler,
-    {
-        consumer::collect_lines_into_write(
-            self.name(),
-            self.subscribe_normal(),
-            write,
-            options,
-            mode,
-            write_options,
-        )
-    }
-
-    /// Collects chunks into an async writer after mapping them with the provided function.
-    ///
-    /// Sink write failures are handled according to `write_options`. Use
-    /// `WriteCollectionOptions::fail_fast()` to stop collection and return
-    /// [`crate::CollectorError::SinkWrite`] from [`Collector::wait`] or
-    /// [`Collector::cancel`], `WriteCollectionOptions::log_and_continue()` to log each
-    /// failure and keep collecting, or `WriteCollectionOptions::with_error_handler(...)`
-    /// to make a per-error continue-or-stop decision.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_into_write_mapped<W, B, H>(
-        &self,
-        write: W,
-        mapper: impl Fn(Chunk) -> B + Send + Sync + Copy + 'static,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Collector<W>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        B: AsRef<[u8]> + Send,
-        H: SinkWriteErrorHandler,
-    {
-        consumer::collect_chunks_into_write_mapped(
-            self.name(),
-            self.subscribe_normal(),
-            write,
-            mapper,
-            write_options,
-        )
-    }
-
-    /// Collects lines into an async writer after mapping them with the provided function.
-    ///
-    /// Sink write failures are handled according to `write_options`. Use
-    /// `WriteCollectionOptions::fail_fast()` to stop collection and return
-    /// [`crate::CollectorError::SinkWrite`] from [`Collector::wait`] or
-    /// [`Collector::cancel`], `WriteCollectionOptions::log_and_continue()` to log each
-    /// failure and keep collecting, or `WriteCollectionOptions::with_error_handler(...)`
-    /// to make a per-error continue-or-stop decision.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_into_write_mapped<W, B, H>(
-        &self,
-        write: W,
-        mapper: impl Fn(Cow<'_, str>) -> B + Send + Sync + Copy + 'static,
-        options: LineParsingOptions,
-        mode: LineWriteMode,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Collector<W>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        B: AsRef<[u8]> + Send,
-        H: SinkWriteErrorHandler,
-    {
-        consumer::collect_lines_into_write_mapped(
-            self.name(),
-            self.subscribe_normal(),
-            write,
-            mapper,
-            options,
-            mode,
-            write_options,
-        )
-    }
-
-    /// Waits for a line that matches the given predicate.
-    ///
-    /// The waiter starts at the earliest output currently available to new consumers. With replay
-    /// enabled and unsealed, that can include retained past output; otherwise it starts at live
-    /// output.
-    #[must_use]
-    pub fn wait_for_line(
-        &self,
-        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
-        options: LineParsingOptions,
-    ) -> LineWaiter {
-        let subscription = self.subscribe_normal();
-        wait_for_line(subscription, predicate, options, None)
-    }
-
-    /// Waits for a line that matches the given predicate, with a timeout.
-    ///
-    /// The waiter starts at the earliest output currently available to new consumers. With replay
-    /// enabled and unsealed, that can include retained past output; otherwise it starts at live
-    /// output.
-    #[must_use]
-    pub fn wait_for_line_with_timeout(
-        &self,
-        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
-        options: LineParsingOptions,
-        timeout: Duration,
-    ) -> LineWaiter {
-        let subscription = self.subscribe_normal();
-        wait_for_line(subscription, predicate, options, Some(timeout))
-    }
+        D: Delivery,
+        R: Replay,
 }
 
 #[cfg(test)]

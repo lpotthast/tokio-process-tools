@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use typed_builder::TypedBuilder;
 
 /// Controls how the process name is automatically generated when not explicitly provided.
 ///
@@ -10,7 +11,7 @@ pub enum AutoName {
     /// Capture a name from the command as specified by the provided settings.
     ///
     /// Example: `ls "-la"` from `Command::new("ls").arg("-la")` when using
-    /// [`AutoNameSettings::program_with_args`].
+    /// [`AutoName::program_with_args`].
     Using(AutoNameSettings),
 
     /// Capture the full Debug representation of the Command.
@@ -22,9 +23,45 @@ pub enum AutoName {
     Debug,
 }
 
+impl AutoName {
+    /// Capture only the program name.
+    ///
+    /// This is the safe default and excludes command arguments and environment variables.
+    #[must_use]
+    pub fn program_only() -> Self {
+        Self::Using(AutoNameSettings::program_only())
+    }
+
+    /// Capture the program name and all arguments.
+    ///
+    /// Arguments may contain sensitive data. Use this only when arguments are safe to log.
+    #[must_use]
+    pub fn program_with_args() -> Self {
+        Self::Using(AutoNameSettings::program_with_args())
+    }
+
+    /// Capture the program name together with all environment variables and arguments.
+    ///
+    /// Environment variables and arguments often contain credentials. Use this only when all
+    /// captured values are safe to log.
+    #[must_use]
+    pub fn program_with_env_and_args() -> Self {
+        Self::Using(AutoNameSettings::program_with_env_and_args())
+    }
+
+    /// Capture the current directory together with the program name, environment variables, and arguments.
+    ///
+    /// Current directories, environment variables, and arguments may contain sensitive data. Use
+    /// this only when all captured values are safe to log.
+    #[must_use]
+    pub fn full() -> Self {
+        Self::Using(AutoNameSettings::full())
+    }
+}
+
 impl Default for AutoName {
     fn default() -> Self {
-        Self::Using(AutoNameSettings::program_only())
+        Self::program_only()
     }
 }
 
@@ -32,16 +69,33 @@ impl Default for AutoName {
 ///
 /// Process names are used in public error messages and tracing fields. Only capture
 /// arguments, environment variables, or current directories when those values are safe to log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Use [`AutoNameSettings::builder`] to opt into custom combinations; the builder defaults to
+/// capturing only the program name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each flag controls one optional part of the generated process name"
 )]
 pub struct AutoNameSettings {
+    #[builder(default = false)]
     include_current_dir: bool,
+    #[builder(default = false)]
     include_envs: bool,
+    #[builder(default = true, setter(skip))]
     include_program: bool,
+    #[builder(default = false)]
     include_args: bool,
+}
+
+impl Default for AutoNameSettings {
+    fn default() -> Self {
+        Self {
+            include_current_dir: false,
+            include_envs: false,
+            include_program: true,
+            include_args: false,
+        }
+    }
 }
 
 impl AutoNameSettings {
@@ -50,12 +104,7 @@ impl AutoNameSettings {
     /// Example: `Command::new("ls").arg("-la").env("FOO", "foo)` is captured as `"ls"`.
     #[must_use]
     pub fn program_only() -> Self {
-        AutoNameSettings {
-            include_current_dir: false,
-            include_envs: false,
-            include_program: true,
-            include_args: false,
-        }
+        Self::default()
     }
 
     /// Capture the program name and all arguments.
@@ -66,12 +115,7 @@ impl AutoNameSettings {
     /// arguments are safe to include in public errors and logs or for debugging purposes.
     #[must_use]
     pub fn program_with_args() -> Self {
-        AutoNameSettings {
-            include_current_dir: false,
-            include_envs: false,
-            include_program: true,
-            include_args: true,
-        }
+        Self::builder().include_args(true).build()
     }
 
     /// Capture the program name and all environment variables and arguments.
@@ -82,12 +126,10 @@ impl AutoNameSettings {
     /// captured values are safe to include in public errors and logs or for debugging purposes.
     #[must_use]
     pub fn program_with_env_and_args() -> Self {
-        AutoNameSettings {
-            include_current_dir: false,
-            include_envs: true,
-            include_program: true,
-            include_args: true,
-        }
+        Self::builder()
+            .include_envs(true)
+            .include_args(true)
+            .build()
     }
 
     /// Capture the directory and the program name and all environment variables and arguments.
@@ -99,12 +141,11 @@ impl AutoNameSettings {
     /// Use this only when all captured values are safe to include in public errors and logs.
     #[must_use]
     pub fn full() -> Self {
-        AutoNameSettings {
-            include_current_dir: true,
-            include_envs: true,
-            include_program: true,
-            include_args: true,
-        }
+        Self::builder()
+            .include_current_dir(true)
+            .include_envs(true)
+            .include_args(true)
+            .build()
     }
 
     fn format_cmd(self, cmd: &std::process::Command) -> String {
@@ -203,6 +244,18 @@ impl From<AutoName> for ProcessName {
     }
 }
 
+impl From<AutoNameSettings> for AutoName {
+    fn from(settings: AutoNameSettings) -> Self {
+        Self::Using(settings)
+    }
+}
+
+impl From<AutoNameSettings> for ProcessName {
+    fn from(settings: AutoNameSettings) -> Self {
+        Self::Auto(settings.into())
+    }
+}
+
 pub(super) fn generate_name(
     name: &ProcessName,
     cmd: &tokio::process::Command,
@@ -232,74 +285,65 @@ mod tests {
     }
 
     #[test]
-    fn auto_name_captures_only_program_by_default() {
+    fn auto_name_defaults_to_safe_program_only_naming() {
         let mut cmd = command_with_args_env_and_current_dir();
         let sensitive_arg = "--token=secret-token-should-not-be-logged";
         cmd.arg(sensitive_arg);
 
-        let name = generate_name(&ProcessName::default(), &cmd);
+        let default_process_name = generated_name(ProcessName::default(), &cmd);
+        let default_auto_name = generated_name(AutoName::default(), &cmd);
+        let program_only_name = generated_name(AutoName::program_only(), &cmd);
+        let builder_default_name = generated_name(AutoNameSettings::builder().build(), &cmd);
 
-        assert_that!(name.as_ref()).is_equal_to("ls");
-        assert_that!(name.as_ref()).does_not_contain(sensitive_arg);
+        for name in [
+            default_process_name.as_str(),
+            default_auto_name.as_str(),
+            program_only_name.as_str(),
+            builder_default_name.as_str(),
+        ] {
+            assert_that!(name).is_equal_to("ls");
+            assert_that!(name).does_not_contain(sensitive_arg);
+        }
     }
 
     #[test]
-    fn auto_name_only_captures_command_when_requested() {
+    fn auto_name_presets_match_settings_and_expected_output() {
         let cmd = command_with_args_env_and_current_dir();
-
-        let name = generate_name(
-            &ProcessName::Auto(AutoName::Using(AutoNameSettings::program_only())),
-            &cmd,
-        );
-
-        assert_that!(name.as_ref()).is_equal_to("ls");
-    }
-
-    #[test]
-    fn auto_name_captures_command_with_args_when_requested() {
-        let cmd = command_with_args_env_and_current_dir();
-
-        let name = generate_name(
-            &ProcessName::Auto(AutoName::Using(AutoNameSettings::program_with_args())),
-            &cmd,
-        );
-
-        assert_that!(name.as_ref()).is_equal_to("ls \"-la\"");
-    }
-
-    #[test]
-    fn auto_name_captures_command_with_envs_and_args_when_requested() {
-        let cmd = command_with_args_env_and_current_dir();
-
-        let name = generate_name(
-            &ProcessName::Auto(AutoName::Using(
+        let cases = [
+            (
+                AutoName::program_only(),
+                AutoNameSettings::program_only(),
+                "ls",
+            ),
+            (
+                AutoName::program_with_args(),
+                AutoNameSettings::program_with_args(),
+                "ls \"-la\"",
+            ),
+            (
+                AutoName::program_with_env_and_args(),
                 AutoNameSettings::program_with_env_and_args(),
-            )),
-            &cmd,
-        );
+                "FOO=foo ls \"-la\"",
+            ),
+            (
+                AutoName::full(),
+                AutoNameSettings::full(),
+                "./ % FOO=foo ls \"-la\"",
+            ),
+        ];
 
-        assert_that!(name.as_ref()).is_equal_to("FOO=foo ls \"-la\"");
+        for (auto_name, settings, expected) in cases {
+            assert_that!(auto_name).is_equal_to(AutoName::Using(settings));
+            assert_that!(generated_name(auto_name, &cmd)).is_equal_to(expected);
+            assert_that!(generated_name(settings, &cmd)).is_equal_to(expected);
+        }
     }
 
     #[test]
-    fn auto_name_captures_command_with_current_dir_envs_and_args_when_requested() {
+    fn auto_name_debug_uses_command_debug_string() {
         let cmd = command_with_args_env_and_current_dir();
 
-        let name = generate_name(
-            &ProcessName::Auto(AutoName::Using(AutoNameSettings::full())),
-            &cmd,
-        );
-
-        assert_that!(name.as_ref()).is_equal_to("./ % FOO=foo ls \"-la\"");
-    }
-
-    #[test]
-    fn auto_name_captures_full_command_debug_string_when_requested() {
-        let cmd = command_with_args_env_and_current_dir();
-
-        let name = generate_name(&ProcessName::Auto(AutoName::Debug), &cmd);
-
-        assert_that!(name.as_ref()).is_equal_to(
+        assert_that!(generated_name(ProcessName::Auto(AutoName::Debug), &cmd)).is_equal_to(
             "Command { std: cd \"./\" && FOO=\"foo\" \"ls\" \"-la\", kill_on_drop: false }",
         );
     }
@@ -312,5 +356,24 @@ mod tests {
         let name = generate_name(&ProcessName::from(format!("worker-{id}")), &cmd);
 
         assert_that!(name.as_ref()).is_equal_to("worker-42");
+    }
+
+    #[test]
+    fn auto_name_settings_builder_supports_custom_combination() {
+        let cmd = command_with_args_env_and_current_dir();
+
+        assert_that!(generated_name(
+            AutoNameSettings::builder()
+                .include_current_dir(true)
+                .include_args(true)
+                .build(),
+            &cmd,
+        ))
+        .is_equal_to("./ % ls \"-la\"");
+    }
+
+    fn generated_name(name: impl Into<ProcessName>, cmd: &Command) -> String {
+        let name = name.into();
+        generate_name(&name, cmd).into_owned()
     }
 }

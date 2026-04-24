@@ -150,4 +150,11 @@ impl ConfiguredShared {
             self.active_tx.send_replace(None);
         }
     }
+
+    pub(super) fn clear_active(&self) {
+        let mut state = self.state.lock().expect("single-subscriber state poisoned");
+
+        state.active_id = None;
+        self.active_tx.send_replace(None);
+    }
 }

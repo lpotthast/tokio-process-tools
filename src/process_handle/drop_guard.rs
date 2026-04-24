@@ -35,25 +35,34 @@ where
     /// This method enables a safeguard that ensures that the process represented by this
     /// `ProcessHandle` is properly terminated or awaited before being dropped.
     /// If `must_be_terminated` is set and the `ProcessHandle` is
-    /// dropped without invoking `terminate()` or `wait()`, an intentional panic will occur to
-    /// prevent silent failure-states, ensuring that system resources are handled correctly.
+    /// dropped without successfully terminating, killing, waiting for, or explicitly detaching the
+    /// process, an intentional panic will occur to prevent silent failure-states, ensuring that
+    /// system resources are handled correctly.
     ///
     /// You typically do not need to call this, as every `ProcessHandle` is marked by default.
     /// Call `must_not_be_terminated` to clear this safeguard to explicitly allow dropping the
     /// process without terminating it.
+    /// Calling this method while the safeguard is already enabled is safe and has no effect beyond
+    /// keeping the handle armed.
     ///
     /// # Panic
     ///
-    /// If the `ProcessHandle` is dropped without being awaited or terminated
+    /// If the `ProcessHandle` is dropped without being awaited or terminated successfully
     /// after calling this method, a panic will occur with a descriptive message
     /// to inform about the incorrect usage.
     pub fn must_be_terminated(&mut self) {
         self.cleanup_on_drop = true;
-        self.panic_on_drop = Some(PanicOnDrop::new(
-            "tokio_process_tools::ProcessHandle",
-            "The process was not terminated.",
-            "Call `wait_for_completion` or `terminate` before the type is dropped!",
-        ));
+        if !self
+            .panic_on_drop
+            .as_ref()
+            .is_some_and(PanicOnDrop::is_armed)
+        {
+            self.panic_on_drop = Some(PanicOnDrop::new(
+                "tokio_process_tools::ProcessHandle",
+                "The process was not terminated.",
+                "Successfully call `wait_for_completion`, `terminate`, or `kill`, or call `must_not_be_terminated` before the type is dropped!",
+            ));
+        }
     }
 
     /// Disables the kill/panic-on-drop safeguards for this handle.
@@ -99,6 +108,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::long_running_command;
     use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, WaitForCompletionOptions};
     use assertr::prelude::*;
 
@@ -106,13 +116,10 @@ mod tests {
         WaitForCompletionOptions::builder().timeout(timeout).build()
     }
 
-    #[tokio::test]
-    async fn test_defusing_drop_panic_keeps_cleanup_guard_armed() {
-        let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("5");
-
-        let mut process = crate::Process::new(cmd)
-            .name("sleep")
+    fn spawn_long_running_process()
+    -> crate::BroadcastProcessHandle<crate::BestEffortDelivery, crate::NoReplay> {
+        crate::Process::new(long_running_command(Duration::from_secs(5)))
+            .name("long-running")
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()
@@ -122,7 +129,53 @@ mod tests {
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
             .spawn()
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_must_be_terminated_is_idempotent_for_fresh_handle() {
+        let mut process = spawn_long_running_process();
+
+        process.must_be_terminated();
+
+        assert_that!(process.cleanup_on_drop).is_true();
+        assert_that!(
+            process
+                .panic_on_drop
+                .as_ref()
+                .is_some_and(PanicOnDrop::is_armed)
+        )
+        .is_true();
+
+        process.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_must_be_terminated_rearms_after_must_not_be_terminated() {
+        let mut process = spawn_long_running_process();
+
+        process.must_not_be_terminated();
+
+        assert_that!(process.cleanup_on_drop).is_false();
+        assert_that!(&process.panic_on_drop).is_none();
+
+        process.must_be_terminated();
+
+        assert_that!(process.cleanup_on_drop).is_true();
+        assert_that!(
+            process
+                .panic_on_drop
+                .as_ref()
+                .is_some_and(PanicOnDrop::is_armed)
+        )
+        .is_true();
+
+        process.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_defusing_drop_panic_keeps_cleanup_guard_armed() {
+        let mut process = spawn_long_running_process();
 
         assert_that!(process.cleanup_on_drop).is_true();
         assert_that!(
@@ -153,21 +206,7 @@ mod tests {
         use nix::sys::wait::waitpid;
         use nix::unistd::Pid;
 
-        let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("5");
-
-        let mut process = crate::Process::new(cmd)
-            .name("sleep")
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .unwrap();
+        let mut process = spawn_long_running_process();
         let pid = process.id().unwrap();
 
         process.must_not_be_terminated();

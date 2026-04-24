@@ -47,13 +47,55 @@ pub struct Inspector {
     pub(crate) task_termination_sender: Option<Sender<()>>,
 }
 
+/// Owns an inspector task while [`Inspector::wait`] is pending.
+///
+/// `Inspector::wait` consumes the inspector and then awaits its task. Without this guard, dropping
+/// that wait future after the task handle has been taken would detach the task instead of applying
+/// the same cleanup behavior as dropping an unused inspector. The guard makes `wait` cancellation
+/// safe by signalling termination and aborting the task if the wait future is dropped early.
+struct InspectorWaitGuard {
+    task: Option<JoinHandle<Result<(), StreamReadError>>>,
+    task_termination_sender: Option<Sender<()>>,
+}
+
+impl InspectorWaitGuard {
+    async fn wait(&mut self, stream_name: &'static str) -> Result<(), InspectorError> {
+        self.task
+            .as_mut()
+            .expect("`task` to be present.")
+            .await
+            .map_err(|err| InspectorError::TaskJoin {
+                stream_name,
+                source: err,
+            })?
+            .map_err(|err| InspectorError::StreamRead {
+                stream_name,
+                source: err,
+            })?;
+
+        self.task = None;
+        self.task_termination_sender = None;
+
+        Ok(())
+    }
+}
+
+impl Drop for InspectorWaitGuard {
+    fn drop(&mut self) {
+        if let Some(task_termination_sender) = self.task_termination_sender.take() {
+            let _res = task_termination_sender.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl Inspector {
     /// Checks if this task has finished.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.task
-            .as_ref()
-            .is_none_or(tokio::task::JoinHandle::is_finished)
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// Wait for the inspector to terminate naturally.
@@ -75,29 +117,12 @@ impl Inspector {
     ///
     /// Panics if the inspector's internal task has already been taken.
     pub async fn wait(mut self) -> Result<(), InspectorError> {
-        // Take the `task_termination_sender`. Let's make sure nobody can ever interfere with us
-        // waiting here. DO NOT drop it, or the task will terminate (at least if it also takes the
-        // receive-error as a signal to terminate)!
-        let tts = self.task_termination_sender.take();
+        let mut guard = InspectorWaitGuard {
+            task: self.task.take(),
+            task_termination_sender: self.task_termination_sender.take(),
+        };
 
-        let result = self
-            .task
-            .take()
-            .expect("`task` to be present.")
-            .await
-            .map_err(|err| InspectorError::TaskJoin {
-                stream_name: self.stream_name,
-                source: err,
-            })?
-            .map_err(|err| InspectorError::StreamRead {
-                stream_name: self.stream_name,
-                source: err,
-            });
-
-        // Drop the termination sender, we don't need it. Task is now terminated.
-        drop(tts);
-
-        result
+        guard.wait(self.stream_name).await
     }
 
     /// Sends a cancellation event to the inspector, letting it shut down.

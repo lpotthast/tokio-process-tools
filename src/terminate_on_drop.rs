@@ -96,9 +96,10 @@ where
                     );
                 }
                 Err(err) => {
-                    panic!(
-                        "Failed to terminate process '{}': {}",
-                        self.process_handle.name, err
+                    tracing::error!(
+                        process = %self.process_handle.name,
+                        error = %err,
+                        "Failed to terminate process during drop"
                     );
                 }
             }

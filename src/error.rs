@@ -1,6 +1,8 @@
 //! Error types for process operations.
 
 use std::borrow::Cow;
+use std::error::Error;
+use std::fmt;
 use std::io;
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -10,34 +12,120 @@ use thiserror::Error;
 use crate::CollectorError;
 
 /// Errors that can occur when terminating a process.
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum TerminationError {
-    /// Failed to send a signal to the process.
-    #[error("Failed to send '{signal}' signal to process '{process_name}': {source}")]
-    SignallingFailed {
-        /// The name of the process.
-        process_name: Cow<'static, str>,
-        /// The underlying IO error.
-        source: io::Error,
-        /// The signal that could not be sent.
-        signal: &'static str,
-    },
-
     /// Failed to terminate the process after trying all platform termination signals.
-    #[error(
-        "Failed to terminate process '{process_name}'. Interrupt failed: {sigint_error}. Terminate failed: {sigterm_error}. Kill failed: {sigkill_error}"
-    )]
     TerminationFailed {
         /// The name of the process.
         process_name: Cow<'static, str>,
-        /// Error from the interrupt attempt.
-        sigint_error: String,
-        /// Error from the terminate attempt.
-        sigterm_error: String,
-        /// Error from the kill attempt.
-        #[source]
-        sigkill_error: io::Error,
+        /// Errors recorded while attempting process termination, in chronological order.
+        attempt_errors: Vec<TerminationAttemptError>,
     },
+}
+
+impl fmt::Display for TerminationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TerminationFailed {
+                process_name,
+                attempt_errors,
+            } => {
+                write!(f, "Failed to terminate process '{process_name}'.")?;
+
+                if attempt_errors.is_empty() {
+                    return write!(f, " No termination attempt error was recorded.");
+                }
+
+                write!(f, " Attempt errors:")?;
+                for (index, attempt_error) in attempt_errors.iter().enumerate() {
+                    write!(f, " [{}] {attempt_error}", index + 1)?;
+                }
+
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Error for TerminationError {}
+
+/// A failed operation recorded while attempting to terminate a process.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct TerminationAttemptError {
+    /// Termination phase where the failure happened.
+    pub phase: TerminationAttemptPhase,
+    /// Operation that failed during the phase.
+    pub operation: TerminationAttemptOperation,
+    /// Platform signal involved in the failed operation, when applicable.
+    pub signal_name: Option<&'static str>,
+    /// Original source error.
+    pub source: Box<dyn Error + 'static>,
+}
+
+impl fmt::Display for TerminationAttemptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} failed", self.phase, self.operation)?;
+
+        if let Some(signal_name) = self.signal_name {
+            write!(f, " for {signal_name}")?;
+        }
+
+        write!(f, ": {}", self.source)
+    }
+}
+
+impl Error for TerminationAttemptError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+/// Termination phase where an attempt error was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TerminationAttemptPhase {
+    /// Initial process status check before any termination signal is sent.
+    Preflight,
+    /// Graceful interrupt phase.
+    Interrupt,
+    /// Graceful terminate phase.
+    Terminate,
+    /// Forceful kill phase.
+    Kill,
+}
+
+impl fmt::Display for TerminationAttemptPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preflight => f.write_str("preflight"),
+            Self::Interrupt => f.write_str("interrupt"),
+            Self::Terminate => f.write_str("terminate"),
+            Self::Kill => f.write_str("kill"),
+        }
+    }
+}
+
+/// Termination operation that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TerminationAttemptOperation {
+    /// Checking whether the process has already exited failed.
+    CheckStatus,
+    /// Sending a graceful or forceful termination signal failed.
+    SendSignal,
+    /// Waiting for the process to exit after a termination signal failed.
+    WaitForExit,
+}
+
+impl fmt::Display for TerminationAttemptOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CheckStatus => f.write_str("status check"),
+            Self::SendSignal => f.write_str("signal send"),
+            Self::WaitForExit => f.write_str("exit wait"),
+        }
+    }
 }
 
 /// Errors that can occur when waiting for process operations.
@@ -102,6 +190,15 @@ pub enum WaitForCompletionWithOutputError {
     #[error("Waiting for process completion failed: {0}")]
     WaitFailed(#[from] WaitError),
 
+    /// Output collection did not complete before the operation timeout elapsed.
+    #[error("Output collection for process '{process_name}' did not complete within {timeout:?}")]
+    OutputCollectionTimeout {
+        /// The name of the process.
+        process_name: Cow<'static, str>,
+        /// The timeout duration that was exceeded.
+        timeout: Duration,
+    },
+
     /// Collecting stdout or stderr failed.
     #[error("Collector failed to collect output: {0}")]
     OutputCollectionFailed(#[from] CollectorError),
@@ -114,6 +211,15 @@ pub enum WaitForCompletionWithOutputOrTerminateError {
     /// Waiting with automatic termination failed.
     #[error("Wait-or-terminate operation failed: {0}")]
     WaitOrTerminateFailed(#[from] WaitOrTerminateError),
+
+    /// Output collection did not complete before the operation timeout elapsed.
+    #[error("Output collection for process '{process_name}' did not complete within {timeout:?}")]
+    OutputCollectionTimeout {
+        /// The name of the process.
+        process_name: Cow<'static, str>,
+        /// The timeout duration that was exceeded.
+        timeout: Duration,
+    },
 
     /// Collecting stdout or stderr failed.
     #[error("Collector failed to collect output: {0}")]

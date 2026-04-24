@@ -304,21 +304,14 @@ mod tests {
     use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE};
     use assertr::prelude::*;
 
-    fn default_builder<D, R>(builder: StreamConfigReadChunkSizeBuilder<D, R>) -> StreamConfig<D, R>
-    where
-        D: Delivery,
-        R: Replay,
-    {
-        builder
-            .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-            .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            .build()
-    }
-
     #[test]
     fn builder_creates_best_effort_no_replay_config() {
-        let config: StreamConfig<BestEffortDelivery, NoReplay> =
-            default_builder(StreamConfig::builder().best_effort_delivery().no_replay());
+        let config: StreamConfig<BestEffortDelivery, NoReplay> = StreamConfig::builder()
+            .best_effort_delivery()
+            .no_replay()
+            .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+            .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            .build();
 
         assert_that!(config.delivery_guarantee()).is_equal_to(DeliveryGuarantee::BestEffort);
         assert_that!(config.replay_enabled()).is_false();
@@ -329,42 +322,53 @@ mod tests {
 
     #[test]
     fn builder_creates_reliable_no_replay_config() {
-        let config: StreamConfig<ReliableDelivery, NoReplay> = default_builder(
-            StreamConfig::builder()
-                .reliable_for_active_subscribers()
-                .no_replay(),
-        );
+        let config: StreamConfig<ReliableDelivery, NoReplay> = StreamConfig::builder()
+            .reliable_for_active_subscribers()
+            .no_replay()
+            .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+            .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            .build();
 
         assert_that!(config.delivery_guarantee())
             .is_equal_to(DeliveryGuarantee::ReliableForActiveSubscribers);
         assert_that!(config.replay_enabled()).is_false();
         assert_that!(config.replay_retention()).is_none();
+        assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
+        assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
     }
 
     #[test]
     fn builder_creates_best_effort_replay_config() {
-        let config: StreamConfig<BestEffortDelivery, ReplayEnabled> = default_builder(
-            StreamConfig::builder()
-                .best_effort_delivery()
-                .replay_last_chunks(2),
-        );
+        let config: StreamConfig<BestEffortDelivery, ReplayEnabled> = StreamConfig::builder()
+            .best_effort_delivery()
+            .replay_last_chunks(2)
+            .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+            .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            .build();
 
         assert_that!(config.delivery_guarantee()).is_equal_to(DeliveryGuarantee::BestEffort);
+        assert_that!(config.replay_enabled()).is_true();
         assert_that!(config.replay_retention()).is_equal_to(Some(ReplayRetention::LastChunks(2)));
+        assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
+        assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
     }
 
     #[test]
     fn builder_creates_reliable_replay_config() {
-        let config: StreamConfig<ReliableDelivery, ReplayEnabled> = default_builder(
-            StreamConfig::builder()
-                .reliable_for_active_subscribers()
-                .replay_last_bytes(16.bytes()),
-        );
+        let config: StreamConfig<ReliableDelivery, ReplayEnabled> = StreamConfig::builder()
+            .reliable_for_active_subscribers()
+            .replay_last_bytes(16.bytes())
+            .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+            .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            .build();
 
         assert_that!(config.delivery_guarantee())
             .is_equal_to(DeliveryGuarantee::ReliableForActiveSubscribers);
+        assert_that!(config.replay_enabled()).is_true();
         assert_that!(config.replay_retention())
             .is_equal_to(Some(ReplayRetention::LastBytes(16.bytes())));
+        assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
+        assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
     }
 
     #[test]

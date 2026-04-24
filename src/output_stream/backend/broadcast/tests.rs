@@ -519,6 +519,35 @@ async fn collector_and_inspector_return_read_error_when_stream_read_fails() {
 }
 
 #[tokio::test]
+async fn inspect_chunks_async_consumes_chunks_until_eof() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = BroadcastOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options_with(2.bytes(), 4),
+    );
+
+    let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let seen_in_task = Arc::clone(&seen);
+    let inspector = stream.inspect_chunks_async(move |chunk| {
+        let seen = Arc::clone(&seen_in_task);
+        let bytes = chunk.as_ref().to_vec();
+        async move {
+            seen.lock().unwrap().push(bytes);
+            Next::Continue
+        }
+    });
+
+    write_half.write_all(b"abcdef").await.unwrap();
+    drop(write_half);
+
+    inspector.wait().await.unwrap();
+
+    let seen = seen.lock().unwrap().clone();
+    assert_that!(seen).is_equal_to(vec![b"ab".to_vec(), b"cd".to_vec(), b"ef".to_vec()]);
+}
+
+#[tokio::test]
 async fn subscriber_after_seal_starts_live() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream = BroadcastOutputStream::from_stream(

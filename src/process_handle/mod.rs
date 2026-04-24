@@ -33,7 +33,9 @@ pub type BroadcastProcessHandle<StdoutD, StdoutR, StderrD = StdoutD, StderrR = S
 ///
 /// stdin is always configured as piped, so it starts as `Open` with a [`ChildStdin`] handle
 /// that can be used to write data to the process. It can be explicitly closed by calling
-/// [`Stdin::close`], after which it transitions to the `Closed` state.
+/// [`Stdin::close`], or implicitly closed by terminal wait helpers such as
+/// [`ProcessHandle::wait_for_completion`] and [`ProcessHandle::kill`], after which it transitions
+/// to the `Closed` state.
 #[derive(Debug)]
 pub enum Stdin {
     /// stdin is open and available for writing.
@@ -60,7 +62,9 @@ impl Stdin {
     /// Closes stdin by dropping the underlying [`ChildStdin`] handle.
     ///
     /// This sends `EOF` to the child process. After calling this method, this stdin
-    /// will be in the `Closed` state and no further writes will be possible.
+    /// will be in the `Closed` state and no further writes will be possible. Terminal wait helpers
+    /// such as [`ProcessHandle::wait_for_completion`] and [`ProcessHandle::kill`] also close any
+    /// still-open stdin automatically; call this method when the child must observe EOF earlier.
     pub fn close(&mut self) {
         *self = Stdin::Closed;
     }
@@ -127,7 +131,7 @@ where
     /// ```no_run
     /// # use tokio::process::Command;
     /// # use tokio_process_tools::{
-    ///     AsyncChunkCollector, AsyncLineCollector, AutoNameSettings, Chunk, Collector,
+    ///     AsyncChunkCollector, AsyncLineCollector, AutoName, Chunk, Collector,
     ///     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, DeliveryGuarantee, LineCollectionOptions,
     ///     LineOverflowBehavior, LineParsingOptions, LineWriteMode, Next, NumBytesExt, Process,
     ///     ProcessHandle, ProcessOutput, RawCollectionOptions, Sink,
@@ -137,7 +141,7 @@ where
     /// # tokio_test::block_on(async {
     /// // The stream backend does not make a difference here.
     /// let mut process = Process::new(Command::new("cat"))
-    ///     .auto_name()
+    ///     .name(AutoName::program_only())
     ///     .stdout_and_stderr(|stream| {
     ///         stream
     ///             .broadcast()
@@ -186,7 +190,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
+        AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
         LineCollectionOptions, LineOverflowBehavior, LineParsingOptions, NumBytesExt,
     };
     use assertr::prelude::*;
@@ -339,7 +343,7 @@ mod tests {
         let cmd = tokio::process::Command::new("sh");
 
         let mut process = crate::Process::new(cmd)
-            .auto_name()
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()

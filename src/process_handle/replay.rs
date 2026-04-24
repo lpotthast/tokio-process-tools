@@ -72,7 +72,7 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytesExt, Process,
+        AutoName, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytesExt, Process,
         WaitForCompletionOptions,
     };
     use assertr::prelude::*;
@@ -84,7 +84,7 @@ mod tests {
         cmd.arg("-c").arg("sleep 0.1");
 
         let process = Process::new(cmd)
-            .auto_name()
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()

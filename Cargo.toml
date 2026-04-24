@@ -43,7 +43,11 @@ tokio-test = "0.4.4"
 tracing-test = "0.2.5"
 
 [[bench]]
-name = "stream_consumption"
+name = "chunk_delivery"
+harness = false
+
+[[bench]]
+name = "line_delivery"
 harness = false
 
 [lints.rust]

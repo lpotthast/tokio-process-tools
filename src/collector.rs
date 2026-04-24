@@ -6,6 +6,7 @@ use std::io;
 use thiserror::Error;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep_until};
 
 /// Errors that can occur when collecting stream data.
 #[derive(Debug, Error)]
@@ -120,7 +121,86 @@ pub struct Collector<S: Sink> {
     pub(crate) task_termination_sender: Option<Sender<()>>,
 }
 
+pub(crate) struct CollectorWait<S: Sink> {
+    stream_name: &'static str,
+    guard: CollectorWaitGuard<S>,
+}
+
+/// Owns a collector task while [`Collector::wait`] is pending.
+///
+/// `Collector::wait` consumes the collector and then awaits its task. Without this guard, dropping
+/// that wait future after the task handle has been taken would detach the task instead of applying
+/// the same cleanup behavior as dropping an unused collector. The guard makes `wait` cancellation
+/// safe by signalling termination and aborting the task if the wait future is dropped early.
+struct CollectorWaitGuard<S: Sink> {
+    task: Option<JoinHandle<Result<S, CollectorTaskError>>>,
+    task_termination_sender: Option<Sender<()>>,
+}
+
+impl<S: Sink> CollectorWaitGuard<S> {
+    async fn wait(&mut self, stream_name: &'static str) -> Result<S, CollectorError> {
+        let sink = self
+            .task
+            .as_mut()
+            .expect("`task` to be present.")
+            .await
+            .map_err(|err| CollectorError::TaskJoin {
+                stream_name,
+                source: err,
+            })?
+            .map_err(|err| match err {
+                CollectorTaskError::StreamRead(source) => CollectorError::StreamRead {
+                    stream_name,
+                    source,
+                },
+                CollectorTaskError::SinkWrite(source) => CollectorError::SinkWrite {
+                    stream_name,
+                    source,
+                },
+            });
+
+        self.task = None;
+        self.task_termination_sender = None;
+
+        sink
+    }
+
+    async fn abort(&mut self) {
+        if let Some(task_termination_sender) = self.task_termination_sender.take() {
+            let _res = task_termination_sender.send(());
+        }
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        if let Some(task) = self.task.as_mut() {
+            let _res = task.await;
+        }
+        self.task = None;
+    }
+}
+
+impl<S: Sink> Drop for CollectorWaitGuard<S> {
+    fn drop(&mut self) {
+        if let Some(task_termination_sender) = self.task_termination_sender.take() {
+            let _res = task_termination_sender.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl<S: Sink> Collector<S> {
+    pub(crate) fn into_wait(mut self) -> CollectorWait<S> {
+        CollectorWait {
+            stream_name: self.stream_name,
+            guard: CollectorWaitGuard {
+                task: self.task.take(),
+                task_termination_sender: self.task_termination_sender.take(),
+            },
+        }
+    }
+
     /// Checks if this task has finished.
     #[must_use]
     pub fn is_finished(&self) -> bool {
@@ -144,13 +224,13 @@ impl<S: Sink> Collector<S> {
     /// # async fn test() {
     /// # use std::time::Duration;
     /// # use tokio_process_tools::{
-    /// #     CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
+    /// #     AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
     /// #     LineCollectionOptions, LineParsingOptions, NumBytesExt, Process,
     /// # };
     ///
     /// # let cmd = tokio::process::Command::new("ls");
     /// let mut process = Process::new(cmd)
-    ///     .auto_name()
+    ///     .name(AutoName::program_only())
     ///     .stdout_and_stderr(|stream| {
     ///         stream
     ///             .broadcast()
@@ -184,36 +264,8 @@ impl<S: Sink> Collector<S> {
     /// # Panics
     ///
     /// Panics if the collector's internal task has already been taken.
-    pub async fn wait(mut self) -> Result<S, CollectorError> {
-        // Take the `task_termination_sender`. Let's make sure nobody can ever interfere with us
-        // waiting here. DO NOT drop it, or the task will terminate (at least if it also takes the
-        // receive-error as a signal to terminate)!
-        let tts = self.task_termination_sender.take();
-
-        let sink = self
-            .task
-            .take()
-            .expect("`task` to be present.")
-            .await
-            .map_err(|err| CollectorError::TaskJoin {
-                stream_name: self.stream_name,
-                source: err,
-            })?
-            .map_err(|err| match err {
-                CollectorTaskError::StreamRead(source) => CollectorError::StreamRead {
-                    stream_name: self.stream_name,
-                    source,
-                },
-                CollectorTaskError::SinkWrite(source) => CollectorError::SinkWrite {
-                    stream_name: self.stream_name,
-                    source,
-                },
-            });
-
-        // Drop the termination sender, we don't need it. Task is now terminated.
-        drop(tts);
-
-        sink
+    pub async fn wait(self) -> Result<S, CollectorError> {
+        self.into_wait().wait().await
     }
 
     /// Sends a cancellation event to the collector, letting it shut down.
@@ -239,6 +291,32 @@ impl<S: Sink> Collector<S> {
             .send(());
 
         self.wait().await
+    }
+}
+
+impl<S: Sink> CollectorWait<S> {
+    pub(crate) async fn wait(&mut self) -> Result<S, CollectorError> {
+        self.guard.wait(self.stream_name).await
+    }
+
+    pub(crate) async fn wait_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Option<S>, CollectorError> {
+        let timeout = sleep_until(deadline);
+        tokio::pin!(timeout);
+
+        tokio::select! {
+            result = self.wait() => result.map(Some),
+            () = &mut timeout => {
+                self.abort().await;
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) async fn abort(&mut self) {
+        self.guard.abort().await;
     }
 }
 

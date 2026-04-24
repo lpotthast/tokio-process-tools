@@ -13,7 +13,23 @@ lint:
 test:
     cargo test
 
+build:
+    cargo build
+
+doc:
+    cargo doc
+
 bench:
     cargo bench
 
-verify: fmt-check lint test
+bench-smoke:
+    cargo bench --no-run
+
+bench-chunks:
+    cargo bench --bench chunk_delivery
+
+bench-lines:
+    cargo bench --bench line_delivery
+
+# Run the full validation suite: check, clippy, test, build, doc
+verify: fmt-check lint test build doc

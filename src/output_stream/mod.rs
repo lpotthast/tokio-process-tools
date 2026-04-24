@@ -33,10 +33,6 @@ pub use event::Chunk;
 pub(crate) use backend::broadcast::BroadcastOutputStream;
 #[allow(unused_imports)]
 pub(crate) use backend::single_subscriber::SingleSubscriberOutputStream;
-pub(crate) use collection::{
-    CollectedBytes, CollectedLines, LineCollectionOptions, RawCollectionOptions,
-    SinkWriteErrorHandler, WriteCollectionOptions,
-};
 pub(crate) use config::{
     StreamConfig, StreamConfigBuilder, StreamConfigMaxBufferedChunksBuilder,
     StreamConfigReadChunkSizeBuilder, StreamConfigReadyBuilder, StreamConfigReplayBuilder,

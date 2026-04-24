@@ -38,6 +38,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::long_running_command;
     use crate::{
         CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
         LineCollectionOptions, LineParsingOptions, NumBytesExt,
@@ -104,11 +105,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_into_inner_defuses_panic_guard() {
-        let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("5");
-
-        let process = crate::Process::new(cmd)
-            .name("sleep")
+        let process = crate::Process::new(long_running_command(Duration::from_secs(5)))
+            .name("long-running")
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()
@@ -127,11 +125,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_into_inner_with_owned_name_drops_owned_string() {
-        let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("5");
-
-        let process = crate::Process::new(cmd)
-            .with_name(format!("sleeper-{}", 7))
+        let process = crate::Process::new(long_running_command(Duration::from_secs(5)))
+            .name(format!("sleeper-{}", 7))
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()

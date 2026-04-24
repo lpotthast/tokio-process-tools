@@ -18,9 +18,12 @@ pub struct WaitForCompletionOptions {
 }
 
 /// Options for waiting until a process exits while collecting bounded line output.
+///
+/// The timeout covers both process completion and stdout/stderr collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 pub struct WaitForCompletionWithOutputOptions {
-    /// Maximum time to wait, or `None` to wait without a timeout.
+    /// Maximum time to wait for process exit and output collection, or `None` to wait without a
+    /// timeout.
     pub timeout: Option<Duration>,
 
     /// Line output collection options.
@@ -28,9 +31,12 @@ pub struct WaitForCompletionWithOutputOptions {
 }
 
 /// Options for waiting until a process exits while collecting trusted line output.
+///
+/// The timeout covers both process completion and stdout/stderr collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 pub struct WaitForCompletionWithTrustedLineOutputOptions {
-    /// Maximum time to wait, or `None` to wait without a timeout.
+    /// Maximum time to wait for process exit and output collection, or `None` to wait without a
+    /// timeout.
     pub timeout: Option<Duration>,
 
     /// Options used for parsing stdout and stderr chunks into lines.
@@ -38,9 +44,12 @@ pub struct WaitForCompletionWithTrustedLineOutputOptions {
 }
 
 /// Options for waiting until a process exits while collecting bounded raw byte output.
+///
+/// The timeout covers both process completion and stdout/stderr collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 pub struct WaitForCompletionWithRawOutputOptions {
-    /// Maximum time to wait, or `None` to wait without a timeout.
+    /// Maximum time to wait for process exit and output collection, or `None` to wait without a
+    /// timeout.
     pub timeout: Option<Duration>,
 
     /// Raw output collection options.
@@ -62,6 +71,9 @@ pub struct WaitForCompletionOrTerminateOptions {
 
 /// Options for waiting until a process exits while collecting bounded line output, terminating it
 /// if needed.
+///
+/// Output collection is bounded by `wait_timeout + interrupt_timeout + terminate_timeout`, plus a
+/// fixed 3-second post-kill confirmation wait when force-kill fallback is required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 pub struct WaitForCompletionOrTerminateWithOutputOptions {
     /// Maximum time to wait before attempting termination.
@@ -79,6 +91,9 @@ pub struct WaitForCompletionOrTerminateWithOutputOptions {
 
 /// Options for waiting until a process exits while collecting trusted line output, terminating it
 /// if needed.
+///
+/// Output collection is bounded by `wait_timeout + interrupt_timeout + terminate_timeout`, plus a
+/// fixed 3-second post-kill confirmation wait when force-kill fallback is required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 pub struct WaitForCompletionOrTerminateWithTrustedLineOutputOptions {
     /// Maximum time to wait before attempting termination.
@@ -96,6 +111,9 @@ pub struct WaitForCompletionOrTerminateWithTrustedLineOutputOptions {
 
 /// Options for waiting until a process exits while collecting bounded raw byte output,
 /// terminating it if needed.
+///
+/// Output collection is bounded by `wait_timeout + interrupt_timeout + terminate_timeout`, plus a
+/// fixed 3-second post-kill confirmation wait when force-kill fallback is required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 pub struct WaitForCompletionOrTerminateWithRawOutputOptions {
     /// Maximum time to wait before attempting termination.

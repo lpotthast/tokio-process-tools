@@ -13,10 +13,13 @@ mod process;
 mod process_handle;
 mod signal;
 mod terminate_on_drop;
+#[cfg(test)]
+mod test_support;
 
 pub use collector::{AsyncChunkCollector, AsyncLineCollector, Collector, CollectorError, Sink};
 pub use error::{
-    SpawnError, StreamReadError, TerminationError, WaitError, WaitForCompletionWithOutputError,
+    SpawnError, StreamReadError, TerminationAttemptError, TerminationAttemptOperation,
+    TerminationAttemptPhase, TerminationError, WaitError, WaitForCompletionWithOutputError,
     WaitForCompletionWithOutputOrTerminateError, WaitForLineResult, WaitOrTerminateError,
 };
 pub use inspector::{Inspector, InspectorError};
@@ -74,10 +77,11 @@ where
 #[cfg(test)]
 mod test {
     use crate::output::ProcessOutput;
+    use crate::test_support::long_running_command;
     use crate::{
-        AutoName, AutoNameSettings, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS,
-        DEFAULT_READ_CHUNK_SIZE, LineCollectionOptions, LineOutputOptions, LineOverflowBehavior,
-        LineParsingOptions, Next, NumBytesExt, Process, RunningState, WaitForCompletionOptions,
+        AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
+        LineCollectionOptions, LineOutputOptions, LineOverflowBehavior, LineParsingOptions, Next,
+        NumBytesExt, Process, RunningState, WaitForCompletionOptions,
         WaitForCompletionWithOutputOptions,
     };
     use assertr::prelude::*;
@@ -124,7 +128,7 @@ mod test {
     #[tokio::test]
     async fn wait_with_output() {
         let mut process = Process::new(Command::new("ls"))
-            .with_auto_name(AutoName::Using(AutoNameSettings::program_only()))
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()
@@ -165,7 +169,7 @@ mod test {
     #[tokio::test]
     async fn single_subscriber_panics_on_multiple_consumers() {
         let mut process = Process::new(Command::new("ls"))
-            .with_auto_name(AutoName::Using(AutoNameSettings::program_only()))
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .single_subscriber()
@@ -197,10 +201,8 @@ mod test {
 
     #[tokio::test]
     async fn is_running() {
-        let mut cmd = Command::new("sleep");
-        cmd.arg("1");
-        let mut process = Process::new(cmd)
-            .with_auto_name(AutoName::Using(AutoNameSettings::program_only()))
+        let mut process = Process::new(long_running_command(Duration::from_secs(1)))
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()
@@ -210,7 +212,7 @@ mod test {
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
             .spawn()
-            .expect("Failed to spawn `sleep` command");
+            .expect("Failed to spawn long-running command");
 
         match process.is_running() {
             RunningState::Running => {}
@@ -243,10 +245,8 @@ mod test {
 
     #[tokio::test]
     async fn terminate() {
-        let mut cmd = Command::new("sleep");
-        cmd.arg("1000");
-        let mut process = Process::new(cmd)
-            .with_auto_name(AutoName::Using(AutoNameSettings::program_only()))
+        let mut process = Process::new(long_running_command(Duration::from_secs(1000)))
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()
@@ -256,7 +256,7 @@ mod test {
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
             .spawn()
-            .expect("Failed to spawn `sleep` command");
+            .expect("Failed to spawn long-running command");
         process
             .terminate(Duration::from_secs(1), Duration::from_secs(1))
             .await

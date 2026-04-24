@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles expose matching helpers for the single-subscriber backend.
 - Added `BroadcastProcessHandle` as a readable alias for broadcast process handles with typed
   stdout and stderr streams.
+- Added `inspect_chunks_async` for asynchronously inspecting raw output chunks without storing
+  them.
 - Added bounded in-memory output collection types and options: `RawCollectionOptions`,
   `LineCollectionOptions`, `CollectedBytes`, `CollectedLines`, and
   `CollectionOverflowBehavior`. Bounded collections expose truncation metadata, and trusted-output
@@ -44,14 +46,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generic so custom handlers are statically dispatched and allocation-free.
 - Added `StreamReadError` so stream read failures can be surfaced by line waiters, collectors, and
   inspectors.
-- Added broadcast mode benchmarks that compare default best-effort throughput with reliable
-  active-subscriber and replay-all configurations.
+- Added `AutoName::program_only()`, `AutoName::program_with_args()`,
+  `AutoName::program_with_env_and_args()`, and `AutoName::full()` as convenience constructors
+  mirroring the built-in `AutoNameSettings` presets.
+- Added `AutoNameSettings::builder()` and direct `.name(AutoNameSettings)` support for process
+  names so callers can opt into combinations beyond the built-in naming presets.
 
 ### Changed
 
 - **Breaking:** Changed `Process` into a staged builder: name the process with `.name(...)`,
-  `.with_name(...)`, `.with_auto_name(...)`, or `.auto_name()`, configure stdout and stderr with
-  `.broadcast()` or `.single_subscriber()` stream builders, then call `.spawn()`.
+  configure stdout and stderr with `.broadcast()` or `.single_subscriber()` stream builders, then
+  call `.spawn()`.
+- **Breaking:** Removed `Process::with_name(...)` and `Process::with_auto_name(...)`. Use
+  `.name(...)` for explicit or automatic naming, including `.name(AutoName::program_only())` for
+  the safe program-only default.
 - **Breaking:** Changed direct `BroadcastOutputStream::from_stream` and
   `SingleSubscriberOutputStream::from_stream` construction to accept `StreamConfig<D, R>`.
   Single-subscriber delivery is now selected through delivery markers and `DeliveryGuarantee`
@@ -80,12 +88,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Changed `wait_for_completion_or_terminate` to return the dedicated
   `WaitOrTerminateError` type, and changed output-collecting wait helpers to return dedicated
   compound error types instead of overloading `WaitError`.
+- **Breaking:** Replaced per-phase `TerminationError::TerminationFailed` diagnostic fields with
+  chronological `TerminationAttemptError` entries that preserve all recorded source errors.
 - **Breaking:** Changed `collect_chunks_into_vec`, `collect_lines_into_vec`,
   `wait_for_completion_with_output`, and `wait_for_completion_with_raw_output` to require explicit
   collection limits. Trusted-output-only variants preserve the previous unbounded behavior under
   explicit `*_trusted` method names.
 - **Breaking:** Changed `ProcessHandle::into_inner()` to return `(Child, Stdin, Stdout, Stderr)` so
-  callers retain control of piped stdin instead of implicitly closing it and sending EOF.
+  callers who extract the inner process retain manual control of piped stdin instead of implicitly
+  closing it and sending EOF.
 - **Breaking:** Changed `collect_chunks_into_write`, `collect_chunks_into_write_mapped`,
   `collect_lines_into_write`, and `collect_lines_into_write_mapped` to require
   `WriteCollectionOptions`; `WriteCollectionOptions::fail_fast()` stops on the first sink write
@@ -103,11 +114,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replay-enabled single-subscriber streams retain configured replay history across sequential
   consumers, including output produced while no consumer is active. `.no_replay()` continues to
   discard output drained while no consumer is active.
+- Simplified the Criterion benchmark suite to focused chunk-delivery and line-delivery targets for
+  the single-subscriber and broadcast backends, added dedicated `just bench-smoke`,
+  `just bench-chunks`, and `just bench-lines` commands, and made compile-only benchmark smoke the
+  default workflow.
 
 ### Fixed
 
+- Fixed `ProcessHandle::must_be_terminated()` so calling it on an already-armed handle is
+  idempotent instead of dropping the existing panic-on-drop guard and panicking immediately.
+- Fixed README process-naming docs to state that the staged builder requires an explicit naming
+  call before stream configuration and to use `.name(AutoName::program_only())` for the safe
+  program-only automatic naming case.
+- **Breaking:** Fixed `terminate()` so failed or canceled termination attempts no longer disarm the
+  drop cleanup and panic guards before the process has successfully terminated.
+- Fixed `send_interrupt_signal()` and `send_terminate_signal()` to reap children that exited
+  before signalling or during a failed signal attempt, avoiding stale PID/process-group targeting
+  and spurious signal failures.
 - Fixed `ProcessHandle::kill()` so a successful kill-and-wait disarms the drop cleanup and panic
   guards, allowing the handle to be dropped safely afterward.
+- Fixed `wait_for_completion*()` helpers and `ProcessHandle::kill()` to close any still-open stdin
+  handle before waiting for process exit, restoring Tokio-compatible deadlock avoidance after
+  piped stdin ownership was split out of `Child`.
 - Rejected zero broadcast and single-subscriber maximum buffered chunk counts before spawning a
   child process, avoiding Tokio channel-construction panics after process creation.
 - Preserved non-timeout wait errors from `wait_for_completion_or_terminate` while still attempting
@@ -120,14 +148,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to accept stateful `FnMut` closures.
 - Fixed Windows graceful interrupt delivery to use targeted `CTRL_BREAK_EVENT` for child process
   groups and enabled the `Win32_System_Threading` feature required for process-group creation.
-- Fixed timed `wait_for_completion_with_output` and `wait_for_completion_with_raw_output` on
-  single-subscriber streams so a timeout drops the temporary collectors without preventing a later
-  output wait or collector from attaching.
+- **Breaking:** Fixed timed `wait_for_completion_with_output*` and
+  `wait_for_completion_with_raw_output*` so configured timeouts bound both process completion and
+  stdout/stderr collection using the full effective wait-or-terminate budget, including inherited
+  output pipes held open by descendants and the fixed 3-second post-kill confirmation wait when
+  force-kill fallback is required. This adds `OutputCollectionTimeout` variants to the output wait
+  error types, surfaces real collector failures promptly even when the sibling stream remains
+  open, and keeps timed-out single-subscriber collectors from blocking later consumers.
+- Fixed `Inspector::wait()` so dropping an in-flight wait future aborts the inspector task instead
+  of detaching it, releasing single-subscriber claims held by stuck async inspectors.
+- Fixed dropped single-subscriber streams so active line waiters, collectors, and inspectors are
+  unblocked instead of waiting forever.
 
 ### Removed
 
 - **Breaking:** Removed `Process::spawn_broadcast()` and `Process::spawn_single_subscriber()` in
   favor of the staged `.broadcast()`/`.single_subscriber()` stream builders.
+- **Breaking:** Removed `Process::auto_name()`. Use `.name(AutoName::program_only())` for the
+  safe program-only automatic naming preset.
 - **Breaking:** Removed the old `Process` stream-sizing and single-subscriber backpressure setter
   methods. Read chunk size, maximum buffered chunks, delivery, and replay are now configured on the
   per-stream builder.
@@ -145,7 +183,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Windows constants `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` are now imported from 
+- Windows constants `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` are now imported from
   `windows_sys::Win32::System::Console`.
 
 ## [0.8.0] - 2026-04-11
@@ -407,24 +445,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `collect_into_*` helpers on `OutputStream`.
 
 [Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.8.1...HEAD
+
 [0.8.1]: https://github.com/lpotthast/tokio-process-tools/compare/v0.8.0...v0.8.1
+
 [0.8.0]: https://github.com/lpotthast/tokio-process-tools/compare/v0.7.2...v0.8.0
+
 [0.7.2]: https://github.com/lpotthast/tokio-process-tools/compare/v0.7.1...v0.7.2
+
 [0.7.1]: https://github.com/lpotthast/tokio-process-tools/compare/v0.7.0...v0.7.1
+
 [0.7.0]: https://github.com/lpotthast/tokio-process-tools/compare/v0.6.0...v0.7.0
+
 [0.6.0]: https://github.com/lpotthast/tokio-process-tools/compare/v0.5.7...v0.6.0
+
 [0.5.7]: https://github.com/lpotthast/tokio-process-tools/compare/v0.5.6...v0.5.7
+
 [0.5.6]: https://github.com/lpotthast/tokio-process-tools/compare/v0.5.5...v0.5.6
+
 [0.5.5]: https://github.com/lpotthast/tokio-process-tools/compare/v0.5.4...v0.5.5
+
 [0.5.4]: https://github.com/lpotthast/tokio-process-tools/compare/v0.5.3...v0.5.4
+
 [0.5.3]: https://github.com/lpotthast/tokio-process-tools/compare/v0.5.2...v0.5.3
+
 [0.5.2]: https://github.com/lpotthast/tokio-process-tools/compare/v0.5.1...v0.5.2
+
 [0.5.1]: https://github.com/lpotthast/tokio-process-tools/compare/v0.5.0...v0.5.1
+
 [0.5.0]: https://github.com/lpotthast/tokio-process-tools/compare/443d629b4fb193f36cba48e9431eec6b38e4823f...v0.5.0
+
 [0.4.0]: https://github.com/lpotthast/tokio-process-tools/compare/5741ad89be9c75764b417c0d2f76200d70ed9655...443d629b4fb193f36cba48e9431eec6b38e4823f
+
 [0.3.1]: https://github.com/lpotthast/tokio-process-tools/compare/41d4017b3c5c1eb566d733944588701411fa39fe...5741ad89be9c75764b417c0d2f76200d70ed9655
+
 [0.3.0]: https://github.com/lpotthast/tokio-process-tools/compare/3f59bdd3759327ce23745205cef432f0b83c69c7...41d4017b3c5c1eb566d733944588701411fa39fe
+
 [0.2.1]: https://github.com/lpotthast/tokio-process-tools/compare/ef7d1bd3814e1dae30e9e63c8d9c0992af192440...3f59bdd3759327ce23745205cef432f0b83c69c7
+
 [0.2.0]: https://github.com/lpotthast/tokio-process-tools/compare/8657219ba05f3645ab617a5a2ffe9ef58d92b28b...ef7d1bd3814e1dae30e9e63c8d9c0992af192440
+
 [0.1.1]: https://github.com/lpotthast/tokio-process-tools/compare/cfeba4890a8b5f6ffd74042017eaf38e623f5b57...8657219ba05f3645ab617a5a2ffe9ef58d92b28b
+
 [0.1.0]: https://github.com/lpotthast/tokio-process-tools/tree/cfeba4890a8b5f6ffd74042017eaf38e623f5b57
