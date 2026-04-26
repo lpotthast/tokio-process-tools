@@ -16,13 +16,16 @@ mod terminate_on_drop;
 #[cfg(test)]
 mod test_support;
 
-pub use collector::{AsyncChunkCollector, AsyncLineCollector, Collector, CollectorError, Sink};
+pub use collector::{
+    AsyncChunkCollector, AsyncLineCollector, Collector, CollectorCancelOutcome, CollectorError,
+    Sink,
+};
 pub use error::{
     SpawnError, StreamReadError, TerminationAttemptError, TerminationAttemptOperation,
     TerminationAttemptPhase, TerminationError, WaitError, WaitForCompletionWithOutputError,
     WaitForCompletionWithOutputOrTerminateError, WaitForLineResult, WaitOrTerminateError,
 };
-pub use inspector::{Inspector, InspectorError};
+pub use inspector::{Inspector, InspectorCancelOutcome, InspectorError};
 pub use output::ProcessOutput;
 pub use output_stream::backend::{broadcast, single_subscriber};
 pub use output_stream::collection::{
@@ -49,230 +52,40 @@ pub use process::{
     ProcessStreamConfig,
 };
 pub use process_handle::{
-    BroadcastProcessHandle, LineOutputOptions, ProcessHandle, RawOutputOptions, RunningState,
-    Stdin, WaitForCompletionOptions, WaitForCompletionOrTerminateOptions,
-    WaitForCompletionOrTerminateWithOutputOptions,
-    WaitForCompletionOrTerminateWithRawOutputOptions,
-    WaitForCompletionOrTerminateWithTrustedLineOutputOptions, WaitForCompletionWithOutputOptions,
-    WaitForCompletionWithRawOutputOptions, WaitForCompletionWithTrustedLineOutputOptions,
+    LineOutputOptions, ProcessHandle, RawOutputOptions, RunningState, Stdin,
+    WaitForCompletionOrTerminateOptions,
 };
 pub use terminate_on_drop::TerminateOnDrop;
 
-#[allow(dead_code)]
+/// Private compile-time assertion that stream types and the public `ProcessHandle` remain
+/// `Send + Sync`.
+///
+/// `Send` matters because users should be able to move a `ProcessHandle` into a spawned task.
+///
+/// `Sync` matters because output streams are accessed through shared references from
+/// `ProcessHandle::stdout()` / `ProcessHandle::stderr()`.
+/// Broadcast streams are explicitly multi-consumer. Single-subscriber streams still use interior
+/// synchronization so concurrent attempts can be safely rejected rather than becoming unsound.
+///
+/// These assertion mainly protect an API guarantee: future internal changes must not accidentally
+/// add something like `Rc`, `RefCell`, or another non-thread-safe field that would make
+/// handles/streams awkward or impossible to use in normal async task patterns. It is not strictly required for
+/// every local use case, but it is a sensible contract for this crate.
+#[allow(dead_code)] // Never really used.
 trait SendSync: Send + Sync {}
+
+impl SendSync for single_subscriber::SingleSubscriberOutputStream {}
+
 impl<D, R> SendSync for broadcast::BroadcastOutputStream<D, R>
 where
     D: Delivery,
     R: Replay,
 {
 }
-impl SendSync for single_subscriber::SingleSubscriberOutputStream {}
+
 impl<Stdout, Stderr> SendSync for ProcessHandle<Stdout, Stderr>
 where
     Stdout: OutputStream + SendSync,
     Stderr: OutputStream + SendSync,
 {
-}
-
-#[cfg(test)]
-mod test {
-    use crate::output::ProcessOutput;
-    use crate::test_support::long_running_command;
-    use crate::{
-        AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
-        LineCollectionOptions, LineOutputOptions, LineOverflowBehavior, LineParsingOptions, Next,
-        NumBytesExt, Process, RunningState, WaitForCompletionOptions,
-        WaitForCompletionWithOutputOptions,
-    };
-    use assertr::prelude::*;
-    use std::time::Duration;
-    use tokio::process::Command;
-
-    fn wait_options(timeout: Option<Duration>) -> WaitForCompletionOptions {
-        WaitForCompletionOptions::builder().timeout(timeout).build()
-    }
-
-    fn line_parsing_options() -> LineParsingOptions {
-        LineParsingOptions::builder()
-            .max_line_length(16.kilobytes())
-            .overflow_behavior(LineOverflowBehavior::default())
-            .build()
-    }
-
-    fn line_collection_options() -> LineCollectionOptions {
-        LineCollectionOptions::builder()
-            .max_bytes(1.megabytes())
-            .max_lines(1024)
-            .overflow_behavior(CollectionOverflowBehavior::default())
-            .build()
-    }
-
-    fn line_output_options() -> LineOutputOptions {
-        let line_collection_options = line_collection_options();
-        LineOutputOptions::builder()
-            .line_parsing_options(line_parsing_options())
-            .stdout_collection_options(line_collection_options)
-            .stderr_collection_options(line_collection_options)
-            .build()
-    }
-
-    fn wait_with_line_output_options(
-        timeout: Option<Duration>,
-    ) -> WaitForCompletionWithOutputOptions {
-        WaitForCompletionWithOutputOptions::builder()
-            .timeout(timeout)
-            .line_output_options(line_output_options())
-            .build()
-    }
-
-    #[tokio::test]
-    async fn wait_with_output() {
-        let mut process = Process::new(Command::new("ls"))
-            .name(AutoName::program_only())
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .expect("Failed to spawn `ls` command");
-        let ProcessOutput {
-            status,
-            stdout,
-            stderr,
-        } = process
-            .wait_for_completion_with_output(wait_with_line_output_options(None))
-            .await
-            .unwrap();
-        assert_that!(status.success()).is_true();
-        for expected in [
-            "Cargo.lock",
-            "Cargo.toml",
-            "LICENSE-APACHE",
-            "LICENSE-MIT",
-            "README.md",
-            "src",
-            "target",
-        ] {
-            assert_that!(stdout.lines().iter().any(|entry| entry == expected))
-                .with_detail_message(format!(
-                    "expected ls output to contain {expected:?}, got {stdout:?}"
-                ))
-                .is_true();
-        }
-        assert_that!(stderr.lines().is_empty()).is_true();
-    }
-
-    #[tokio::test]
-    async fn single_subscriber_panics_on_multiple_consumers() {
-        let mut process = Process::new(Command::new("ls"))
-            .name(AutoName::program_only())
-            .stdout_and_stderr(|stream| {
-                stream
-                    .single_subscriber()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .expect("Failed to spawn `ls` command");
-
-        let _inspector = process
-            .stdout()
-            .inspect_lines(|_line| Next::Continue, LineParsingOptions::default());
-
-        assert_that_panic_by(|| {
-            let _inspector = process
-                .stdout()
-                .inspect_lines(|_line| Next::Continue, LineParsingOptions::default());
-        })
-        .has_type::<String>()
-        .is_equal_to("Cannot create multiple active consumers on SingleSubscriberOutputStream (stream: 'stdout'). Only one active inspector, collector, or line waiter can be active at a time. Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.");
-
-        process
-            .wait_for_completion(wait_options(None))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn is_running() {
-        let mut process = Process::new(long_running_command(Duration::from_secs(1)))
-            .name(AutoName::program_only())
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .expect("Failed to spawn long-running command");
-
-        match process.is_running() {
-            RunningState::Running => {}
-            RunningState::Terminated(exit_status) => {
-                assert_that!(exit_status).fail("Process should be running");
-            }
-            RunningState::Uncertain(_) => {
-                assert_that!(&process).fail("Process state should not be uncertain");
-            }
-        }
-
-        let _exit_status = process
-            .wait_for_completion(wait_options(None))
-            .await
-            .unwrap();
-
-        match process.is_running() {
-            RunningState::Running => {
-                assert_that!(process).fail("Process should not be running anymore");
-            }
-            RunningState::Terminated(exit_status) => {
-                assert_that!(exit_status.code()).is_some().is_equal_to(0);
-                assert_that!(exit_status.success()).is_true();
-            }
-            RunningState::Uncertain(_) => {
-                assert_that!(process).fail("Process state should not be uncertain");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn terminate() {
-        let mut process = Process::new(long_running_command(Duration::from_secs(1000)))
-            .name(AutoName::program_only())
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .expect("Failed to spawn long-running command");
-        process
-            .terminate(Duration::from_secs(1), Duration::from_secs(1))
-            .await
-            .unwrap();
-        match process.is_running() {
-            RunningState::Running => {
-                assert_that!(process).fail("Process should not be running anymore");
-            }
-            RunningState::Terminated(exit_status) => {
-                // Terminating a process with a signal results in no code being emitted (on linux).
-                assert_that!(exit_status.code()).is_none();
-                assert_that!(exit_status.success()).is_false();
-            }
-            RunningState::Uncertain(_) => {
-                assert_that!(process).fail("Process state should not be uncertain");
-            }
-        }
-    }
 }

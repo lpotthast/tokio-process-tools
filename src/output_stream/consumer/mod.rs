@@ -1,6 +1,7 @@
 use crate::output_stream::{LineParserState, LineParsingOptions, Next};
 use std::borrow::Cow;
 
+pub(crate) mod api;
 pub(crate) mod collect;
 pub(crate) mod inspect;
 pub(crate) mod wait;

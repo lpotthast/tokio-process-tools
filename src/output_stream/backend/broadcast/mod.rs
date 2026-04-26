@@ -314,7 +314,7 @@ where
     }
 }
 
-impl<D, R> crate::output_stream::backend::consumer_api::SubscribableOutputStream
+impl<D, R> crate::output_stream::consumer::api::SubscribableOutputStream
     for BroadcastOutputStream<D, R>
 where
     D: Delivery,
@@ -325,7 +325,7 @@ where
     }
 }
 
-crate::output_stream::backend::consumer_api::impl_output_stream_consumer_api! {
+crate::output_stream::consumer::api::impl_output_stream_consumer_api! {
     impl<D, R> BroadcastOutputStream<D, R>
     where
         D: Delivery,

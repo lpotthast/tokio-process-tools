@@ -56,8 +56,9 @@ include concise Rustdoc comments. Prefer small, focused modules over large cross
 
 ## Testing Guidelines
 
-There is no top-level `tests/` directory; most tests are inline `#[cfg(test)]` modules beside the code they verify. Add
-tests next to the affected module.
+Prefer inline `#[cfg(test)]` modules beside the code they verify. When tests grow very large, consider an additional
+`{module_name}_tests.rs` next to the affected module. But: This may hint that the module is too large, having too many
+responsibilities and that it needs to be split.
 
 This crate uses `#[tokio::test]` heavily. Any test that exercises `TerminateOnDrop` must use
 `#[tokio::test(flavor = "multi_thread")]`, because the single-threaded runtime cannot drive the async drop path
@@ -66,9 +67,14 @@ correctly.
 Assertions use the `assertr` crate consistently via `assert_that!(...)`. Other relevant test dependencies include
 `tracing-test`, `tempfile`, `mockall`, and `tokio-test`.
 
-Name tests after observable behavior, for example `wait_with_output` or
-`single_subscriber_panics_on_multiple_consumers`. Run `cargo test` locally before pushing, and add regression coverage
-for bug fixes.
+Name tests after observable behavior.
+
+Group tests into focused submodules. If there are multiple tests for a function, name the submodule after the function
+and do not repeat the function name in the test name.
+
+Run `cargo test` locally before pushing.
+
+Add regression coverage for bug fixes.
 
 ## Required Change Workflow
 

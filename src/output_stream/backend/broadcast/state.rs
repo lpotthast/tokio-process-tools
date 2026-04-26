@@ -290,3 +290,154 @@ pub(super) async fn append_event<D, R>(
     }
     shared.output_available.notify_waiters();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output_stream::Chunk;
+    use crate::{NumBytesExt, ReliableDelivery, ReplayEnabled};
+    use assertr::prelude::*;
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn chunk(bytes: &'static [u8]) -> StreamEvent {
+        StreamEvent::Chunk(Chunk(Bytes::from_static(bytes)))
+    }
+
+    fn best_effort_options(
+        retention: ReplayRetention,
+    ) -> StreamConfig<crate::BestEffortDelivery, ReplayEnabled> {
+        let builder = StreamConfig::builder().best_effort_delivery();
+        match retention {
+            ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
+            ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
+            ReplayRetention::All => builder.replay_all(),
+        }
+        .read_chunk_size(2.bytes())
+        .max_buffered_chunks(4)
+        .build()
+    }
+
+    fn reliable_no_replay_options() -> StreamConfig<ReliableDelivery, crate::NoReplay> {
+        StreamConfig::builder()
+            .reliable_for_active_subscribers()
+            .no_replay()
+            .read_chunk_size(1.bytes())
+            .max_buffered_chunks(1)
+            .build()
+    }
+
+    fn assert_chunk(event: Option<StreamEvent>, expected: &'static [u8]) {
+        match event {
+            Some(StreamEvent::Chunk(chunk)) => {
+                assert_that!(chunk.as_ref()).is_equal_to(expected);
+            }
+            other => {
+                assert_that!(&other).fail(format_args!("expected chunk, got {other:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn replay_last_chunks_starts_at_retention_boundary() {
+        let options = best_effort_options(ReplayRetention::LastChunks(2));
+        let mut state = BroadcastState::new();
+
+        state.push(chunk(b"a\n"), options.replay_retention());
+        state.push(chunk(b"b\n"), options.replay_retention());
+        state.push(chunk(b"c\n"), options.replay_retention());
+
+        assert_that!(state.replay_start_seq).is_equal_to(1);
+        assert_that!(state.replay_chunk_count).is_equal_to(2);
+        assert_that!(state.replay_byte_count).is_equal_to(4);
+        assert_chunk(state.event_at(state.replay_start_seq), b"b\n");
+        assert_chunk(state.event_at(state.replay_start_seq + 1), b"c\n");
+    }
+
+    #[test]
+    fn replay_last_bytes_keeps_whole_chunks_covering_boundary() {
+        let options = best_effort_options(ReplayRetention::LastBytes(3.bytes()));
+        let mut state = BroadcastState::new();
+
+        state.push(chunk(b"aa"), options.replay_retention());
+        state.push(chunk(b"bb"), options.replay_retention());
+        state.push(chunk(b"cc"), options.replay_retention());
+
+        assert_that!(state.replay_start_seq).is_equal_to(1);
+        assert_that!(state.replay_chunk_count).is_equal_to(2);
+        assert_that!(state.replay_byte_count).is_equal_to(4);
+        assert_chunk(state.event_at(state.replay_start_seq), b"bb");
+        assert_chunk(state.event_at(state.replay_start_seq + 1), b"cc");
+    }
+
+    #[test]
+    fn replay_last_bytes_bounds_replay_and_clears_on_seal() {
+        let options = best_effort_options(ReplayRetention::LastBytes(4.bytes()));
+        let mut state = BroadcastState::new();
+
+        state.push(chunk(b"aa"), options.replay_retention());
+        state.push(chunk(b"bb"), options.replay_retention());
+        state.push(chunk(b"cc"), options.replay_retention());
+        assert_that!(state.replay_start_seq).is_equal_to(1);
+        assert_that!(state.replay_byte_count).is_equal_to(4);
+
+        state.replay_sealed = true;
+        evict_locked(&mut state, options);
+
+        assert_that!(state.events.len()).is_equal_to(0);
+        assert_that!(state.retained_chunk_count).is_equal_to(0);
+        assert_that!(state.retained_byte_count).is_equal_to(0);
+        assert_that!(state.replay_byte_count).is_equal_to(0);
+    }
+
+    #[tokio::test]
+    async fn reliable_delivery_waits_before_active_lag_exceeds_capacity() {
+        let options = reliable_no_replay_options();
+        let shared = Arc::new(Shared::new());
+        let subscriber_id = {
+            let mut state = shared.state.lock().expect("broadcast state poisoned");
+            state.add_subscriber(0)
+        };
+
+        append_event(&shared, options, chunk(b"a")).await;
+        let shared_for_append = Arc::clone(&shared);
+        let mut second_append =
+            tokio::spawn(
+                async move { append_event(&shared_for_append, options, chunk(b"b")).await },
+            );
+
+        assert_that!(
+            tokio::time::timeout(Duration::from_millis(25), &mut second_append)
+                .await
+                .is_err()
+        )
+        .is_true();
+
+        {
+            let state = shared.state.lock().expect("broadcast state poisoned");
+            assert_that!(state.next_seq).is_equal_to(1);
+            assert_that!(state.events.len()).is_equal_to(1);
+            assert_that!(state.retained_chunk_count).is_equal_to(1);
+            assert_that!(state.retained_byte_count).is_equal_to(1);
+        }
+
+        {
+            let mut state = shared.state.lock().expect("broadcast state poisoned");
+            state
+                .subscribers
+                .get_mut(&subscriber_id)
+                .expect("subscriber should still be active")
+                .cursor = 1;
+            evict_locked(&mut state, options);
+        }
+        shared.reader_available.notify_waiters();
+
+        second_append.await.unwrap();
+
+        let state = shared.state.lock().expect("broadcast state poisoned");
+        assert_that!(state.next_seq).is_equal_to(2);
+        assert_that!(state.events.len()).is_equal_to(1);
+        assert_chunk(state.event_at(1), b"b");
+    }
+}

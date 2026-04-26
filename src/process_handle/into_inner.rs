@@ -48,11 +48,11 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     fn line_collection_options() -> LineCollectionOptions {
-        LineCollectionOptions::builder()
-            .max_bytes(1.megabytes())
-            .max_lines(1024)
-            .overflow_behavior(CollectionOverflowBehavior::default())
-            .build()
+        LineCollectionOptions::Bounded {
+            max_bytes: 1.megabytes(),
+            max_lines: 1024,
+            overflow_behavior: CollectionOverflowBehavior::default(),
+        }
     }
 
     #[tokio::test]

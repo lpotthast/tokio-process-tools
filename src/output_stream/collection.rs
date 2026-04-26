@@ -1,7 +1,6 @@
 use crate::output_stream::options::NumBytes;
 use std::collections::VecDeque;
 use std::io;
-use typed_builder::TypedBuilder;
 
 /// Controls which output is retained once a bounded in-memory collection reaches its limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -182,54 +181,41 @@ impl<H> WriteCollectionOptions<H> {
 
 /// Options for collecting raw output bytes into memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RawCollectionOptions {
-    /// Maximum number of bytes retained in memory.
-    pub max_bytes: NumBytes,
+pub enum RawCollectionOptions {
+    /// Retain at most `max_bytes` bytes in memory.
+    Bounded {
+        /// Maximum number of bytes retained in memory.
+        max_bytes: NumBytes,
 
-    /// Which retained bytes to keep when more output is observed.
-    pub overflow_behavior: CollectionOverflowBehavior,
-}
+        /// Which retained bytes to keep when more output is observed.
+        overflow_behavior: CollectionOverflowBehavior,
+    },
 
-impl RawCollectionOptions {
-    /// Creates bounded raw collection options that retain at most `max_bytes`.
-    #[must_use]
-    pub fn new(max_bytes: NumBytes) -> Self {
-        Self {
-            max_bytes,
-            overflow_behavior: CollectionOverflowBehavior::default(),
-        }
-    }
-
-    /// Returns these options with a custom overflow behavior.
-    #[must_use]
-    pub fn with_overflow_behavior(mut self, overflow_behavior: CollectionOverflowBehavior) -> Self {
-        self.overflow_behavior = overflow_behavior;
-        self
-    }
+    /// Retain all observed bytes in memory without a total output cap.
+    ///
+    /// Use only when the output source and its output volume are trusted.
+    TrustedUnbounded,
 }
 
 /// Options for collecting parsed output lines into memory.
-///
-/// The builder requires all fields, including the overflow behavior:
-///
-/// ```compile_fail
-/// use tokio_process_tools::{LineCollectionOptions, NumBytesExt};
-///
-/// let _ = LineCollectionOptions::builder()
-///     .max_bytes(1.megabytes())
-///     .max_lines(1024)
-///     .build();
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
-pub struct LineCollectionOptions {
-    /// Maximum total bytes retained across all collected lines.
-    pub max_bytes: NumBytes,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineCollectionOptions {
+    /// Retain at most `max_bytes` total line bytes and at most `max_lines` lines in memory.
+    Bounded {
+        /// Maximum total bytes retained across all collected lines.
+        max_bytes: NumBytes,
 
-    /// Maximum number of lines retained in memory.
-    pub max_lines: usize,
+        /// Maximum number of lines retained in memory.
+        max_lines: usize,
 
-    /// Which retained lines to keep when more output is observed.
-    pub overflow_behavior: CollectionOverflowBehavior,
+        /// Which retained lines to keep when more output is observed.
+        overflow_behavior: CollectionOverflowBehavior,
+    },
+
+    /// Retain all observed lines in memory without a total output cap.
+    ///
+    /// Use only when the output source and its output volume are trusted.
+    TrustedUnbounded,
 }
 
 /// Raw bytes collected from an output stream.
@@ -253,9 +239,13 @@ impl CollectedBytes {
     }
 
     pub(crate) fn push_chunk(&mut self, chunk: &[u8], options: RawCollectionOptions) {
-        let max_bytes = options.max_bytes.bytes();
-        match options.overflow_behavior {
-            CollectionOverflowBehavior::DropAdditionalData => {
+        match options {
+            RawCollectionOptions::TrustedUnbounded => self.bytes.extend_from_slice(chunk),
+            RawCollectionOptions::Bounded {
+                max_bytes,
+                overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+            } => {
+                let max_bytes = max_bytes.bytes();
                 let remaining = max_bytes.saturating_sub(self.bytes.len());
                 if chunk.len() > remaining {
                     self.truncated = true;
@@ -263,7 +253,11 @@ impl CollectedBytes {
                 self.bytes
                     .extend_from_slice(&chunk[..remaining.min(chunk.len())]);
             }
-            CollectionOverflowBehavior::DropOldestData => {
+            RawCollectionOptions::Bounded {
+                max_bytes,
+                overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+            } => {
+                let max_bytes = max_bytes.bytes();
                 if chunk.len() > max_bytes {
                     self.bytes.clear();
                     self.bytes
@@ -341,12 +335,16 @@ impl CollectedLines {
     }
 
     pub(crate) fn push_line(&mut self, line: String, options: LineCollectionOptions) {
-        let line_len = line.len();
-        let max_bytes = options.max_bytes.bytes();
-
-        match options.overflow_behavior {
-            CollectionOverflowBehavior::DropAdditionalData => {
-                if self.lines.len() >= options.max_lines
+        match options {
+            LineCollectionOptions::TrustedUnbounded => self.push_back(line),
+            LineCollectionOptions::Bounded {
+                max_bytes,
+                max_lines,
+                overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+            } => {
+                let line_len = line.len();
+                let max_bytes = max_bytes.bytes();
+                if self.lines.len() >= max_lines
                     || line_len > max_bytes
                     || line_len > max_bytes.saturating_sub(self.retained_bytes)
                 {
@@ -355,8 +353,14 @@ impl CollectedLines {
                 }
                 self.push_back(line);
             }
-            CollectionOverflowBehavior::DropOldestData => {
-                if options.max_lines == 0 {
+            LineCollectionOptions::Bounded {
+                max_bytes,
+                max_lines,
+                overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+            } => {
+                let line_len = line.len();
+                let max_bytes = max_bytes.bytes();
+                if max_lines == 0 {
                     self.truncated = true;
                     return;
                 }
@@ -365,7 +369,7 @@ impl CollectedLines {
                     return;
                 }
 
-                while self.lines.len() >= options.max_lines
+                while self.lines.len() >= max_lines
                     || line_len > max_bytes.saturating_sub(self.retained_bytes)
                 {
                     self.pop_front()
@@ -410,11 +414,11 @@ mod tests {
     use assertr::prelude::*;
 
     fn drop_oldest_options(max_bytes: usize, max_lines: usize) -> LineCollectionOptions {
-        LineCollectionOptions::builder()
-            .max_bytes(max_bytes.bytes())
-            .max_lines(max_lines)
-            .overflow_behavior(CollectionOverflowBehavior::DropOldestData)
-            .build()
+        LineCollectionOptions::Bounded {
+            max_bytes: max_bytes.bytes(),
+            max_lines,
+            overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+        }
     }
 
     fn assert_retained_bytes_match_lines(collected: &CollectedLines) {
@@ -423,22 +427,24 @@ mod tests {
     }
 
     #[test]
-    fn raw_collection_keeps_prefix_when_dropping_additional_data() {
+    fn raw_collection_keeps_expected_bytes_when_truncated() {
         let mut collected = CollectedBytes::new();
-        let options = RawCollectionOptions::new(5.bytes());
+        let options = RawCollectionOptions::Bounded {
+            max_bytes: 5.bytes(),
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
 
         collected.push_chunk(b"abc", options);
         collected.push_chunk(b"def", options);
 
         assert_that!(collected.bytes.as_slice()).is_equal_to(b"abcde".as_slice());
         assert_that!(collected.truncated).is_true();
-    }
 
-    #[test]
-    fn raw_collection_keeps_suffix_when_dropping_oldest_data() {
         let mut collected = CollectedBytes::new();
-        let options = RawCollectionOptions::new(5.bytes())
-            .with_overflow_behavior(CollectionOverflowBehavior::DropOldestData);
+        let options = RawCollectionOptions::Bounded {
+            max_bytes: 5.bytes(),
+            overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+        };
 
         collected.push_chunk(b"abc", options);
         collected.push_chunk(b"def", options);
@@ -448,13 +454,13 @@ mod tests {
     }
 
     #[test]
-    fn line_collection_enforces_line_and_byte_limits() {
+    fn basic_line_collection_limit_modes() {
         let mut collected = CollectedLines::new();
-        let options = LineCollectionOptions::builder()
-            .max_bytes(7.bytes())
-            .max_lines(2)
-            .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
-            .build();
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 7.bytes(),
+            max_lines: 2,
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
 
         collected.push_line("one".to_string(), options);
         collected.push_line("two".to_string(), options);
@@ -469,16 +475,13 @@ mod tests {
         )
         .is_equal_to(vec!["one", "two"]);
         assert_that!(collected.truncated()).is_true();
-    }
 
-    #[test]
-    fn line_collection_can_keep_latest_lines() {
         let mut collected = CollectedLines::new();
-        let options = LineCollectionOptions::builder()
-            .max_bytes(6.bytes())
-            .max_lines(2)
-            .overflow_behavior(CollectionOverflowBehavior::DropOldestData)
-            .build();
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 6.bytes(),
+            max_lines: 2,
+            overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+        };
 
         collected.push_line("one".to_string(), options);
         collected.push_line("two".to_string(), options);
@@ -497,11 +500,11 @@ mod tests {
 
     #[test]
     fn retained_bytes_tracks_appended_lines() {
-        let options = LineCollectionOptions::builder()
-            .max_bytes(100.bytes())
-            .max_lines(100)
-            .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
-            .build();
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 100.bytes(),
+            max_lines: 100,
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
         let mut collected = CollectedLines::new();
 
         collected.push_line("aaa".to_string(), options);
@@ -577,11 +580,11 @@ mod tests {
 
     #[test]
     fn drop_additional_preserves_retained_lines_when_oversized_line_arrives() {
-        let options = LineCollectionOptions::builder()
-            .max_bytes(10.bytes())
-            .max_lines(100)
-            .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
-            .build();
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 10.bytes(),
+            max_lines: 100,
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
         let mut collected = CollectedLines::new();
 
         collected.push_line("aaa".to_string(), options);
@@ -595,11 +598,11 @@ mod tests {
 
     #[test]
     fn drop_additional_preserves_retained_bytes_when_limit_rejects_line() {
-        let options = LineCollectionOptions::builder()
-            .max_bytes(6.bytes())
-            .max_lines(100)
-            .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
-            .build();
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 6.bytes(),
+            max_lines: 100,
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
         let mut collected = CollectedLines::new();
 
         collected.push_line("aaa".to_string(), options);

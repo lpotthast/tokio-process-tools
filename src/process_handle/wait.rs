@@ -1,4 +1,4 @@
-use super::{ProcessHandle, WaitForCompletionOptions, WaitForCompletionOrTerminateOptions};
+use super::{ProcessHandle, WaitForCompletionOrTerminateOptions};
 use crate::error::{WaitError, WaitOrTerminateError};
 use crate::output_stream::OutputStream;
 use std::io;
@@ -47,8 +47,9 @@ where
     /// [`tokio::process::Child::wait`] and helping avoid deadlocks where the child is waiting for
     /// input while the parent is waiting for exit.
     ///
-    /// If the timeout is reached before the process terminated, an error is returned but the
-    /// process remains untouched / keeps running.
+    /// If the timeout is reached before the process terminated, an error is returned and the
+    /// process keeps running without being signalled or killed. Its stdin has still been closed
+    /// before the wait started.
     /// Use [`ProcessHandle::wait_for_completion_or_terminate`] if you want immediate termination.
     ///
     /// This does not provide the processes output. Use [`ProcessHandle::stdout`] and
@@ -59,9 +60,9 @@ where
     /// Returns [`WaitError`] if waiting for the process fails or the timeout elapses.
     pub async fn wait_for_completion(
         &mut self,
-        options: WaitForCompletionOptions,
+        timeout: Option<Duration>,
     ) -> Result<ExitStatus, WaitError> {
-        self.wait_for_completion_inner(options.timeout).await
+        self.wait_for_completion_inner(timeout).await
     }
 
     pub(super) async fn wait_for_completion_inner(
@@ -230,24 +231,20 @@ mod tests {
     use assertr::prelude::*;
     use tokio::io::AsyncWriteExt;
 
-    fn wait_options(timeout: Option<Duration>) -> WaitForCompletionOptions {
-        WaitForCompletionOptions::builder().timeout(timeout).build()
-    }
-
     fn wait_or_terminate_options(wait_timeout: Duration) -> WaitForCompletionOrTerminateOptions {
-        WaitForCompletionOrTerminateOptions::builder()
-            .wait_timeout(wait_timeout)
-            .interrupt_timeout(Duration::from_secs(1))
-            .terminate_timeout(Duration::from_secs(1))
-            .build()
+        WaitForCompletionOrTerminateOptions {
+            wait_timeout,
+            interrupt_timeout: Duration::from_secs(1),
+            terminate_timeout: Duration::from_secs(1),
+        }
     }
 
     fn line_collection_options() -> LineCollectionOptions {
-        LineCollectionOptions::builder()
-            .max_bytes(1.megabytes())
-            .max_lines(1024)
-            .overflow_behavior(CollectionOverflowBehavior::default())
-            .build()
+        LineCollectionOptions::Bounded {
+            max_bytes: 1.megabytes(),
+            max_lines: 1024,
+            overflow_behavior: CollectionOverflowBehavior::default(),
+        }
     }
 
     #[tokio::test]
@@ -266,7 +263,7 @@ mod tests {
             .unwrap();
 
         process
-            .wait_for_completion(wait_options(Some(Duration::from_secs(2))))
+            .wait_for_completion(Some(Duration::from_secs(2)))
             .await
             .unwrap();
 
@@ -306,7 +303,7 @@ mod tests {
         stdin.flush().await.unwrap();
 
         let status = process
-            .wait_for_completion(wait_options(Some(Duration::from_secs(2))))
+            .wait_for_completion(Some(Duration::from_secs(2)))
             .await
             .unwrap();
 

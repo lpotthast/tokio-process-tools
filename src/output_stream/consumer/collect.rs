@@ -182,3 +182,193 @@ where
         task_termination_sender: Some(term_sig_tx),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CollectorError;
+    use crate::{AsyncChunkCollector, AsyncLineCollector};
+    use assertr::prelude::*;
+    use bytes::Bytes;
+    use std::borrow::Cow;
+    use std::io;
+    use tokio::sync::mpsc;
+
+    async fn event_receiver(events: Vec<StreamEvent>) -> mpsc::Receiver<StreamEvent> {
+        let (tx, rx) = mpsc::channel(events.len().max(1));
+        for event in events {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        rx
+    }
+
+    #[tokio::test]
+    async fn collectors_return_stream_read_error() {
+        let error =
+            crate::StreamReadError::new("custom", io::Error::from(io::ErrorKind::BrokenPipe));
+        let collector = collect_lines(
+            "custom",
+            event_receiver(vec![
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"complete\npartial"))),
+                StreamEvent::ReadError(error),
+            ])
+            .await,
+            Vec::<String>::new(),
+            |line, lines| {
+                lines.push(line.into_owned());
+                Next::Continue
+            },
+            LineParsingOptions::default(),
+        );
+
+        match collector.wait().await {
+            Err(CollectorError::StreamRead { source, .. }) => {
+                assert_that!(source.stream_name()).is_equal_to("custom");
+                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
+            }
+            other => {
+                assert_that!(&other).fail(format_args!(
+                    "expected collector stream read error, got {other:?}"
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collectors_skip_gaps_and_keep_final_unterminated_line() {
+        let collector = collect_lines(
+            "custom",
+            event_receiver(vec![
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"one\npar"))),
+                StreamEvent::Gap,
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"\ntwo\nfinal"))),
+                StreamEvent::Eof,
+            ])
+            .await,
+            Vec::<String>::new(),
+            |line, lines| {
+                lines.push(line.into_owned());
+                Next::Continue
+            },
+            LineParsingOptions::default(),
+        );
+
+        let lines = collector.wait().await.unwrap();
+        assert_that!(lines).contains_exactly(["one", "two", "final"]);
+    }
+
+    struct ExtendChunks;
+
+    impl AsyncChunkCollector<Vec<u8>> for ExtendChunks {
+        async fn collect<'a>(&'a mut self, chunk: Chunk, seen: &'a mut Vec<u8>) -> Next {
+            seen.extend_from_slice(chunk.as_ref());
+            Next::Continue
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_collector_async_extends_sink_until_eof() {
+        let collector = collect_chunks_async(
+            "custom",
+            event_receiver(vec![
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"ab"))),
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"cd"))),
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"ef"))),
+                StreamEvent::Eof,
+            ])
+            .await,
+            Vec::new(),
+            ExtendChunks,
+        );
+
+        let seen = collector.wait().await.unwrap();
+        assert_that!(seen).is_equal_to(b"abcdef".to_vec());
+    }
+
+    #[tokio::test]
+    async fn chunk_collector_accepts_stateful_callback() {
+        let mut chunk_index = 0;
+        let collector = collect_chunks(
+            "custom",
+            event_receiver(vec![
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"ab"))),
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"cd"))),
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"ef"))),
+                StreamEvent::Eof,
+            ])
+            .await,
+            Vec::new(),
+            move |chunk, indexed_chunks| {
+                chunk_index += 1;
+                indexed_chunks.push((chunk_index, chunk.as_ref().to_vec()));
+            },
+        );
+
+        let indexed_chunks = collector.wait().await.unwrap();
+        assert_that!(indexed_chunks).is_equal_to(vec![
+            (1, b"ab".to_vec()),
+            (2, b"cd".to_vec()),
+            (3, b"ef".to_vec()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn line_collector_accepts_stateful_callback() {
+        let mut line_index = 0;
+        let collector = collect_lines(
+            "custom",
+            event_receiver(vec![
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"alpha\nbeta\ngamma\n"))),
+                StreamEvent::Eof,
+            ])
+            .await,
+            Vec::new(),
+            move |line, indexed_lines| {
+                line_index += 1;
+                indexed_lines.push(format!("{line_index}:{line}"));
+                Next::Continue
+            },
+            LineParsingOptions::default(),
+        );
+
+        let indexed_lines = collector.wait().await.unwrap();
+        assert_that!(indexed_lines).is_equal_to(vec![
+            "1:alpha".to_string(),
+            "2:beta".to_string(),
+            "3:gamma".to_string(),
+        ]);
+    }
+
+    struct BreakOnLine;
+
+    impl AsyncLineCollector<Vec<String>> for BreakOnLine {
+        async fn collect<'a>(&'a mut self, line: Cow<'a, str>, seen: &'a mut Vec<String>) -> Next {
+            if line == "break" {
+                seen.push(line.into_owned());
+                Next::Break
+            } else {
+                seen.push(line.into_owned());
+                Next::Continue
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn line_collector_async_break_stops_after_requested_line() {
+        let collector = collect_lines_async(
+            "custom",
+            event_receiver(vec![
+                StreamEvent::Chunk(Chunk(Bytes::from_static(b"start\nbreak\nend\n"))),
+                StreamEvent::Eof,
+            ])
+            .await,
+            Vec::new(),
+            BreakOnLine,
+            LineParsingOptions::default(),
+        );
+
+        let seen = collector.wait().await.unwrap();
+        assert_that!(seen).contains_exactly(["start", "break"]);
+    }
+}

@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::CollectorError;
 
 /// Errors that can occur when terminating a process.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum TerminationError {
     /// Failed to terminate the process after trying all platform termination signals.
     TerminationFailed {
@@ -47,10 +47,8 @@ impl fmt::Display for TerminationError {
     }
 }
 
-impl Error for TerminationError {}
-
 /// A failed operation recorded while attempting to terminate a process.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub struct TerminationAttemptError {
     /// Termination phase where the failure happened.
@@ -60,6 +58,7 @@ pub struct TerminationAttemptError {
     /// Platform signal involved in the failed operation, when applicable.
     pub signal_name: Option<&'static str>,
     /// Original source error.
+    #[source]
     pub source: Box<dyn Error + 'static>,
 }
 
@@ -72,12 +71,6 @@ impl fmt::Display for TerminationAttemptError {
         }
 
         write!(f, ": {}", self.source)
-    }
-}
-
-impl Error for TerminationAttemptError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&*self.source)
     }
 }
 

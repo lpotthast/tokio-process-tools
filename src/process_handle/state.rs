@@ -40,3 +40,54 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::long_running_command;
+    use crate::{
+        AutoName, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, Process, RunningState,
+    };
+    use assertr::prelude::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn is_running_reports_running_before_wait_and_terminated_after_wait() {
+        let mut process = Process::new(long_running_command(Duration::from_secs(1)))
+            .name(AutoName::program_only())
+            .stdout_and_stderr(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .no_replay()
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .unwrap();
+
+        match process.is_running() {
+            RunningState::Running => {}
+            RunningState::Terminated(exit_status) => {
+                assert_that!(exit_status).fail("process should still be running");
+            }
+            RunningState::Uncertain(_) => {
+                assert_that!(&process).fail("process state should not be uncertain");
+            }
+        }
+
+        process.wait_for_completion(None).await.unwrap();
+
+        match process.is_running() {
+            RunningState::Running => {
+                assert_that!(process).fail("process should not be running anymore");
+            }
+            RunningState::Terminated(exit_status) => {
+                assert_that!(exit_status.code()).is_some().is_equal_to(0);
+                assert_that!(exit_status.success()).is_true();
+            }
+            RunningState::Uncertain(_) => {
+                assert_that!(process).fail("process state should not be uncertain");
+            }
+        }
+    }
+}

@@ -48,7 +48,8 @@ of an implicit side effect.
 - Streams emit chunks; line consumers parse those chunks, and a final unterminated line is still surfaced at EOF.
 - Delivery policy decides what happens when active consumers lag behind live process output.
 - Replay policy decides whether consumers created after spawning can see earlier output.
-- Collection options bound retained bytes and lines unless you opt into trusted-output helpers.
+- Collection options bound retained bytes and lines unless you explicitly choose trusted-unbounded
+  collection.
 - `ProcessHandle` remains armed until it is successfully waited, terminated, killed, or `must_not_be_terminated()` is
   called.
 
@@ -74,8 +75,8 @@ When spawning a process, choose the stream settings that match how output will b
 - Use `.reliable_for_active_subscribers()` when active consumers must not miss output.
 - Use replay, such as `.replay_last_bytes(...)`, when startup output must be available to consumers attached after the
   process was spawned.
-- Use bounded collection options for untrusted output, and reserve `*_trusted` helpers for processes
-  whose output volume is known and controlled.
+- Use bounded collection options for untrusted output, and reserve `TrustedUnbounded` options for
+  processes whose output volume is known and controlled.
 
 New consumers start at the earliest output the stream can currently provide. With `.no_replay()`,
 that is live output. With replay enabled and unsealed, it is the oldest retained output. After
@@ -109,14 +110,7 @@ async fn main() {
         .spawn()
         .expect("failed to spawn command");
 
-    let status = process
-        .wait_for_completion(
-            WaitForCompletionOptions::builder()
-                .timeout(None)
-                .build(),
-        )
-        .await
-        .unwrap();
+    let status = process.wait_for_completion(None).await.unwrap();
 
     println!("exit status: {status:?}");
 }
@@ -134,11 +128,11 @@ use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
-    let line_collection = LineCollectionOptions::builder()
-        .max_bytes(1.megabytes())
-        .max_lines(1024)
-        .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
-        .build();
+    let line_collection = LineCollectionOptions::Bounded {
+        max_bytes: 1.megabytes(),
+        max_lines: 1024,
+        overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+    };
 
     let mut process = Process::new(Command::new("ls"))
         .name(AutoName::program_only())
@@ -159,16 +153,12 @@ async fn main() {
         stderr,
     } = process
         .wait_for_completion_with_output(
-            WaitForCompletionWithOutputOptions::builder()
-                .timeout(None)
-                .line_output_options(
-                    LineOutputOptions::builder()
-                        .line_parsing_options(LineParsingOptions::default())
-                        .stdout_collection_options(line_collection)
-                        .stderr_collection_options(line_collection)
-                        .build(),
-                )
-                .build(),
+            None,
+            LineOutputOptions {
+                line_parsing_options: LineParsingOptions::default(),
+                stdout_collection_options: line_collection,
+                stderr_collection_options: line_collection,
+            },
         )
         .await
         .unwrap();
@@ -253,11 +243,11 @@ use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
-    let line_collection = LineCollectionOptions::builder()
-        .max_bytes(1.megabytes())
-        .max_lines(1024)
-        .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
-        .build();
+    let line_collection = LineCollectionOptions::Bounded {
+        max_bytes: 1.megabytes(),
+        max_lines: 1024,
+        overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+    };
 
     let mut process = Process::new(Command::new("cat"))
         .name(AutoName::program_only())
@@ -282,16 +272,12 @@ async fn main() {
 
     let output = process
         .wait_for_completion_with_output(
-            WaitForCompletionWithOutputOptions::builder()
-                .timeout(None)
-                .line_output_options(
-                    LineOutputOptions::builder()
-                        .line_parsing_options(LineParsingOptions::default())
-                        .stdout_collection_options(line_collection)
-                        .stderr_collection_options(line_collection)
-                        .build(),
-                )
-                .build(),
+            None,
+            LineOutputOptions {
+                line_parsing_options: LineParsingOptions::default(),
+                stdout_collection_options: line_collection,
+                stderr_collection_options: line_collection,
+            },
         )
         .await
         .unwrap();
@@ -323,13 +309,11 @@ async fn main() {
         .expect("failed to spawn command");
 
     match process
-        .wait_for_completion_or_terminate(
-            WaitForCompletionOrTerminateOptions::builder()
-                .wait_timeout(Duration::from_secs(30))
-                .interrupt_timeout(Duration::from_secs(3))
-                .terminate_timeout(Duration::from_secs(5))
-                .build(),
-        )
+        .wait_for_completion_or_terminate(WaitForCompletionOrTerminateOptions {
+            wait_timeout: Duration::from_secs(30),
+            interrupt_timeout: Duration::from_secs(3),
+            terminate_timeout: Duration::from_secs(5),
+        })
         .await
     {
         Ok(status) => println!("completed with status: {status:?}"),
@@ -358,18 +342,23 @@ async fn main() {
 
 ## Further APIs
 
-- Use `wait_for_completion_with_raw_output()`, `wait_for_completion_with_output_trusted()`,
-  `wait_for_completion_with_raw_output_trusted()`,
-  `wait_for_completion_with_output_or_terminate()`,
-  `wait_for_completion_with_output_or_terminate_trusted()`,
-  `wait_for_completion_with_raw_output_or_terminate()`, and
-  `wait_for_completion_with_raw_output_or_terminate_trusted()` for other wait-and-collect
-  combinations.
+- Use `wait_for_completion_with_raw_output()`, `wait_for_completion_with_output_or_terminate()`,
+  and `wait_for_completion_with_raw_output_or_terminate()` for other wait-and-collect
+  combinations. Select `TrustedUnbounded` collection options only when the process and output
+  volume are trusted.
 - Use `inspect_lines()`, `inspect_lines_async()`, `inspect_chunks()`, `inspect_chunks_async()`,
   `collect_lines()`, `collect_lines_async()`, `collect_chunks()`, and `collect_chunks_async()`
   when output handling should run in background tasks instead of a terminal wait helper.
-- Use `Collector::wait()`, `Collector::cancel()`, `Inspector::wait()`, and `Inspector::cancel()`
-  to control those background tasks explicitly.
+- Use `Collector::wait()` and `Inspector::wait()` to wait for background consumers to finish
+  naturally.
+- Use `Collector::cancel()` and `Inspector::cancel()` for cooperative cleanup. Cancellation is
+  observed between stream events, preserves collector sinks, and waits for any in-flight async
+  callback or writer call; it can hang if that work hangs.
+- Use `Collector::abort()` and `Inspector::abort()` when cleanup must be forceful. Abort drops
+  pending async callback/write futures and releases stream subscriptions, but collector
+  sinks/writers are not returned.
+- Use `Collector::cancel_or_abort_after(...)` and `Inspector::cancel_or_abort_after(...)` to try
+  cooperative cancellation first and force-abort if the timeout elapses.
 - Use `collect_lines_into_write()`, `collect_lines_into_write_mapped()`,
   `collect_chunks_into_write()`, and `collect_chunks_into_write_mapped()` to forward output into an
   async writer. `WriteCollectionOptions` controls sink-write failures, and `LineWriteMode`
@@ -408,14 +397,7 @@ async fn main() {
         .spawn()
         .unwrap();
 
-    process
-        .wait_for_completion(
-            WaitForCompletionOptions::builder()
-                .timeout(None)
-                .build(),
-        )
-        .await
-        .unwrap();
+    process.wait_for_completion(None).await.unwrap();
 }
 ```
 
@@ -433,9 +415,10 @@ Canonical naming forms:
 ### Timeout with Automatic Termination
 
 Use `wait_for_completion_or_terminate()` as shown in `Timeout and Cleanup` above when a timeout
-should immediately trigger cleanup. If you also need bounded output collection during that cleanup
-path, use `wait_for_completion_with_output_or_terminate()`,
-`wait_for_completion_with_raw_output_or_terminate()`, or their `*_trusted` variants.
+should immediately trigger cleanup. If you also need output collection during that cleanup path,
+use `wait_for_completion_with_output_or_terminate()` or
+`wait_for_completion_with_raw_output_or_terminate()` with bounded or `TrustedUnbounded`
+collection options.
 
 ### Automatic Termination on Drop
 
@@ -463,8 +446,10 @@ async fn main() {
 ```
 
 By default, dropping a live `ProcessHandle` without a successful terminal wait, `terminate()`, or
-`kill()` triggers best-effort cleanup and then panics. `terminate_on_drop()` replaces that panic
-path with async termination on drop, and it requires a multithreaded Tokio runtime.
+`kill()` triggers best-effort cleanup and then panics. `terminate_on_drop()` attempts async
+termination on drop instead of taking the normal immediate panic path, and it requires a
+multithreaded Tokio runtime. If drop-time termination fails, the inner handle can still remain
+armed and trigger its fallback cleanup/panic path.
 
 If the child must outlive the handle, call `must_not_be_terminated()` before dropping it. That
 suppresses kill/panic-on-drop, but it still drops the library-owned stdio handles. Use

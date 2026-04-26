@@ -1,42 +1,26 @@
 use super::{ActiveSubscriber, ConfiguredShared, read_chunked};
+use crate::AsyncChunkCollector;
 use crate::output_stream::Chunk;
 use crate::output_stream::StreamEvent;
 use crate::output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
-use crate::output_stream::backend::test_support::{
-    FailingWrite, ReadErrorAfterBytes, write_test_data,
-};
-use crate::output_stream::consumer;
-use crate::output_stream::{DeliveryGuarantee, LineWriteMode, Next, ReplayRetention, StreamConfig};
-use crate::{AsyncChunkCollector, AsyncLineCollector};
+use crate::output_stream::backend::test_support::ReadErrorAfterBytes;
+use crate::output_stream::{DeliveryGuarantee, Next, ReplayRetention, StreamConfig};
 use crate::{
-    CollectionOverflowBehavior, CollectorError, DEFAULT_MAX_BUFFERED_CHUNKS,
-    DEFAULT_READ_CHUNK_SIZE, InspectorError, LineCollectionOptions, LineParsingOptions, NumBytes,
-    NumBytesExt, SinkWriteErrorAction, SinkWriteOperation, WaitForLineResult,
-    WriteCollectionOptions,
+    CollectorCancelOutcome, CollectorError, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
+    InspectorCancelOutcome, LineParsingOptions, NumBytes, NumBytesExt, RawCollectionOptions,
+    WaitForLineResult, WriteCollectionOptions,
 };
 use assertr::prelude::*;
-use bytes::Bytes;
-use mockall::{automock, predicate};
-use std::borrow::Cow;
-use std::cell::Cell;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing_test::traced_test;
-
-fn line_collection_options() -> LineCollectionOptions {
-    LineCollectionOptions::builder()
-        .max_bytes(1.megabytes())
-        .max_lines(1024)
-        .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
-        .build()
-}
 
 fn best_effort_no_replay_options() -> StreamConfig {
     best_effort_no_replay_options_with(4.bytes(), 4)
@@ -159,63 +143,49 @@ impl AsyncRead for AlwaysReadyBytes {
     }
 }
 
-struct BreakOnLine;
+struct HangingChunkCollector {
+    entered_tx: Option<oneshot::Sender<()>>,
+}
 
-impl AsyncLineCollector<Vec<String>> for BreakOnLine {
-    async fn collect<'a>(&'a mut self, line: Cow<'a, str>, seen: &'a mut Vec<String>) -> Next {
-        if line == "break" {
-            seen.push(line.into_owned());
-            Next::Break
-        } else {
-            seen.push(line.into_owned());
-            Next::Continue
+impl HangingChunkCollector {
+    fn new(entered_tx: oneshot::Sender<()>) -> Self {
+        Self {
+            entered_tx: Some(entered_tx),
         }
     }
 }
 
-struct WriteLine;
-
-impl AsyncLineCollector<std::fs::File> for WriteLine {
-    async fn collect<'a>(
-        &'a mut self,
-        line: Cow<'a, str>,
-        temp_file: &'a mut std::fs::File,
-    ) -> Next {
-        writeln!(temp_file, "{line}").unwrap();
-        Next::Continue
+impl AsyncChunkCollector<Vec<u8>> for HangingChunkCollector {
+    async fn collect<'a>(&'a mut self, _chunk: Chunk, _seen: &'a mut Vec<u8>) -> Next {
+        if let Some(entered_tx) = self.entered_tx.take() {
+            entered_tx.send(()).unwrap();
+        }
+        std::future::pending::<Next>().await
     }
 }
 
-struct ExtendChunks;
+struct PendingWrite {
+    entered_tx: Option<oneshot::Sender<()>>,
+}
 
-impl AsyncChunkCollector<Vec<u8>> for ExtendChunks {
-    async fn collect<'a>(&'a mut self, chunk: Chunk, seen: &'a mut Vec<u8>) -> Next {
-        seen.extend_from_slice(chunk.as_ref());
-        Next::Continue
+impl PendingWrite {
+    fn new(entered_tx: oneshot::Sender<()>) -> Self {
+        Self {
+            entered_tx: Some(entered_tx),
+        }
     }
 }
 
-#[derive(Default)]
-struct SendOnlyLineSink {
-    lines: Vec<String>,
-    line_count: Cell<usize>,
-}
-
-#[derive(Default)]
-struct SendOnlyWrite {
-    bytes: Vec<u8>,
-    write_calls: Cell<usize>,
-}
-
-impl AsyncWrite for SendOnlyWrite {
+impl AsyncWrite for PendingWrite {
     fn poll_write(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        buf: &[u8],
+        _buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.write_calls.set(self.write_calls.get() + 1);
-        self.bytes.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
+        if let Some(entered_tx) = self.entered_tx.take() {
+            entered_tx.send(()).unwrap();
+        }
+        Poll::Pending
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -264,13 +234,13 @@ async fn typed_no_replay_starts_consumer_at_live_output() {
     write_half.flush().await.unwrap();
     sleep(Duration::from_millis(25)).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     write_half.write_all(b"live").await.unwrap();
     write_half.flush().await.unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"live".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"live".to_vec());
 }
 
 #[tokio::test]
@@ -286,13 +256,13 @@ async fn typed_replay_all_delivers_pre_consumer_output_before_live_output() {
     write_half.flush().await.unwrap();
     sleep(Duration::from_millis(25)).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     write_half.write_all(b"live").await.unwrap();
     write_half.flush().await.unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"oldlive".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"oldlive".to_vec());
 }
 
 #[tokio::test]
@@ -317,7 +287,7 @@ async fn configured_subscription_snapshots_replay_buffer_from_shared_state() {
         assert_that!(state.events.len()).is_equal_to(1);
     }
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
 
     {
         let state = shared
@@ -332,7 +302,7 @@ async fn configured_subscription_snapshots_replay_buffer_from_shared_state() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"oldlive".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"oldlive".to_vec());
 }
 
 #[tokio::test]
@@ -344,16 +314,16 @@ async fn collector_drop_allows_later_collector() {
         best_effort_no_replay_options(),
     );
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     drop(collector);
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"later".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
 }
 
 #[tokio::test]
@@ -365,16 +335,126 @@ async fn collector_cancel_allows_later_collector() {
         best_effort_no_replay_options(),
     );
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
-    assert_that!(collector.cancel().await.unwrap()).is_empty();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"later".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
+}
+
+#[tokio::test]
+async fn collector_cancel_waits_for_hanging_async_collector() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let collector = stream.collect_chunks_async(Vec::new(), HangingChunkCollector::new(entered_tx));
+
+    write_half.write_all(b"ready").await.unwrap();
+    entered_rx.await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_millis(25), collector.cancel()).await;
+    assert_that!(result.is_err()).is_true();
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    write_half.write_all(b"later").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
+}
+
+#[tokio::test]
+async fn collector_abort_releases_single_subscriber_claim() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let collector = stream.collect_chunks_async(Vec::new(), HangingChunkCollector::new(entered_tx));
+
+    write_half.write_all(b"ready").await.unwrap();
+    entered_rx.await.unwrap();
+
+    collector.abort().await;
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    write_half.write_all(b"later").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
+}
+
+#[tokio::test]
+async fn collector_cancel_or_abort_after_returns_cancelled_when_cooperative() {
+    let (read_half, _write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let outcome = collector
+        .cancel_or_abort_after(Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    match outcome {
+        CollectorCancelOutcome::Cancelled(bytes) => {
+            assert_that!(bytes.bytes).is_empty();
+        }
+        CollectorCancelOutcome::Aborted => {
+            assert_that!(()).fail("expected cooperative cancellation");
+        }
+    }
+    wait_for_no_active_consumer(&stream).await;
+}
+
+#[tokio::test]
+async fn collector_cancel_or_abort_after_aborts_hanging_async_collector() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let collector = stream.collect_chunks_async(Vec::new(), HangingChunkCollector::new(entered_tx));
+
+    write_half.write_all(b"ready").await.unwrap();
+    entered_rx.await.unwrap();
+
+    let outcome = collector
+        .cancel_or_abort_after(Duration::from_millis(25))
+        .await
+        .unwrap();
+
+    assert_that!(matches!(outcome, CollectorCancelOutcome::Aborted)).is_true();
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    write_half.write_all(b"later").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
 }
 
 #[tokio::test]
@@ -390,12 +470,12 @@ async fn inspector_drop_allows_later_collector() {
     drop(inspector);
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"later".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
 }
 
 #[tokio::test]
@@ -426,12 +506,133 @@ async fn inspector_wait_cancellation_releases_single_subscriber_claim() {
     assert_that!(result.is_err()).is_true();
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     write_half.write_all(b"later\n").await.unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"later\n".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"later\n".to_vec());
+}
+
+#[tokio::test]
+async fn inspector_cancel_waits_for_hanging_async_callback() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let mut entered_tx = Some(entered_tx);
+    let inspector = stream.inspect_chunks_async(move |_chunk| {
+        if let Some(entered_tx) = entered_tx.take() {
+            entered_tx.send(()).unwrap();
+        }
+        async move { std::future::pending::<Next>().await }
+    });
+
+    write_half.write_all(b"ready").await.unwrap();
+    entered_rx.await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_millis(25), inspector.cancel()).await;
+    assert_that!(result.is_err()).is_true();
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    write_half.write_all(b"later").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
+}
+
+#[tokio::test]
+async fn inspector_abort_releases_single_subscriber_claim() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let mut entered_tx = Some(entered_tx);
+    let inspector = stream.inspect_chunks_async(move |_chunk| {
+        if let Some(entered_tx) = entered_tx.take() {
+            entered_tx.send(()).unwrap();
+        }
+        async move { std::future::pending::<Next>().await }
+    });
+
+    write_half.write_all(b"ready").await.unwrap();
+    entered_rx.await.unwrap();
+
+    inspector.abort().await;
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    write_half.write_all(b"later").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
+}
+
+#[tokio::test]
+async fn inspector_cancel_or_abort_after_returns_cancelled_when_cooperative() {
+    let (read_half, _write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let inspector = stream.inspect_chunks(|_chunk| Next::Continue);
+    let outcome = inspector
+        .cancel_or_abort_after(Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_that!(outcome).is_equal_to(InspectorCancelOutcome::Cancelled);
+    wait_for_no_active_consumer(&stream).await;
+}
+
+#[tokio::test]
+async fn inspector_cancel_or_abort_after_aborts_hanging_callback() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let mut entered_tx = Some(entered_tx);
+    let inspector = stream.inspect_chunks_async(move |_chunk| {
+        if let Some(entered_tx) = entered_tx.take() {
+            entered_tx.send(()).unwrap();
+        }
+        async move { std::future::pending::<Next>().await }
+    });
+
+    write_half.write_all(b"ready").await.unwrap();
+    entered_rx.await.unwrap();
+
+    let outcome = inspector
+        .cancel_or_abort_after(Duration::from_millis(25))
+        .await
+        .unwrap();
+
+    assert_that!(outcome).is_equal_to(InspectorCancelOutcome::Aborted);
+    wait_for_no_active_consumer(&stream).await;
+
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    write_half.write_all(b"later").await.unwrap();
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
 }
 
 #[tokio::test]
@@ -453,12 +654,12 @@ async fn wait_for_line_timeout_allows_later_collector() {
     assert_that!(result).is_equal_to(Ok(WaitForLineResult::Timeout));
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     write_half.write_all(b"ready\n").await.unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"ready\n".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"ready\n".to_vec());
 }
 
 #[tokio::test]
@@ -475,7 +676,7 @@ async fn reader_drains_after_consumer_drop() {
             .build(),
     );
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     drop(collector);
     wait_for_no_active_consumer(&stream).await;
 
@@ -486,12 +687,12 @@ async fn reader_drains_after_consumer_drop() {
         .unwrap();
     sleep(Duration::from_millis(25)).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     write_half.write_all(b"tail").await.unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"tail".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"tail".to_vec());
 }
 
 #[tokio::test]
@@ -503,19 +704,19 @@ async fn no_replay_discards_output_between_consumers() {
         best_effort_no_replay_options(),
     );
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
-    assert_that!(collector.cancel().await.unwrap()).is_empty();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
     wait_for_no_active_consumer(&stream).await;
 
     write_half.write_all(b"idle").await.unwrap();
     write_half.flush().await.unwrap();
     sleep(Duration::from_millis(25)).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_empty();
+    assert_that!(bytes.bytes).is_empty();
 }
 
 #[tokio::test]
@@ -527,19 +728,19 @@ async fn replay_retains_output_between_consumers() {
         reliable_replay_options(ReplayRetention::All),
     );
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
-    assert_that!(collector.cancel().await.unwrap()).is_empty();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
     wait_for_no_active_consumer(&stream).await;
 
     write_half.write_all(b"idle").await.unwrap();
     write_half.flush().await.unwrap();
     sleep(Duration::from_millis(25)).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"idle".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"idle".to_vec());
 }
 
 #[tokio::test]
@@ -551,19 +752,48 @@ async fn replay_retention_limits_later_consumer() {
         reliable_replay_options(ReplayRetention::LastChunks(1)),
     );
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
-    assert_that!(collector.cancel().await.unwrap()).is_empty();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
     wait_for_no_active_consumer(&stream).await;
 
     write_half.write_all(b"aabbcc").await.unwrap();
     write_half.flush().await.unwrap();
     sleep(Duration::from_millis(25)).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"cc".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"cc".to_vec());
+}
+
+#[tokio::test]
+async fn replay_last_bytes_keeps_whole_chunks_covering_boundary() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        StreamConfig::builder()
+            .reliable_for_active_subscribers()
+            .replay_last_bytes(3.bytes())
+            .read_chunk_size(2.bytes())
+            .max_buffered_chunks(4)
+            .build(),
+    );
+
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
+    wait_for_no_active_consumer(&stream).await;
+
+    write_half.write_all(b"aabbcc").await.unwrap();
+    write_half.flush().await.unwrap();
+    sleep(Duration::from_millis(25)).await;
+
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    drop(write_half);
+
+    let bytes = collector.wait().await.unwrap();
+    assert_that!(bytes.bytes).is_equal_to(b"bbcc".to_vec());
 }
 
 #[tokio::test]
@@ -579,11 +809,11 @@ async fn later_consumer_observes_eof() {
     sleep(Duration::from_millis(25)).await;
 
     let bytes = stream
-        .collect_all_chunks_into_vec_trusted()
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
         .wait()
         .await
         .unwrap();
-    assert_that!(bytes).is_empty();
+    assert_that!(bytes.bytes).is_empty();
 }
 
 #[tokio::test]
@@ -596,7 +826,11 @@ async fn later_consumer_observes_read_error() {
 
     sleep(Duration::from_millis(25)).await;
 
-    match stream.collect_all_chunks_into_vec_trusted().wait().await {
+    match stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .wait()
+        .await
+    {
         Err(CollectorError::StreamRead { source, .. }) => {
             assert_that!(source.stream_name()).is_equal_to("custom");
             assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
@@ -630,7 +864,7 @@ async fn configured_subscription_after_seal_starts_live_with_empty_shared_replay
     }
 
     stream.seal_replay();
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
 
     {
         let state = shared
@@ -645,7 +879,7 @@ async fn configured_subscription_after_seal_starts_live_with_empty_shared_replay
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"live".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"live".to_vec());
 }
 
 #[tokio::test]
@@ -657,7 +891,7 @@ async fn configured_second_subscriber_panic_does_not_poison_state_or_stop_reader
         reliable_replay_options(ReplayRetention::All),
     );
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
 
     assert_that_panic_by(|| {
         let _waiter = stream.wait_for_line_with_timeout(
@@ -676,7 +910,7 @@ async fn configured_second_subscriber_panic_does_not_poison_state_or_stop_reader
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"live".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"live".to_vec());
 }
 
 #[tokio::test]
@@ -694,11 +928,11 @@ async fn typed_replay_last_chunks_starts_at_retention_boundary() {
     drop(write_half);
 
     let bytes = stream
-        .collect_all_chunks_into_vec_trusted()
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
         .wait()
         .await
         .unwrap();
-    assert_that!(bytes).is_equal_to(b"bbbb".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"bbbb".to_vec());
 }
 
 #[tokio::test]
@@ -906,94 +1140,6 @@ async fn configured_reader_publishes_read_error_without_panicking() {
 }
 
 #[tokio::test]
-async fn wait_for_line_returns_matched_when_line_appears_before_eof() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let waiter = os.wait_for_line(|line| line.contains("ready"), LineParsingOptions::default());
-
-    write_half.write_all(b"booting\nready\n").await.unwrap();
-    write_half.flush().await.unwrap();
-    drop(write_half);
-
-    let result = waiter.await;
-    assert_that!(result).is_equal_to(Ok(WaitForLineResult::Matched));
-}
-
-#[tokio::test]
-async fn wait_for_line_returns_stream_closed_when_stream_ends_before_match() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let waiter = os.wait_for_line(|line| line.contains("ready"), LineParsingOptions::default());
-
-    write_half
-        .write_all(b"booting\nstill starting\n")
-        .await
-        .unwrap();
-    write_half.flush().await.unwrap();
-    drop(write_half);
-
-    let result = waiter.await;
-    assert_that!(result).is_equal_to(Ok(WaitForLineResult::StreamClosed));
-}
-
-#[tokio::test]
-async fn wait_for_line_returns_matched_for_partial_final_line_at_eof() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let waiter = os.wait_for_line(|line| line.contains("ready"), LineParsingOptions::default());
-
-    write_half.write_all(b"booting\nready").await.unwrap();
-    write_half.flush().await.unwrap();
-    drop(write_half);
-
-    let result = waiter.await;
-    assert_that!(result).is_equal_to(Ok(WaitForLineResult::Matched));
-}
-
-#[tokio::test]
-async fn wait_for_line_with_timeout_returns_timeout_while_stream_stays_open() {
-    let (read_half, _write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let result = os
-        .wait_for_line_with_timeout(
-            |line| line.contains("ready"),
-            LineParsingOptions::default(),
-            Duration::from_millis(25),
-        )
-        .await;
-
-    assert_that!(result).is_equal_to(Ok(WaitForLineResult::Timeout));
-}
-
-#[tokio::test]
 async fn dropping_stream_closes_waiting_subscribers() {
     let (read_half, _write_half) = tokio::io::duplex(64);
     let stream = SingleSubscriberOutputStream::from_stream(
@@ -1012,42 +1158,6 @@ async fn dropping_stream_closes_waiting_subscribers() {
 }
 
 #[tokio::test]
-async fn wait_for_line_subscribes_before_polling() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let stream = SingleSubscriberOutputStream::from_stream(
-        read_half,
-        "custom",
-        best_effort_no_replay_options(),
-    );
-
-    let waiter = stream.wait_for_line(|line| line == "ready", LineParsingOptions::default());
-    write_half.write_all(b"ready\n").await.unwrap();
-    drop(write_half);
-
-    assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Matched));
-}
-
-#[tokio::test]
-async fn wait_for_line_with_timeout_subscribes_before_polling() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let stream = SingleSubscriberOutputStream::from_stream(
-        read_half,
-        "custom",
-        best_effort_no_replay_options(),
-    );
-
-    let waiter = stream.wait_for_line_with_timeout(
-        |line| line == "ready",
-        LineParsingOptions::default(),
-        Duration::from_secs(1),
-    );
-    write_half.write_all(b"ready\n").await.unwrap();
-    drop(write_half);
-
-    assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Matched));
-}
-
-#[tokio::test]
 async fn wait_for_line_claims_receiver_before_polling() {
     let (read_half, _write_half) = tokio::io::duplex(64);
     let stream = SingleSubscriberOutputStream::from_stream(
@@ -1063,113 +1173,6 @@ async fn wait_for_line_claims_receiver_before_polling() {
     })
     .has_type::<String>()
     .is_equal_to(ACTIVE_CONSUMER_PANIC);
-}
-
-#[tokio::test]
-async fn wait_for_line_returns_read_error_when_stream_read_fails() {
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        ReadErrorAfterBytes::new(b"booting\npartial", io::ErrorKind::BrokenPipe),
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let result = os
-        .wait_for_line(|line| line == "partial", LineParsingOptions::default())
-        .await;
-
-    let err = result.expect_err("read failure should be surfaced");
-    assert_that!(err.stream_name()).is_equal_to("custom");
-    assert_that!(err.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-}
-
-#[tokio::test]
-async fn collector_and_inspector_return_read_error_when_stream_read_fails() {
-    let collector_stream = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        ReadErrorAfterBytes::new(b"complete\npartial", io::ErrorKind::BrokenPipe),
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let collector = collector_stream
-        .collect_lines_into_vec(LineParsingOptions::default(), line_collection_options());
-    match collector.wait().await {
-        Err(CollectorError::StreamRead { source, .. }) => {
-            assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!(
-                "expected collector stream read error, got {other:?}"
-            ));
-        }
-    }
-
-    let inspector_stream = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        ReadErrorAfterBytes::new(b"complete\npartial", io::ErrorKind::BrokenPipe),
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let inspector =
-        inspector_stream.inspect_lines(|_line| Next::Continue, LineParsingOptions::default());
-    match inspector.wait().await {
-        Err(InspectorError::StreamRead { source, .. }) => {
-            assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!(
-                "expected inspector stream read error, got {other:?}"
-            ));
-        }
-    }
-}
-
-#[tokio::test]
-async fn wait_for_line_returns_stream_closed_when_stream_ends_after_writes_without_match() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    write_half.write_all(b"booting\n").await.unwrap();
-    write_half.flush().await.unwrap();
-    drop(write_half);
-
-    // The terminal EOF event is retained even when chunk replay is disabled, so a later
-    // consumer still observes stream closure.
-    let result = os
-        .wait_for_line(|line| line.contains("ready"), LineParsingOptions::default())
-        .await;
-
-    assert_that!(result).is_equal_to(Ok(WaitForLineResult::StreamClosed));
-}
-
-#[tokio::test]
-async fn wait_for_line_does_not_match_across_explicit_gap_event() {
-    let (tx, rx) = mpsc::channel::<StreamEvent>(4);
-
-    tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"rea"))))
-        .await
-        .unwrap();
-    tx.send(StreamEvent::Gap).await.unwrap();
-    tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"dy\n"))))
-        .await
-        .unwrap();
-    tx.send(StreamEvent::Eof).await.unwrap();
-    drop(tx);
-
-    let result =
-        consumer::wait::wait_for_line(rx, |line| line == "ready", LineParsingOptions::default())
-            .await;
-
-    assert_that!(result).is_equal_to(Ok(WaitForLineResult::StreamClosed));
 }
 
 #[tokio::test]
@@ -1221,194 +1224,7 @@ async fn handles_backpressure_by_dropping_newer_chunks_after_channel_buffer_fill
 }
 
 #[tokio::test]
-async fn inspect_lines() {
-    #[automock]
-    trait LineVisitor {
-        fn visit(&self, line: String);
-    }
-
-    #[rustfmt::skip]
-        fn configure(mock: &mut MockLineVisitor) {
-            mock.expect_visit().with(predicate::eq("Cargo.lock".to_string())).times(1).return_const(());
-            mock.expect_visit().with(predicate::eq("Cargo.toml".to_string())).times(1).return_const(());
-            mock.expect_visit().with(predicate::eq("README.md".to_string())).times(1).return_const(());
-            mock.expect_visit().with(predicate::eq("src".to_string())).times(1).return_const(());
-            mock.expect_visit().with(predicate::eq("target".to_string())).times(1).return_const(());
-        }
-
-    let (read_half, write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let mut mock = MockLineVisitor::new();
-    configure(&mut mock);
-
-    let inspector = os.inspect_lines(
-        move |line| {
-            mock.visit(line.into_owned());
-            Next::Continue
-        },
-        LineParsingOptions::default(),
-    );
-
-    tokio::spawn(write_test_data(write_half)).await.unwrap();
-
-    inspector.cancel().await.unwrap();
-    drop(os);
-}
-
-#[tokio::test]
-async fn inspect_chunks_accepts_stateful_callback() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        2.bytes(),
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let (count_tx, count_rx) = oneshot::channel();
-    let mut chunk_count = 0;
-    let mut count_tx = Some(count_tx);
-    let inspector = os.inspect_chunks(move |_chunk| {
-        chunk_count += 1;
-        if chunk_count == 3 {
-            count_tx.take().unwrap().send(chunk_count).unwrap();
-            Next::Break
-        } else {
-            Next::Continue
-        }
-    });
-
-    write_half.write_all(b"abcdef").await.unwrap();
-    drop(write_half);
-
-    inspector.wait().await.unwrap();
-    let chunk_count = count_rx.await.unwrap();
-    assert_that!(chunk_count).is_equal_to(3);
-    drop(os);
-}
-
-#[tokio::test]
-async fn inspect_chunks_async_accepts_stateful_callback() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        2.bytes(),
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-    let seen_in_task = Arc::clone(&seen);
-    let mut chunk_count = 0;
-    let inspector = os.inspect_chunks_async(move |chunk| {
-        chunk_count += 1;
-        let seen = Arc::clone(&seen_in_task);
-        let bytes = chunk.as_ref().to_vec();
-        let should_break = chunk_count == 3;
-        async move {
-            seen.lock().expect("lock").push(bytes);
-            if should_break {
-                Next::Break
-            } else {
-                Next::Continue
-            }
-        }
-    });
-
-    write_half.write_all(b"abcdefgh").await.unwrap();
-    drop(write_half);
-
-    inspector.wait().await.unwrap();
-
-    let seen = seen.lock().expect("lock").clone();
-    assert_that!(seen).is_equal_to(vec![b"ab".to_vec(), b"cd".to_vec(), b"ef".to_vec()]);
-    drop(os);
-}
-
-/// This tests that our impl macros properly `break 'outer`, as they might be in an inner loop!
-/// With `break` instead of `break 'outer`, this test would never complete, as the `Next::Break`
-/// would not terminate the collector!
-#[tokio::test]
-#[traced_test]
-async fn inspect_lines_async() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        32.bytes(),
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let seen: Vec<String> = Vec::new();
-    let collector = os.collect_lines_async(seen, BreakOnLine, LineParsingOptions::default());
-
-    let _writer = tokio::spawn(async move {
-        write_half.write_all("start\n".as_bytes()).await.unwrap();
-        write_half.write_all("break\n".as_bytes()).await.unwrap();
-        write_half.write_all("end\n".as_bytes()).await.unwrap();
-
-        loop {
-            write_half
-                .write_all("gibberish\n".as_bytes())
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    });
-
-    let seen = collector.wait().await.unwrap();
-
-    assert_that!(seen).contains_exactly(["start", "break"]);
-}
-
-#[tokio::test]
-async fn inspect_lines_async_preserves_unterminated_final_line() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-    let seen_in_task = Arc::clone(&seen);
-    let inspector = os.inspect_lines_async(
-        move |line| {
-            let seen = Arc::clone(&seen_in_task);
-            let line = line.into_owned();
-            async move {
-                seen.lock().expect("lock").push(line);
-                Next::Continue
-            }
-        },
-        LineParsingOptions::default(),
-    );
-
-    write_half.write_all(b"tail").await.unwrap();
-    write_half.flush().await.unwrap();
-    drop(write_half);
-
-    inspector.wait().await.unwrap();
-
-    let seen = seen.lock().expect("lock").clone();
-    assert_that!(seen).contains_exactly(["tail"]);
-    drop(os);
-}
-
-#[tokio::test]
-async fn inspect_chunks_async_wait_cancellation_releases_single_subscriber_claim() {
+async fn writer_collector_cancel_or_abort_after_aborts_pending_write() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream = SingleSubscriberOutputStream::from_stream(
         read_half,
@@ -1417,525 +1233,28 @@ async fn inspect_chunks_async_wait_cancellation_releases_single_subscriber_claim
     );
 
     let (entered_tx, entered_rx) = oneshot::channel();
-    let mut entered_tx = Some(entered_tx);
-    let inspector = stream.inspect_chunks_async(move |_chunk| {
-        if let Some(entered_tx) = entered_tx.take() {
-            entered_tx.send(()).unwrap();
-        }
-        async move { std::future::pending::<Next>().await }
-    });
+    let collector = stream.collect_chunks_into_write(
+        PendingWrite::new(entered_tx),
+        WriteCollectionOptions::fail_fast(),
+    );
 
     write_half.write_all(b"ready").await.unwrap();
-    write_half.flush().await.unwrap();
     entered_rx.await.unwrap();
 
-    let result = tokio::time::timeout(Duration::from_millis(25), inspector.wait()).await;
-    assert_that!(result.is_err()).is_true();
+    let outcome = collector
+        .cancel_or_abort_after(Duration::from_millis(25))
+        .await
+        .unwrap();
+
+    assert_that!(matches!(outcome, CollectorCancelOutcome::Aborted)).is_true();
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_all_chunks_into_vec_trusted();
+    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes).is_equal_to(b"later".to_vec());
-}
-
-#[tokio::test]
-async fn collect_chunks_async_into_vec() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        2.bytes(),
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let collector = os.collect_chunks_async(Vec::new(), ExtendChunks);
-
-    write_half.write_all(b"abcdef").await.unwrap();
-    drop(write_half);
-
-    let seen = collector.wait().await.unwrap();
-    assert_that!(seen).is_equal_to(b"abcdef".to_vec());
-}
-
-#[tokio::test]
-async fn collect_chunks_accepts_stateful_callback() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        2.bytes(),
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let mut chunk_index = 0;
-    let collector = os.collect_chunks(Vec::new(), move |chunk, indexed_chunks| {
-        chunk_index += 1;
-        indexed_chunks.push((chunk_index, chunk.as_ref().to_vec()));
-    });
-
-    write_half.write_all(b"abcdef").await.unwrap();
-    drop(write_half);
-
-    let indexed_chunks = collector.wait().await.unwrap();
-    assert_that!(indexed_chunks).is_equal_to(vec![
-        (1, b"ab".to_vec()),
-        (2, b"cd".to_vec()),
-        (3, b"ef".to_vec()),
-    ]);
-}
-
-#[tokio::test]
-async fn collect_lines_to_file() {
-    let (read_half, write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        32,
-    );
-
-    let temp_file = tempfile::tempfile().unwrap();
-    let collector = os.collect_lines(
-        temp_file,
-        |line, temp_file| {
-            writeln!(temp_file, "{line}").unwrap();
-            Next::Continue
-        },
-        LineParsingOptions::default(),
-    );
-
-    tokio::spawn(write_test_data(write_half)).await.unwrap();
-
-    let mut temp_file = collector.cancel().await.unwrap();
-    temp_file.seek(SeekFrom::Start(0)).unwrap();
-    let mut contents = String::new();
-    temp_file.read_to_string(&mut contents).unwrap();
-
-    assert_that!(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
-}
-
-#[tokio::test]
-async fn collect_lines_accepts_stateful_callback() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let mut line_index = 0;
-    let collector = os.collect_lines(
-        Vec::new(),
-        move |line, indexed_lines| {
-            line_index += 1;
-            indexed_lines.push(format!("{line_index}:{line}"));
-            Next::Continue
-        },
-        LineParsingOptions::default(),
-    );
-
-    write_half.write_all(b"alpha\nbeta\ngamma\n").await.unwrap();
-    drop(write_half);
-
-    let indexed_lines = collector.wait().await.unwrap();
-    assert_that!(indexed_lines).is_equal_to(vec![
-        "1:alpha".to_string(),
-        "2:beta".to_string(),
-        "3:gamma".to_string(),
-    ]);
-}
-
-#[tokio::test]
-async fn collect_lines_accepts_send_only_sink() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let collector = os.collect_lines(
-        SendOnlyLineSink::default(),
-        |line, sink| {
-            sink.lines.push(line.into_owned());
-            sink.line_count.set(sink.line_count.get() + 1);
-            Next::Continue
-        },
-        LineParsingOptions::default(),
-    );
-
-    write_half.write_all(b"alpha\nbeta").await.unwrap();
-    drop(write_half);
-
-    let sink = collector.wait().await.unwrap();
-    assert_that!(sink.lines).is_equal_to(vec!["alpha".to_string(), "beta".to_string()]);
-    assert_that!(sink.line_count.get()).is_equal_to(2);
-}
-
-#[tokio::test]
-async fn collect_lines_async_to_file() {
-    let (read_half, write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        32.bytes(),
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let temp_file = tempfile::tempfile().unwrap();
-    let collector = os.collect_lines_async(temp_file, WriteLine, LineParsingOptions::default());
-
-    tokio::spawn(write_test_data(write_half)).await.unwrap();
-
-    let mut temp_file = collector.cancel().await.unwrap();
-    temp_file.seek(SeekFrom::Start(0)).unwrap();
-    let mut contents = String::new();
-    temp_file.read_to_string(&mut contents).unwrap();
-
-    assert_that!(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
-}
-
-#[tokio::test]
-async fn collect_lines_into_write_respects_requested_line_delimiter_mode() {
-    let (read_half, write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let temp_file = tokio::fs::File::from_std(tempfile::tempfile().unwrap());
-    let collector = os.collect_lines_into_write(
-        temp_file,
-        LineParsingOptions::default(),
-        LineWriteMode::AsIs,
-        WriteCollectionOptions::fail_fast(),
-    );
-
-    tokio::spawn(write_test_data(write_half)).await.unwrap();
-
-    let mut temp_file = collector.cancel().await.unwrap();
-    temp_file.seek(SeekFrom::Start(0)).await.unwrap();
-    let mut contents = String::new();
-    temp_file.read_to_string(&mut contents).await.unwrap();
-
-    assert_that!(contents).is_equal_to("Cargo.lockCargo.tomlREADME.mdsrctarget");
-}
-
-#[tokio::test]
-async fn collect_chunks_into_write_accepts_send_only_writer() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let collector = os.collect_chunks_into_write(
-        SendOnlyWrite::default(),
-        WriteCollectionOptions::fail_fast(),
-    );
-
-    write_half.write_all(b"abcdef").await.unwrap();
-    drop(write_half);
-
-    let writer = collector.wait().await.unwrap();
-    assert_that!(writer.bytes).is_equal_to(b"abcdef".to_vec());
-    assert_that!(writer.write_calls.get()).is_greater_than(0);
-}
-
-#[tokio::test]
-#[traced_test]
-async fn collect_chunks_into_write_mapped() {
-    let (read_half, write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::BestEffort,
-        32.bytes(),
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-
-    let temp_file = tokio::fs::File::options()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .read(true)
-        .open(std::env::temp_dir().join(
-            "tokio_process_tools_test_single_subscriber_collect_chunks_into_write_mapped.txt",
-        ))
-        .await
-        .unwrap();
-
-    let collector = os.collect_chunks_into_write_mapped(
-        temp_file,
-        |chunk| String::from_utf8_lossy(chunk.as_ref()).to_string(),
-        WriteCollectionOptions::fail_fast(),
-    );
-
-    tokio::spawn(write_test_data(write_half)).await.unwrap();
-
-    let mut temp_file = collector.cancel().await.unwrap();
-    temp_file.seek(SeekFrom::Start(0)).await.unwrap();
-    let mut contents = String::new();
-    temp_file.read_to_string(&mut contents).await.unwrap();
-
-    assert_that!(contents).is_equal_to("Cargo.lock\nCargo.toml\nREADME.md\nsrc\ntarget\n");
-}
-
-#[tokio::test]
-async fn collect_chunks_into_write_returns_sink_write_error() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::ReliableForActiveSubscribers,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let collector = os.collect_chunks_into_write(
-        FailingWrite::new(0, io::ErrorKind::BrokenPipe),
-        WriteCollectionOptions::fail_fast(),
-    );
-
-    write_half.write_all(b"abc").await.unwrap();
-    drop(write_half);
-
-    match collector.wait().await {
-        Err(CollectorError::SinkWrite {
-            stream_name,
-            source,
-        }) => {
-            assert_that!(stream_name).is_equal_to("custom");
-            assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-        }
-    }
-}
-
-#[tokio::test]
-async fn collect_chunks_into_write_mapped_returns_sink_write_error() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::ReliableForActiveSubscribers,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let collector = os.collect_chunks_into_write_mapped(
-        FailingWrite::new(0, io::ErrorKind::ConnectionReset),
-        |chunk| chunk,
-        WriteCollectionOptions::fail_fast(),
-    );
-
-    write_half.write_all(b"abc").await.unwrap();
-    drop(write_half);
-
-    match collector.wait().await {
-        Err(CollectorError::SinkWrite { source, .. }) => {
-            assert_that!(source.kind()).is_equal_to(io::ErrorKind::ConnectionReset);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-        }
-    }
-}
-
-#[tokio::test]
-async fn collect_lines_into_write_returns_sink_write_error_for_line_bytes() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::ReliableForActiveSubscribers,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let collector = os.collect_lines_into_write(
-        FailingWrite::new(0, io::ErrorKind::BrokenPipe),
-        LineParsingOptions::default(),
-        LineWriteMode::AppendLf,
-        WriteCollectionOptions::fail_fast(),
-    );
-
-    write_half.write_all(b"one\n").await.unwrap();
-    drop(write_half);
-
-    match collector.wait().await {
-        Err(CollectorError::SinkWrite { source, .. }) => {
-            assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-        }
-    }
-}
-
-#[tokio::test]
-async fn collect_lines_into_write_returns_sink_write_error_for_appended_delimiter() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::ReliableForActiveSubscribers,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let collector = os.collect_lines_into_write(
-        FailingWrite::new(1, io::ErrorKind::WriteZero),
-        LineParsingOptions::default(),
-        LineWriteMode::AppendLf,
-        WriteCollectionOptions::fail_fast(),
-    );
-
-    write_half.write_all(b"one\n").await.unwrap();
-    drop(write_half);
-
-    match collector.wait().await {
-        Err(CollectorError::SinkWrite { source, .. }) => {
-            assert_that!(source.kind()).is_equal_to(io::ErrorKind::WriteZero);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-        }
-    }
-}
-
-#[tokio::test]
-async fn collect_lines_into_write_mapped_returns_sink_write_error() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::ReliableForActiveSubscribers,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let collector = os.collect_lines_into_write_mapped(
-        FailingWrite::new(0, io::ErrorKind::BrokenPipe),
-        |line| line.into_owned().into_bytes(),
-        LineParsingOptions::default(),
-        LineWriteMode::AsIs,
-        WriteCollectionOptions::fail_fast(),
-    );
-
-    write_half.write_all(b"one\n").await.unwrap();
-    drop(write_half);
-
-    match collector.wait().await {
-        Err(CollectorError::SinkWrite { source, .. }) => {
-            assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-        }
-    }
-}
-
-#[tokio::test]
-async fn write_error_handler_can_continue_after_sink_write_errors() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::ReliableForActiveSubscribers,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let handled_events = Arc::clone(&events);
-    let collector = os.collect_lines_into_write(
-        FailingWrite::new(0, io::ErrorKind::BrokenPipe),
-        LineParsingOptions::default(),
-        LineWriteMode::AppendLf,
-        WriteCollectionOptions::with_error_handler(move |err| {
-            handled_events.lock().unwrap().push((
-                err.stream_name(),
-                err.operation(),
-                err.attempted_len(),
-                err.source().kind(),
-            ));
-            SinkWriteErrorAction::Continue
-        }),
-    );
-
-    write_half.write_all(b"a\nb\n").await.unwrap();
-    drop(write_half);
-
-    let write = collector.wait().await.unwrap();
-    assert_that!(write.bytes_written).is_equal_to(0);
-    assert_that!(events.lock().unwrap().as_slice()).is_equal_to([
-        (
-            "custom",
-            SinkWriteOperation::Line,
-            1,
-            io::ErrorKind::BrokenPipe,
-        ),
-        (
-            "custom",
-            SinkWriteOperation::Line,
-            1,
-            io::ErrorKind::BrokenPipe,
-        ),
-    ]);
-}
-
-#[tokio::test]
-async fn write_error_handler_can_continue_then_stop() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let os = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::ReliableForActiveSubscribers,
-        1.bytes(),
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let handled_count = Arc::new(Mutex::new(0_usize));
-    let count_for_handler = Arc::clone(&handled_count);
-    let collector = os.collect_chunks_into_write(
-        FailingWrite::new(0, io::ErrorKind::BrokenPipe),
-        WriteCollectionOptions::with_error_handler(move |err| {
-            assert_that!(err.operation()).is_equal_to(SinkWriteOperation::Chunk);
-            let mut count = count_for_handler.lock().unwrap();
-            *count += 1;
-            if *count == 1 {
-                SinkWriteErrorAction::Continue
-            } else {
-                SinkWriteErrorAction::Stop
-            }
-        }),
-    );
-
-    write_half.write_all(b"ab").await.unwrap();
-    drop(write_half);
-
-    match collector.wait().await {
-        Err(CollectorError::SinkWrite { source, .. }) => {
-            assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-        }
-    }
-    assert_that!(*handled_count.lock().unwrap()).is_equal_to(2);
+    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
 }
 
 #[tokio::test]
@@ -1958,31 +1277,4 @@ async fn multiple_subscribers_are_not_possible() {
     })
     .has_type::<String>()
     .is_equal_to(ACTIVE_CONSUMER_PANIC);
-}
-
-#[tokio::test]
-async fn bounded_line_collection_drains_until_eof_after_limit_is_reached() {
-    let (read_half, mut write_half) = tokio::io::duplex(64);
-    let stream = SingleSubscriberOutputStream::from_stream_with_delivery_guarantee(
-        read_half,
-        "custom",
-        DeliveryGuarantee::ReliableForActiveSubscribers,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS,
-    );
-    let collector = stream.collect_lines_into_vec(
-        LineParsingOptions::default(),
-        LineCollectionOptions::builder()
-            .max_bytes(3.bytes())
-            .max_lines(1)
-            .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
-            .build(),
-    );
-
-    write_half.write_all(b"one\ntwo\nthree\n").await.unwrap();
-    drop(write_half);
-
-    let collected = collector.wait().await.unwrap();
-    assert_that!(collected.lines().iter().map(String::as_str)).contains_exactly(["one"]);
-    assert_that!(collected.truncated()).is_true();
 }

@@ -263,7 +263,7 @@ impl SingleSubscriberOutputStream {
     }
 }
 
-impl crate::output_stream::backend::consumer_api::SubscribableOutputStream
+impl crate::output_stream::consumer::api::SubscribableOutputStream
     for SingleSubscriberOutputStream
 {
     fn subscribe_for_consumer(&self) -> impl crate::output_stream::subscription::EventSubscription {
@@ -271,7 +271,7 @@ impl crate::output_stream::backend::consumer_api::SubscribableOutputStream
     }
 }
 
-crate::output_stream::backend::consumer_api::impl_output_stream_consumer_api! {
+crate::output_stream::consumer::api::impl_output_stream_consumer_api! {
     impl SingleSubscriberOutputStream
 }
 

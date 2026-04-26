@@ -5,6 +5,7 @@ mod support;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::time::Duration;
+use tokio_process_tools::RawCollectionOptions;
 
 fn bench_chunk_delivery(c: &mut Criterion) {
     let rt = support::runtime();
@@ -26,7 +27,7 @@ fn bench_chunk_delivery(c: &mut Criterion) {
                         read_chunk_size,
                     );
                     let delivered_bytes = stream
-                        .collect_all_chunks_into_vec_trusted()
+                        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
                         .wait()
                         .await
                         .unwrap()
@@ -46,7 +47,7 @@ fn bench_chunk_delivery(c: &mut Criterion) {
                         read_chunk_size,
                     );
                     let delivered_bytes = stream
-                        .collect_all_chunks_into_vec_trusted()
+                        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
                         .wait()
                         .await
                         .unwrap()

@@ -108,16 +108,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broadcast::BroadcastOutputStream;
     use crate::test_support::long_running_command;
-    use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, WaitForCompletionOptions};
+    use crate::{
+        BestEffortDelivery, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NoReplay,
+    };
     use assertr::prelude::*;
 
-    fn wait_options(timeout: Option<Duration>) -> WaitForCompletionOptions {
-        WaitForCompletionOptions::builder().timeout(timeout).build()
-    }
-
     fn spawn_long_running_process()
-    -> crate::BroadcastProcessHandle<crate::BestEffortDelivery, crate::NoReplay> {
+    -> ProcessHandle<BroadcastOutputStream<BestEffortDelivery, NoReplay>> {
         crate::Process::new(long_running_command(Duration::from_secs(5)))
             .name("long-running")
             .stdout_and_stderr(|stream| {
@@ -192,10 +191,7 @@ mod tests {
         assert_that!(&process.panic_on_drop).is_none();
 
         process.kill().await.unwrap();
-        process
-            .wait_for_completion(wait_options(None))
-            .await
-            .unwrap();
+        process.wait_for_completion(None).await.unwrap();
     }
 
     #[cfg(unix)]

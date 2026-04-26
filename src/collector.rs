@@ -3,6 +3,7 @@ use crate::output_stream::{Chunk, Next};
 use std::borrow::Cow;
 use std::future::Future;
 use std::io;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
@@ -64,6 +65,16 @@ pub trait Sink: Send + 'static {}
 
 impl<T> Sink for T where T: Send + 'static {}
 
+/// The result of [`Collector::cancel_or_abort_after`].
+#[derive(Debug)]
+pub enum CollectorCancelOutcome<S: Sink> {
+    /// The collector observed cooperative cancellation before the timeout and returned its sink.
+    Cancelled(S),
+
+    /// The timeout elapsed, so the collector task was aborted and its sink was dropped.
+    Aborted,
+}
+
 /// An async collector for raw output chunks.
 ///
 /// The collector itself may hold state via `&mut self`, but only the sink `S` is returned from
@@ -109,7 +120,9 @@ pub trait AsyncLineCollector<S: Sink>: Send + 'static {
 ///
 /// For proper cleanup, call
 /// - `wait()`, which waits for the collection task to complete.
-/// - `cancel()`, which sends a termination signal and then waits for the collection task to complete.
+/// - `cancel()`, which asks the collector to stop and then waits for cooperative completion.
+/// - `abort()`, which forcefully aborts the collector task.
+/// - `cancel_or_abort_after()`, which tries cooperative cancellation first and aborts on timeout.
 ///
 /// If not cleaned up, the termination signal will be sent when dropping this collector,
 /// but the task will be aborted (forceful, not waiting for its regular completion).
@@ -138,6 +151,14 @@ struct CollectorWaitGuard<S: Sink> {
 }
 
 impl<S: Sink> CollectorWaitGuard<S> {
+    fn cancel(&mut self) {
+        let _res = self
+            .task_termination_sender
+            .take()
+            .expect("`task_termination_sender` to be present.")
+            .send(());
+    }
+
     async fn wait(&mut self, stream_name: &'static str) -> Result<S, CollectorError> {
         let sink = self
             .task
@@ -201,13 +222,17 @@ impl<S: Sink> Collector<S> {
         }
     }
 
-    /// Checks if this task has finished.
+    /// Returns whether the collector task has finished.
+    ///
+    /// This is a non-blocking task-state check. A finished collector still owns its task result
+    /// until [`wait`](Self::wait), [`cancel`](Self::cancel), [`abort`](Self::abort), or
+    /// [`cancel_or_abort_after`](Self::cancel_or_abort_after) consumes it.
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.task.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// Wait for the collector to terminate naturally.
+    /// Waits for the collector to terminate naturally and returns its sink.
     ///
     /// A collector will automatically terminate when either:
     ///
@@ -215,7 +240,8 @@ impl<S: Sink> Collector<S> {
     /// 2. The underlying stream is closed (by receiving an EOF / final read of 0 bytes).
     /// 3. The first `Next::Break` is observed.
     ///
-    /// If none of these may occur in your case, this could/will hang forever!
+    /// If none of these may occur in your case, this can hang forever. `wait` also waits for any
+    /// in-flight async collector callback or writer call to complete.
     ///
     /// The stdout/stderr streams naturally close when the process is terminated, so `wait`ing
     /// on a collector after termination is fine:
@@ -243,11 +269,11 @@ impl<S: Sink> Collector<S> {
     ///     .unwrap();
     /// let collector = process.stdout().collect_lines_into_vec(
     ///     LineParsingOptions::default(),
-    ///     LineCollectionOptions::builder()
-    ///         .max_bytes(1.megabytes())
-    ///         .max_lines(1024)
-    ///         .overflow_behavior(CollectionOverflowBehavior::DropAdditionalData)
-    ///         .build(),
+    ///     LineCollectionOptions::Bounded {
+    ///         max_bytes: 1.megabytes(),
+    ///         max_lines: 1024,
+    ///         overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+    ///     },
     /// );
     /// process.terminate(Duration::from_secs(1), Duration::from_secs(1)).await.unwrap();
     /// let collected = collector.wait().await.unwrap(); // This will return immediately.
@@ -268,7 +294,16 @@ impl<S: Sink> Collector<S> {
         self.into_wait().wait().await
     }
 
-    /// Sends a cancellation event to the collector, letting it shut down.
+    /// Sends a cooperative cancellation event to the collector and returns its sink.
+    ///
+    /// Cancellation is observed only between stream events. If an async collector callback or
+    /// writer call is already in progress, `cancel` waits for that work to finish before the
+    /// collector can observe cancellation. As a result, `cancel` can hang if the in-flight
+    /// callback or writer future hangs.
+    ///
+    /// The sink is preserved and returned only after the collector task exits normally. For
+    /// bounded cleanup that can sacrifice sink recovery, use [`abort`](Self::abort) or
+    /// [`cancel_or_abort_after`](Self::cancel_or_abort_after).
     ///
     /// # Errors
     ///
@@ -280,21 +315,64 @@ impl<S: Sink> Collector<S> {
     /// # Panics
     ///
     /// Panics if the collector's internal cancellation sender has already been taken.
-    pub async fn cancel(mut self) -> Result<S, CollectorError> {
-        // We ignore any potential error here.
-        // Sending may fail if the task is already terminated (for example, by reaching EOF),
-        // which in turn dropped the receiver end!
-        let _res = self
-            .task_termination_sender
-            .take()
-            .expect("`task_termination_sender` to be present.")
-            .send(());
+    pub async fn cancel(self) -> Result<S, CollectorError> {
+        let mut wait = self.into_wait();
+        wait.cancel();
+        wait.wait().await
+    }
 
-        self.wait().await
+    /// Forcefully aborts the collector task.
+    ///
+    /// This drops any pending async collector callback or writer future, releases the stream
+    /// subscription, and drops the sink/writer instead of returning it. It cannot preempt blocking
+    /// synchronous code that never yields to the async runtime.
+    ///
+    /// For single-subscriber streams, the consumer claim is released after the aborted task has
+    /// been joined during this method.
+    pub async fn abort(self) {
+        self.into_wait().abort().await;
+    }
+
+    /// Cooperatively cancels the collector, aborting it if `timeout` elapses first.
+    ///
+    /// Returns [`CollectorCancelOutcome::Cancelled`] with the sink when the collector observes
+    /// cancellation and exits normally before the timeout. Returns
+    /// [`CollectorCancelOutcome::Aborted`] when the timeout elapses; in that case the task is
+    /// aborted, any pending callback/write future is dropped, and the sink/writer is not returned.
+    ///
+    /// Cancellation is still cooperative until the timeout boundary: an in-flight async callback
+    /// or writer call must finish before cancellation can be observed. For single-subscriber
+    /// streams, the consumer claim is released before this method returns, both after successful
+    /// cooperative cancellation and after timeout-driven abort.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CollectorError::TaskJoin`] if the collector task cannot be joined before the
+    /// timeout, [`CollectorError::StreamRead`] if the underlying stream fails while being read
+    /// before cancellation is observed, or [`CollectorError::SinkWrite`] if a writer-backed
+    /// collector stops after a sink write failure before cancellation is observed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the collector's internal cancellation sender has already been taken.
+    pub async fn cancel_or_abort_after(
+        self,
+        timeout: Duration,
+    ) -> Result<CollectorCancelOutcome<S>, CollectorError> {
+        let mut wait = self.into_wait();
+        wait.cancel();
+        match wait.wait_until(Instant::now() + timeout).await? {
+            Some(sink) => Ok(CollectorCancelOutcome::Cancelled(sink)),
+            None => Ok(CollectorCancelOutcome::Aborted),
+        }
     }
 }
 
 impl<S: Sink> CollectorWait<S> {
+    pub(crate) fn cancel(&mut self) {
+        self.guard.cancel();
+    }
+
     pub(crate) async fn wait(&mut self) -> Result<S, CollectorError> {
         self.guard.wait(self.stream_name).await
     }

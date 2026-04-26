@@ -215,37 +215,47 @@ impl ProcessStreamBuilder {
 mod tests {
     use super::*;
     use crate::{NumBytes, NumBytesExt};
+    use assertr::prelude::*;
 
     #[test]
-    #[should_panic(expected = "read_chunk_size must be greater than zero bytes")]
     fn process_stream_builder_panics_on_zero_read_chunk_size() {
-        let _config = ProcessStreamBuilder
-            .single_subscriber()
-            .best_effort_delivery()
-            .no_replay()
-            .read_chunk_size(NumBytes::zero())
-            .max_buffered_chunks(1);
+        assert_that_panic_by(|| {
+            let _config = ProcessStreamBuilder
+                .single_subscriber()
+                .best_effort_delivery()
+                .no_replay()
+                .read_chunk_size(NumBytes::zero())
+                .max_buffered_chunks(1);
+        })
+        .has_type::<String>()
+        .is_equal_to("read_chunk_size must be greater than zero bytes");
     }
 
     #[test]
-    #[should_panic(expected = "max_buffered_chunks must be greater than zero")]
     fn single_subscriber_process_stream_builder_panics_on_zero_max_buffered_chunks() {
-        let _config = ProcessStreamBuilder
-            .single_subscriber()
-            .best_effort_delivery()
-            .no_replay()
-            .read_chunk_size(8.bytes())
-            .max_buffered_chunks(0);
+        assert_that_panic_by(|| {
+            let _config = ProcessStreamBuilder
+                .single_subscriber()
+                .best_effort_delivery()
+                .no_replay()
+                .read_chunk_size(8.bytes())
+                .max_buffered_chunks(0);
+        })
+        .has_type::<String>()
+        .is_equal_to("max_buffered_chunks must be greater than zero");
     }
 
     #[test]
-    #[should_panic(expected = "max_buffered_chunks must be greater than zero")]
     fn broadcast_process_stream_builder_panics_on_zero_max_buffered_chunks() {
-        let _config = ProcessStreamBuilder
-            .broadcast()
-            .best_effort_delivery()
-            .no_replay()
-            .read_chunk_size(8.bytes())
-            .max_buffered_chunks(0);
+        assert_that_panic_by(|| {
+            let _config = ProcessStreamBuilder
+                .broadcast()
+                .best_effort_delivery()
+                .no_replay()
+                .read_chunk_size(8.bytes())
+                .max_buffered_chunks(0);
+        })
+        .has_type::<String>()
+        .is_equal_to("max_buffered_chunks must be greater than zero");
     }
 }

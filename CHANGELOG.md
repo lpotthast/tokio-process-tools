@@ -35,12 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdout and stderr streams.
 - Added `inspect_chunks_async` for asynchronously inspecting raw output chunks without storing
   them.
-- Added bounded in-memory output collection types and options: `RawCollectionOptions`,
+- Added `Collector::abort()`, `Inspector::abort()`,
+  `Collector::cancel_or_abort_after(...)`, and `Inspector::cancel_or_abort_after(...)` for
+  explicit forceful cleanup when cooperative background-consumer cancellation cannot complete.
+- Added in-memory output collection types and options: `RawCollectionOptions`,
   `LineCollectionOptions`, `CollectedBytes`, `CollectedLines`, and
-  `CollectionOverflowBehavior`. Bounded collections expose truncation metadata, and trusted-output
-  helpers preserve the previous unbounded collection behavior under explicit method names.
-- Added required-field builders for `LineParsingOptions`, `LineCollectionOptions`, and process
-  wait/output option structs.
+  `CollectionOverflowBehavior`. Collection options distinguish bounded untrusted output from
+  trusted-unbounded output, and collected output exposes truncation metadata.
+- Added required-field builders for `LineParsingOptions`.
 - Added `WriteCollectionOptions` and public sink write error handler types for configuring whether
   writer collectors stop or continue after individual sink write failures. The options type remains
   generic so custom handlers are statically dispatched and allocation-free.
@@ -73,12 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OutputStream::max_buffered_chunks()`, `DEFAULT_READ_CHUNK_SIZE`, and
   `DEFAULT_MAX_BUFFERED_CHUNKS`.
 - **Breaking:** Replaced `Output` and `RawOutput` with
-  `ProcessOutput<Stdout, Stderr = Stdout>`. Existing helpers now return
-  `ProcessOutput<CollectedLines>`, `ProcessOutput<CollectedBytes>`,
-  `ProcessOutput<Vec<String>>`, or `ProcessOutput<Vec<u8>>`.
-- **Breaking:** Replaced positional `wait_for_completion*` timeout and output arguments with
-  required-field `TypedBuilder` option structs, including concrete line, raw, and trusted-line
-  output wait options.
+  `ProcessOutput<Stdout, Stderr = Stdout>`. Output-collecting wait helpers now return
+  `ProcessOutput<CollectedLines>` or `ProcessOutput<CollectedBytes>`.
+- **Breaking:** Changed process wait helpers to take direct timeout parameters and direct option
+  structs instead of combinatorial `TypedBuilder` wait/output option structs.
 - **Breaking:** Changed `wait_for_line` and `wait_for_line_with_timeout` to return a `LineWaiter`
   future whose output is `Result<WaitForLineResult, StreamReadError>`. The stream subscription or
   single-subscriber receiver claim is created before the returned future is first polled.
@@ -92,8 +92,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chronological `TerminationAttemptError` entries that preserve all recorded source errors.
 - **Breaking:** Changed `collect_chunks_into_vec`, `collect_lines_into_vec`,
   `wait_for_completion_with_output`, and `wait_for_completion_with_raw_output` to require explicit
-  collection limits. Trusted-output-only variants preserve the previous unbounded behavior under
-  explicit `*_trusted` method names.
+  collection options. Removed trusted-output-only variants; use `TrustedUnbounded` collection
+  options to preserve previous unbounded behavior.
 - **Breaking:** Changed `ProcessHandle::into_inner()` to return `(Child, Stdin, Stdout, Stderr)` so
   callers who extract the inner process retain manual control of piped stdin instead of implicitly
   closing it and sending EOF.
@@ -111,9 +111,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Single-subscriber streams now allow one active consumer at a time instead of one consumer for the
   entire stream lifetime. After a collector, inspector, or line waiter completes, is canceled, is
   dropped, or times out, another consumer can attach. Concurrent consumers still panic.
+- Clarified that `Collector::cancel()` and `Inspector::cancel()` are cooperative, wait for
+  in-flight async callbacks or writer calls, and can hang if that work hangs. Collector
+  cancellation continues to return the sink only after normal task completion.
 - Replay-enabled single-subscriber streams retain configured replay history across sequential
   consumers, including output produced while no consumer is active. `.no_replay()` continues to
   discard output drained while no consumer is active.
+- Improved line-delivery throughput for ASCII output by fast-pathing line text conversion while
+  preserving lossy handling for non-ASCII and invalid UTF-8 bytes.
 - Simplified the Criterion benchmark suite to focused chunk-delivery and line-delivery targets for
   the single-subscriber and broadcast backends, added dedicated `just bench-smoke`,
   `just bench-chunks`, and `just bench-lines` commands, and made compile-only benchmark smoke the

@@ -285,100 +285,36 @@ where
 mod tests {
     use super::*;
     use crate::output_stream::collectable::CollectableOutputStream;
+    use crate::test_support::ScriptedOutput;
     use crate::{
         AutoName, AutoNameSettings, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS,
         DEFAULT_READ_CHUNK_SIZE, LineCollectionOptions, LineOutputOptions, LineOverflowBehavior,
-        LineParsingOptions, NumBytes, NumBytesExt, ProcessHandle, ProcessOutput,
-        WaitForCompletionOptions, WaitForCompletionWithOutputOptions,
+        LineParsingOptions, NumBytesExt, ProcessHandle, ProcessOutput,
     };
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::process::Command;
 
-    #[derive(Debug, Clone, Copy)]
-    struct StreamSizing {
-        read_chunk_size: NumBytes,
-        max_buffered_chunks: usize,
-    }
+    fn line_output_options() -> LineOutputOptions {
+        let line_collection_options = LineCollectionOptions::Bounded {
+            max_bytes: 1.megabytes(),
+            max_lines: 1024,
+            overflow_behavior: CollectionOverflowBehavior::default(),
+        };
 
-    #[derive(Debug, Clone, Copy)]
-    struct StreamSizingPair {
-        stdout: StreamSizing,
-        stderr: StreamSizing,
-    }
-
-    impl StreamSizing {
-        fn new(read_chunk_size: NumBytes, max_buffered_chunks: usize) -> Self {
-            Self {
-                read_chunk_size,
-                max_buffered_chunks,
-            }
+        LineOutputOptions {
+            line_parsing_options: LineParsingOptions::builder()
+                .max_line_length(16.kilobytes())
+                .overflow_behavior(LineOverflowBehavior::default())
+                .build(),
+            stdout_collection_options: line_collection_options,
+            stderr_collection_options: line_collection_options,
         }
     }
 
-    impl StreamSizingPair {
-        fn same(read_chunk_size: NumBytes, max_buffered_chunks: usize) -> Self {
-            let sizing = StreamSizing::new(read_chunk_size, max_buffered_chunks);
-            Self {
-                stdout: sizing,
-                stderr: sizing,
-            }
-        }
-
-        fn split(stdout: StreamSizing, stderr: StreamSizing) -> Self {
-            Self { stdout, stderr }
-        }
-    }
-
-    fn line_output_options(timeout: Option<Duration>) -> WaitForCompletionWithOutputOptions {
-        let line_collection_options = LineCollectionOptions::builder()
-            .max_bytes(1.megabytes())
-            .max_lines(1024)
-            .overflow_behavior(CollectionOverflowBehavior::default())
-            .build();
-
-        WaitForCompletionWithOutputOptions::builder()
-            .timeout(timeout)
-            .line_output_options(
-                LineOutputOptions::builder()
-                    .line_parsing_options(
-                        LineParsingOptions::builder()
-                            .max_line_length(16.kilobytes())
-                            .overflow_behavior(LineOverflowBehavior::default())
-                            .build(),
-                    )
-                    .stdout_collection_options(line_collection_options)
-                    .stderr_collection_options(line_collection_options)
-                    .build(),
-            )
-            .build()
-    }
-
-    fn out_and_err_command() -> Command {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("printf 'out\n'; printf 'err\n' >&2");
-        cmd
-    }
-
-    fn assert_process_sizing<Stdout, Stderr>(
-        process: &ProcessHandle<Stdout, Stderr>,
-        expected: StreamSizingPair,
+    async fn assert_successful_completion<Stdout, Stderr>(
+        mut process: ProcessHandle<Stdout, Stderr>,
     ) where
-        Stdout: OutputStream,
-        Stderr: OutputStream,
-    {
-        assert_that!(process.stdout().read_chunk_size())
-            .is_equal_to(expected.stdout.read_chunk_size);
-        assert_that!(process.stdout().max_buffered_chunks())
-            .is_equal_to(expected.stdout.max_buffered_chunks);
-        assert_that!(process.stderr().read_chunk_size())
-            .is_equal_to(expected.stderr.read_chunk_size);
-        assert_that!(process.stderr().max_buffered_chunks())
-            .is_equal_to(expected.stderr.max_buffered_chunks);
-    }
-
-    async fn assert_listing_completion<Stdout, Stderr>(mut process: ProcessHandle<Stdout, Stderr>)
-    where
         Stdout: CollectableOutputStream,
         Stderr: CollectableOutputStream,
     {
@@ -387,7 +323,7 @@ mod tests {
             stdout,
             stderr,
         } = process
-            .wait_for_completion_with_output(line_output_options(None))
+            .wait_for_completion_with_output(None, line_output_options())
             .await
             .unwrap();
 
@@ -403,7 +339,7 @@ mod tests {
         Stderr: CollectableOutputStream,
     {
         let output = process
-            .wait_for_completion_with_output(line_output_options(Some(Duration::from_secs(2))))
+            .wait_for_completion_with_output(Some(Duration::from_secs(2)), line_output_options())
             .await
             .unwrap();
 
@@ -412,379 +348,428 @@ mod tests {
         assert_that!(output.stderr.lines().iter().map(String::as_str)).contains_exactly(["err"]);
     }
 
-    macro_rules! same_backend_smoke_test {
-        ($name:ident, $backend:ident, same_stream, $read_chunk_size:expr, $max_buffered_chunks:expr) => {
-            #[tokio::test]
-            async fn $name() {
-                let process = Process::new(Command::new("ls"))
-                    .name(AutoName::program_only())
-                    .stdout_and_stderr(|stream| {
-                        stream
-                            .$backend()
-                            .best_effort_delivery()
-                            .replay_last_bytes(1.megabytes())
-                            .read_chunk_size($read_chunk_size)
-                            .max_buffered_chunks($max_buffered_chunks)
-                    })
-                    .spawn()
-                    .expect("Failed to spawn");
+    mod same_backend {
+        use super::*;
 
-                assert_process_sizing(
-                    &process,
-                    StreamSizingPair::same($read_chunk_size, $max_buffered_chunks),
-                );
-                assert_listing_completion(process).await;
-            }
-        };
-        (
-            $name:ident,
-            $backend:ident,
-            split_streams,
-            stdout: ($stdout_read_chunk_size:expr, $stdout_max_buffered_chunks:expr),
-            stderr: ($stderr_read_chunk_size:expr, $stderr_max_buffered_chunks:expr)
-        ) => {
-            #[tokio::test]
-            async fn $name() {
-                let process = Process::new(Command::new("ls"))
-                    .name(AutoName::program_only())
-                    .stdout(|stdout| {
-                        stdout
-                            .$backend()
-                            .best_effort_delivery()
-                            .replay_last_bytes(1.megabytes())
-                            .read_chunk_size($stdout_read_chunk_size)
-                            .max_buffered_chunks($stdout_max_buffered_chunks)
-                    })
-                    .stderr(|stderr| {
-                        stderr
-                            .$backend()
-                            .best_effort_delivery()
-                            .replay_last_bytes(1.megabytes())
-                            .read_chunk_size($stderr_read_chunk_size)
-                            .max_buffered_chunks($stderr_max_buffered_chunks)
-                    })
-                    .spawn()
-                    .expect("Failed to spawn");
+        #[tokio::test]
+        async fn shared_broadcast_config_applies_to_stdout_and_stderr() {
+            let process = Process::new(ScriptedOutput::builder().stdout("out\n").build())
+                .name(AutoName::program_only())
+                .stdout_and_stderr(|stream| {
+                    stream
+                        .broadcast()
+                        .best_effort_delivery()
+                        .replay_last_bytes(1.megabytes())
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+                .expect("Failed to spawn");
 
-                assert_process_sizing(
-                    &process,
-                    StreamSizingPair::split(
-                        StreamSizing::new($stdout_read_chunk_size, $stdout_max_buffered_chunks),
-                        StreamSizing::new($stderr_read_chunk_size, $stderr_max_buffered_chunks),
-                    ),
-                );
-                assert_listing_completion(process).await;
-            }
-        };
+            assert_that!(process.stdout().read_chunk_size()).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
+            assert_that!(process.stdout().max_buffered_chunks())
+                .is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
+            assert_that!(process.stderr().read_chunk_size()).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
+            assert_that!(process.stderr().max_buffered_chunks())
+                .is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
+            assert_successful_completion(process).await;
+        }
+
+        #[tokio::test]
+        async fn split_broadcast_config_applies_per_stream() {
+            let process = Process::new(ScriptedOutput::builder().stdout("out\n").build())
+                .name(AutoName::program_only())
+                .stdout(|stdout| {
+                    stdout
+                        .broadcast()
+                        .best_effort_delivery()
+                        .replay_last_bytes(1.megabytes())
+                        .read_chunk_size(42.kilobytes())
+                        .max_buffered_chunks(42)
+                })
+                .stderr(|stderr| {
+                    stderr
+                        .broadcast()
+                        .best_effort_delivery()
+                        .replay_last_bytes(1.megabytes())
+                        .read_chunk_size(43.kilobytes())
+                        .max_buffered_chunks(43)
+                })
+                .spawn()
+                .expect("Failed to spawn");
+
+            assert_that!(process.stdout().read_chunk_size()).is_equal_to(42.kilobytes());
+            assert_that!(process.stdout().max_buffered_chunks()).is_equal_to(42);
+            assert_that!(process.stderr().read_chunk_size()).is_equal_to(43.kilobytes());
+            assert_that!(process.stderr().max_buffered_chunks()).is_equal_to(43);
+            assert_successful_completion(process).await;
+        }
+
+        #[tokio::test]
+        async fn shared_single_subscriber_config_applies_to_stdout_and_stderr() {
+            let process = Process::new(ScriptedOutput::builder().stdout("out\n").build())
+                .name(AutoName::program_only())
+                .stdout_and_stderr(|stream| {
+                    stream
+                        .single_subscriber()
+                        .best_effort_delivery()
+                        .replay_last_bytes(1.megabytes())
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+                .expect("Failed to spawn");
+
+            assert_that!(process.stdout().read_chunk_size()).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
+            assert_that!(process.stdout().max_buffered_chunks())
+                .is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
+            assert_that!(process.stderr().read_chunk_size()).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
+            assert_that!(process.stderr().max_buffered_chunks())
+                .is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
+            assert_successful_completion(process).await;
+        }
+
+        #[tokio::test]
+        async fn split_single_subscriber_config_applies_per_stream() {
+            let process = Process::new(ScriptedOutput::builder().stdout("out\n").build())
+                .name(AutoName::program_only())
+                .stdout(|stdout| {
+                    stdout
+                        .single_subscriber()
+                        .best_effort_delivery()
+                        .replay_last_bytes(1.megabytes())
+                        .read_chunk_size(42.kilobytes())
+                        .max_buffered_chunks(42)
+                })
+                .stderr(|stderr| {
+                    stderr
+                        .single_subscriber()
+                        .best_effort_delivery()
+                        .replay_last_bytes(1.megabytes())
+                        .read_chunk_size(43.kilobytes())
+                        .max_buffered_chunks(43)
+                })
+                .spawn()
+                .expect("Failed to spawn");
+
+            assert_that!(process.stdout().read_chunk_size()).is_equal_to(42.kilobytes());
+            assert_that!(process.stdout().max_buffered_chunks()).is_equal_to(42);
+            assert_that!(process.stderr().read_chunk_size()).is_equal_to(43.kilobytes());
+            assert_that!(process.stderr().max_buffered_chunks()).is_equal_to(43);
+            assert_successful_completion(process).await;
+        }
     }
 
-    same_backend_smoke_test!(
-        process_builder_broadcast,
-        broadcast,
-        same_stream,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS
-    );
+    mod single_subscriber_delivery_and_replay {
+        use super::*;
 
-    same_backend_smoke_test!(
-        process_builder_broadcast_with_custom_capacities,
-        broadcast,
-        split_streams,
-        stdout: (42.kilobytes(), 42),
-        stderr: (43.kilobytes(), 43)
-    );
+        #[tokio::test]
+        async fn split_delivery_modes_can_wait_for_completion() {
+            let mut process = Process::new(Command::new("ls"))
+                .name(AutoName::program_only())
+                .stdout(|stdout| {
+                    stdout
+                        .single_subscriber()
+                        .reliable_for_active_subscribers()
+                        .no_replay()
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .stderr(|stderr| {
+                    stderr
+                        .single_subscriber()
+                        .best_effort_delivery()
+                        .no_replay()
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+                .expect("Failed to spawn");
 
-    #[tokio::test]
-    async fn process_builder_single_subscriber_with_per_stream_delivery() {
-        let mut process = Process::new(Command::new("ls"))
+            let _ = process.wait_for_completion(None).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn shared_no_replay_disables_replay_on_both_streams() {
+            let mut process = Process::new(Command::new("ls"))
+                .name(AutoName::program_only())
+                .stdout_and_stderr(|stream| {
+                    stream
+                        .single_subscriber()
+                        .reliable_for_active_subscribers()
+                        .no_replay()
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+                .expect("Failed to spawn");
+
+            assert_that!(process.stdout().replay_enabled()).is_false();
+            assert_that!(process.stderr().replay_enabled()).is_false();
+
+            let _ = process.wait_for_completion(None).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn split_replay_enabled_streams_can_be_sealed() {
+            let mut process = Process::new(Command::new("ls"))
+                .name(AutoName::program_only())
+                .stdout(|stdout| {
+                    stdout
+                        .single_subscriber()
+                        .best_effort_delivery()
+                        .replay_last_chunks(1)
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .stderr(|stderr| {
+                    stderr
+                        .single_subscriber()
+                        .reliable_for_active_subscribers()
+                        .replay_last_chunks(1)
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+                .expect("Failed to spawn");
+
+            assert_that!(process.stdout().replay_enabled()).is_true();
+            assert_that!(process.stderr().replay_enabled()).is_true();
+
+            process.seal_output_replay();
+            assert_that!(process.stdout().is_replay_sealed()).is_true();
+            assert_that!(process.stderr().is_replay_sealed()).is_true();
+
+            let _ = process.wait_for_completion(None).await.unwrap();
+        }
+    }
+
+    mod mixed_backend {
+        use super::*;
+
+        #[tokio::test]
+        async fn split_broadcast_config_applies_per_stream() {
+            let process = Process::new(
+                ScriptedOutput::builder()
+                    .stdout("out\n")
+                    .stderr("err\n")
+                    .build(),
+            )
             .name(AutoName::program_only())
             .stdout(|stdout| {
                 stdout
-                    .single_subscriber()
+                    .broadcast()
                     .reliable_for_active_subscribers()
-                    .no_replay()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(21.bytes())
+                    .max_buffered_chunks(22)
+            })
+            .stderr(|stderr| {
+                stderr
+                    .broadcast()
+                    .reliable_for_active_subscribers()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(23.bytes())
+                    .max_buffered_chunks(24)
+            })
+            .spawn()
+            .expect("Failed to spawn");
+
+            assert_that!(process.stdout().read_chunk_size()).is_equal_to(21.bytes());
+            assert_that!(process.stdout().max_buffered_chunks()).is_equal_to(22);
+            assert_that!(process.stderr().read_chunk_size()).is_equal_to(23.bytes());
+            assert_that!(process.stderr().max_buffered_chunks()).is_equal_to(24);
+            assert_out_and_err_completion(process).await;
+        }
+
+        #[tokio::test]
+        async fn broadcast_stdout_replay_can_be_sealed() {
+            let process = Process::new(
+                ScriptedOutput::builder()
+                    .stdout("out\n")
+                    .stderr("err\n")
+                    .build(),
+            )
+            .name(AutoName::program_only())
+            .stdout(|stdout| {
+                stdout
+                    .broadcast()
+                    .reliable_for_active_subscribers()
+                    .replay_last_bytes(1.megabytes())
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
             .stderr(|stderr| {
                 stderr
-                    .single_subscriber()
+                    .broadcast()
                     .best_effort_delivery()
-                    .no_replay()
+                    .replay_last_bytes(1.megabytes())
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
             .spawn()
             .expect("Failed to spawn");
 
-        let _ = process
-            .wait_for_completion(WaitForCompletionOptions::builder().timeout(None).build())
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn process_builder_single_subscriber_with_typed_same_delivery() {
-        let mut process = Process::new(Command::new("ls"))
-            .name(AutoName::program_only())
-            .stdout_and_stderr(|stream| {
-                stream
-                    .single_subscriber()
-                    .reliable_for_active_subscribers()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .expect("Failed to spawn");
-
-        assert_that!(process.stdout().replay_enabled()).is_false();
-        assert_that!(process.stderr().replay_enabled()).is_false();
-
-        let _ = process
-            .wait_for_completion(WaitForCompletionOptions::builder().timeout(None).build())
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn process_builder_single_subscriber_with_typed_per_stream_replay() {
-        let mut process = Process::new(Command::new("ls"))
-            .name(AutoName::program_only())
-            .stdout(|stdout| {
-                stdout
-                    .single_subscriber()
-                    .best_effort_delivery()
-                    .replay_last_chunks(1)
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .stderr(|stderr| {
-                stderr
-                    .single_subscriber()
-                    .reliable_for_active_subscribers()
-                    .replay_last_chunks(1)
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .expect("Failed to spawn");
-
-        assert_that!(process.stdout().replay_enabled()).is_true();
-        assert_that!(process.stderr().replay_enabled()).is_true();
-
-        process.seal_output_replay();
-        assert_that!(process.stdout().is_replay_sealed()).is_true();
-        assert_that!(process.stderr().is_replay_sealed()).is_true();
-
-        let _ = process
-            .wait_for_completion(WaitForCompletionOptions::builder().timeout(None).build())
-            .await
-            .unwrap();
-    }
-
-    same_backend_smoke_test!(
-        process_builder_single_subscriber,
-        single_subscriber,
-        same_stream,
-        DEFAULT_READ_CHUNK_SIZE,
-        DEFAULT_MAX_BUFFERED_CHUNKS
-    );
-
-    same_backend_smoke_test!(
-        process_builder_single_subscriber_with_custom_capacities,
-        single_subscriber,
-        split_streams,
-        stdout: (42.kilobytes(), 42),
-        stderr: (43.kilobytes(), 43)
-    );
-
-    macro_rules! backend_matrix_test {
-        (
-            $name:ident,
-            stdout: $stdout_backend:ident.$stdout_delivery:ident($stdout_read_chunk_size:expr, $stdout_max_buffered_chunks:expr),
-            stderr: $stderr_backend:ident.$stderr_delivery:ident($stderr_read_chunk_size:expr, $stderr_max_buffered_chunks:expr),
-            before_wait: |$process:ident| $before_wait:block
-        ) => {
-            #[tokio::test]
-            async fn $name() {
-                let $process = Process::new(out_and_err_command())
-                    .name(AutoName::program_only())
-                    .stdout(|stdout| {
-                        stdout
-                            .$stdout_backend()
-                            .$stdout_delivery()
-                            .replay_last_bytes(1.megabytes())
-                            .read_chunk_size($stdout_read_chunk_size)
-                            .max_buffered_chunks($stdout_max_buffered_chunks)
-                    })
-                    .stderr(|stderr| {
-                        stderr
-                            .$stderr_backend()
-                            .$stderr_delivery()
-                            .replay_last_bytes(1.megabytes())
-                            .read_chunk_size($stderr_read_chunk_size)
-                            .max_buffered_chunks($stderr_max_buffered_chunks)
-                    })
-                    .spawn()
-                    .expect("Failed to spawn");
-
-                assert_process_sizing(
-                    &$process,
-                    StreamSizingPair::split(
-                        StreamSizing::new($stdout_read_chunk_size, $stdout_max_buffered_chunks),
-                        StreamSizing::new($stderr_read_chunk_size, $stderr_max_buffered_chunks),
-                    ),
-                );
-
-                $before_wait
-
-                assert_out_and_err_completion($process).await;
-            }
-        };
-    }
-
-    backend_matrix_test!(
-        process_builder_broadcast_mode_uses_inline_stream_sizing,
-        stdout: broadcast.reliable_for_active_subscribers(21.bytes(), 22),
-        stderr: broadcast.reliable_for_active_subscribers(23.bytes(), 24),
-        before_wait: |_process| {}
-    );
-
-    backend_matrix_test!(
-        process_builder_broadcast_supports_distinct_stdout_and_stderr_mode_types,
-        stdout: broadcast.reliable_for_active_subscribers(
-            DEFAULT_READ_CHUNK_SIZE,
-            DEFAULT_MAX_BUFFERED_CHUNKS
-        ),
-        stderr: broadcast.best_effort_delivery(
-            DEFAULT_READ_CHUNK_SIZE,
-            DEFAULT_MAX_BUFFERED_CHUNKS
-        ),
-        before_wait: |process| {
             assert_that!(process.stdout().is_replay_sealed()).is_false();
             process.seal_stdout_replay();
             assert_that!(process.stdout().is_replay_sealed()).is_true();
+            assert_out_and_err_completion(process).await;
         }
-    );
 
-    backend_matrix_test!(
-        process_builder_supports_broadcast_stdout_and_single_subscriber_stderr,
-        stdout: broadcast.reliable_for_active_subscribers(
-            DEFAULT_READ_CHUNK_SIZE,
-            DEFAULT_MAX_BUFFERED_CHUNKS
-        ),
-        stderr: single_subscriber.best_effort_delivery(
-            DEFAULT_READ_CHUNK_SIZE,
-            DEFAULT_MAX_BUFFERED_CHUNKS
-        ),
-        before_wait: |process| {
-            process.seal_stdout_replay();
-            assert_that!(process.stdout().is_replay_sealed()).is_true();
-        }
-    );
-
-    backend_matrix_test!(
-        process_builder_supports_single_subscriber_stdout_and_broadcast_stderr,
-        stdout: single_subscriber.reliable_for_active_subscribers(
-            DEFAULT_READ_CHUNK_SIZE,
-            DEFAULT_MAX_BUFFERED_CHUNKS
-        ),
-        stderr: broadcast.best_effort_delivery(
-            DEFAULT_READ_CHUNK_SIZE,
-            DEFAULT_MAX_BUFFERED_CHUNKS
-        ),
-        before_wait: |process| {
-            process.seal_stderr_replay();
-            assert_that!(process.stderr().is_replay_sealed()).is_true();
-        }
-    );
-
-    #[tokio::test]
-    async fn process_builder_default_spawn_error_does_not_capture_sensitive_args() {
-        let sensitive_arg = "--token=secret-token-should-not-be-logged";
-        let mut cmd = Command::new("tokio-process-tools-definitely-missing-command");
-        cmd.arg(sensitive_arg);
-
-        let error = match Process::new(cmd)
-            .name(AutoName::program_only())
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-        {
-            Ok(mut process) => {
-                let _ = process
-                    .wait_for_completion(WaitForCompletionOptions::builder().timeout(None).build())
-                    .await;
-                assert_that!(()).fail("command should fail to spawn");
-                return;
-            }
-            Err(error) => error,
-        };
-        let error = error.to_string();
-
-        assert_that!(error.as_str()).contains("tokio-process-tools-definitely-missing-command");
-        assert_that!(error.as_str()).does_not_contain(sensitive_arg);
-    }
-
-    #[tokio::test]
-    async fn process_builder_custom_name() {
-        let id = 42;
-        let mut process = Process::new(Command::new("ls"))
-            .name(format!("worker-{id}"))
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .expect("Failed to spawn");
-
-        assert_that!(&process.name).is_equal_to("worker-42");
-
-        let _ = process
-            .wait_for_completion(WaitForCompletionOptions::builder().timeout(None).build())
-            .await;
-    }
-
-    #[tokio::test]
-    async fn process_builder_accepts_auto_name_settings_directly() {
-        let mut cmd = Command::new("ls");
-        cmd.arg("-la");
-        cmd.env("IGNORED_ENV", "secret");
-        cmd.current_dir("./");
-
-        let mut process = Process::new(cmd)
-            .name(
-                AutoNameSettings::builder()
-                    .include_current_dir(true)
-                    .include_args(true)
+        #[tokio::test]
+        async fn broadcast_stdout_and_single_subscriber_stderr_can_complete() {
+            let process = Process::new(
+                ScriptedOutput::builder()
+                    .stdout("out\n")
+                    .stderr("err\n")
                     .build(),
             )
-            .stdout_and_stderr(|stream| {
-                stream
+            .name(AutoName::program_only())
+            .stdout(|stdout| {
+                stdout
                     .broadcast()
+                    .reliable_for_active_subscribers()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .stderr(|stderr| {
+                stderr
+                    .single_subscriber()
                     .best_effort_delivery()
-                    .no_replay()
+                    .replay_last_bytes(1.megabytes())
                     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
             .spawn()
             .expect("Failed to spawn");
 
-        assert_that!(&process.name).is_equal_to("./ % ls \"-la\"");
+            process.seal_stdout_replay();
+            assert_that!(process.stdout().is_replay_sealed()).is_true();
+            assert_out_and_err_completion(process).await;
+        }
 
-        let _ = process
-            .wait_for_completion(WaitForCompletionOptions::builder().timeout(None).build())
-            .await;
+        #[tokio::test]
+        async fn single_subscriber_stdout_and_broadcast_stderr_can_complete() {
+            let process = Process::new(
+                ScriptedOutput::builder()
+                    .stdout("out\n")
+                    .stderr("err\n")
+                    .build(),
+            )
+            .name(AutoName::program_only())
+            .stdout(|stdout| {
+                stdout
+                    .single_subscriber()
+                    .reliable_for_active_subscribers()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .stderr(|stderr| {
+                stderr
+                    .broadcast()
+                    .best_effort_delivery()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .expect("Failed to spawn");
+
+            process.seal_stderr_replay();
+            assert_that!(process.stderr().is_replay_sealed()).is_true();
+            assert_out_and_err_completion(process).await;
+        }
+    }
+
+    mod spawn_errors {
+        use super::*;
+
+        #[tokio::test]
+        async fn default_auto_name_does_not_capture_sensitive_args_in_spawn_error() {
+            let sensitive_arg = "--token=secret-token-should-not-be-logged";
+            let mut cmd = Command::new("tokio-process-tools-definitely-missing-command");
+            cmd.arg(sensitive_arg);
+
+            let error = match Process::new(cmd)
+                .name(AutoName::program_only())
+                .stdout_and_stderr(|stream| {
+                    stream
+                        .broadcast()
+                        .best_effort_delivery()
+                        .no_replay()
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+            {
+                Ok(mut process) => {
+                    let _ = process.wait_for_completion(None).await;
+                    assert_that!(()).fail("command should fail to spawn");
+                    return;
+                }
+                Err(error) => error,
+            };
+            let error = error.to_string();
+
+            assert_that!(error.as_str()).contains("tokio-process-tools-definitely-missing-command");
+            assert_that!(error.as_str()).does_not_contain(sensitive_arg);
+        }
+    }
+
+    mod names {
+        use super::*;
+
+        #[tokio::test]
+        async fn explicit_name_is_used_for_process_handle() {
+            let id = 42;
+            let mut process = Process::new(Command::new("ls"))
+                .name(format!("worker-{id}"))
+                .stdout_and_stderr(|stream| {
+                    stream
+                        .broadcast()
+                        .best_effort_delivery()
+                        .no_replay()
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+                .expect("Failed to spawn");
+
+            assert_that!(&process.name).is_equal_to("worker-42");
+
+            let _ = process.wait_for_completion(None).await;
+        }
+
+        #[tokio::test]
+        async fn auto_name_settings_include_current_dir_and_args() {
+            let mut cmd = Command::new("ls");
+            cmd.arg("-la");
+            cmd.env("IGNORED_ENV", "secret");
+            cmd.current_dir("./");
+
+            let mut process = Process::new(cmd)
+                .name(
+                    AutoNameSettings::builder()
+                        .include_current_dir(true)
+                        .include_args(true)
+                        .build(),
+                )
+                .stdout_and_stderr(|stream| {
+                    stream
+                        .broadcast()
+                        .best_effort_delivery()
+                        .no_replay()
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+                .expect("Failed to spawn");
+
+            assert_that!(&process.name).is_equal_to("./ % ls \"-la\"");
+
+            let _ = process.wait_for_completion(None).await;
+        }
     }
 }

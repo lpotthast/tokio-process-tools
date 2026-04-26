@@ -305,7 +305,7 @@ mod tests {
     use assertr::prelude::*;
 
     #[test]
-    fn builder_creates_best_effort_no_replay_config() {
+    fn builder_creates_expected_delivery_and_replay_configs() {
         let config: StreamConfig<BestEffortDelivery, NoReplay> = StreamConfig::builder()
             .best_effort_delivery()
             .no_replay()
@@ -318,10 +318,7 @@ mod tests {
         assert_that!(config.replay_retention()).is_none();
         assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
         assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
-    }
 
-    #[test]
-    fn builder_creates_reliable_no_replay_config() {
         let config: StreamConfig<ReliableDelivery, NoReplay> = StreamConfig::builder()
             .reliable_for_active_subscribers()
             .no_replay()
@@ -335,10 +332,7 @@ mod tests {
         assert_that!(config.replay_retention()).is_none();
         assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
         assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
-    }
 
-    #[test]
-    fn builder_creates_best_effort_replay_config() {
         let config: StreamConfig<BestEffortDelivery, ReplayEnabled> = StreamConfig::builder()
             .best_effort_delivery()
             .replay_last_chunks(2)
@@ -351,10 +345,7 @@ mod tests {
         assert_that!(config.replay_retention()).is_equal_to(Some(ReplayRetention::LastChunks(2)));
         assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
         assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
-    }
 
-    #[test]
-    fn builder_creates_reliable_replay_config() {
         let config: StreamConfig<ReliableDelivery, ReplayEnabled> = StreamConfig::builder()
             .reliable_for_active_subscribers()
             .replay_last_bytes(16.bytes())
@@ -372,72 +363,76 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "read_chunk_size must be greater than zero bytes")]
-    fn builder_rejects_zero_read_chunk_size() {
-        let _config = StreamConfig::builder()
-            .best_effort_delivery()
-            .no_replay()
-            .read_chunk_size(0.bytes());
-    }
+    fn invalid_configs_panic_with_parameter_names() {
+        assert_that_panic_by(|| {
+            let _config = StreamConfig::builder()
+                .best_effort_delivery()
+                .no_replay()
+                .read_chunk_size(0.bytes());
+        })
+        .has_type::<String>()
+        .is_equal_to("read_chunk_size must be greater than zero bytes");
 
-    #[test]
-    #[should_panic(expected = "max_buffered_chunks must be greater than zero")]
-    fn builder_rejects_zero_max_buffered_chunks() {
-        let _config = StreamConfig::builder()
-            .best_effort_delivery()
-            .no_replay()
-            .read_chunk_size(8.bytes())
-            .max_buffered_chunks(0);
-    }
+        assert_that_panic_by(|| {
+            let _config = StreamConfig::builder()
+                .best_effort_delivery()
+                .no_replay()
+                .read_chunk_size(8.bytes())
+                .max_buffered_chunks(0);
+        })
+        .has_type::<String>()
+        .is_equal_to("max_buffered_chunks must be greater than zero");
 
-    #[test]
-    #[should_panic(expected = "chunks must retain at least one chunk")]
-    fn builder_rejects_zero_replay_chunks() {
-        let _config = StreamConfig::builder()
-            .best_effort_delivery()
-            .replay_last_chunks(0);
-    }
+        assert_that_panic_by(|| {
+            let _config = StreamConfig::builder()
+                .best_effort_delivery()
+                .replay_last_chunks(0);
+        })
+        .has_type::<String>()
+        .is_equal_to("chunks must retain at least one chunk");
 
-    #[test]
-    #[should_panic(expected = "bytes must retain at least one byte")]
-    fn builder_rejects_zero_replay_bytes() {
-        let _config = StreamConfig::builder()
-            .best_effort_delivery()
-            .replay_last_bytes(NumBytes::zero());
-    }
+        assert_that_panic_by(|| {
+            let _config = StreamConfig::builder()
+                .best_effort_delivery()
+                .replay_last_bytes(NumBytes::zero());
+        })
+        .has_type::<String>()
+        .is_equal_to("bytes must retain at least one byte");
 
-    #[test]
-    #[should_panic(expected = "replay_retention must retain at least one chunk")]
-    fn replay_enabled_rejects_zero_replay_retention() {
-        let _replay = ReplayEnabled::new(ReplayRetention::LastChunks(0));
-    }
+        assert_that_panic_by(|| {
+            let _replay = ReplayEnabled::new(ReplayRetention::LastChunks(0));
+        })
+        .has_type::<String>()
+        .is_equal_to("replay_retention must retain at least one chunk");
 
-    #[test]
-    #[should_panic(expected = "replay_retention must retain at least one byte")]
-    fn with_replay_retention_rejects_zero_replay_retention() {
-        let config = StreamConfig::builder()
-            .best_effort_delivery()
-            .replay_all()
-            .read_chunk_size(8.bytes())
-            .max_buffered_chunks(2)
-            .build();
+        assert_that_panic_by(|| {
+            let config = StreamConfig::builder()
+                .best_effort_delivery()
+                .replay_all()
+                .read_chunk_size(8.bytes())
+                .max_buffered_chunks(2)
+                .build();
 
-        let _config = config.with_replay_retention(ReplayRetention::LastBytes(NumBytes::zero()));
-    }
+            let _config =
+                config.with_replay_retention(ReplayRetention::LastBytes(NumBytes::zero()));
+        })
+        .has_type::<String>()
+        .is_equal_to("replay_retention must retain at least one byte");
 
-    #[test]
-    #[should_panic(expected = "options.replay_retention must retain at least one byte")]
-    fn config_validation_rejects_zero_replay_retention() {
-        let config = StreamConfig {
-            read_chunk_size: 8.bytes(),
-            max_buffered_chunks: 2,
-            delivery: BestEffortDelivery,
-            replay: ReplayEnabled {
-                replay_retention: ReplayRetention::LastBytes(NumBytes::zero()),
-            },
-        };
+        assert_that_panic_by(|| {
+            let config = StreamConfig {
+                read_chunk_size: 8.bytes(),
+                max_buffered_chunks: 2,
+                delivery: BestEffortDelivery,
+                replay: ReplayEnabled {
+                    replay_retention: ReplayRetention::LastBytes(NumBytes::zero()),
+                },
+            };
 
-        config.assert_valid("options");
+            config.assert_valid("options");
+        })
+        .has_type::<String>()
+        .is_equal_to("options.replay_retention must retain at least one byte");
     }
 
     #[tokio::test]

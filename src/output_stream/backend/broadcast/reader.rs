@@ -95,3 +95,83 @@ pub(super) async fn read_chunked_fast<S: AsyncRead + Unpin + Send + 'static>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::FastClosureState;
+    use super::super::state::Shared;
+    use super::*;
+    use crate::{NumBytesExt, StreamConfig};
+    use assertr::prelude::*;
+    use std::io::Cursor;
+
+    fn replay_all_options() -> StreamConfig<crate::BestEffortDelivery, crate::ReplayEnabled> {
+        StreamConfig::builder()
+            .best_effort_delivery()
+            .replay_all()
+            .read_chunk_size(2.bytes())
+            .max_buffered_chunks(8)
+            .build()
+    }
+
+    fn assert_chunk(event: &StreamEvent, expected: &'static [u8]) {
+        match event {
+            StreamEvent::Chunk(chunk) => {
+                assert_that!(chunk.as_ref()).is_equal_to(expected);
+            }
+            other => {
+                assert_that!(other).fail(format_args!("expected chunk, got {other:?}"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_reader_splits_input_into_configured_chunks_and_eof() {
+        let shared = Arc::new(Shared::new());
+        let options = replay_all_options();
+
+        read_chunked_shared(
+            Cursor::new(b"abcdef".to_vec()),
+            Arc::clone(&shared),
+            options,
+            "custom",
+        )
+        .await;
+
+        let state = shared.state.lock().expect("broadcast state poisoned");
+        assert_that!(state.events.len()).is_equal_to(4);
+        assert_chunk(&state.events[0], b"ab");
+        assert_chunk(&state.events[1], b"cd");
+        assert_chunk(&state.events[2], b"ef");
+        assert_that!(matches!(state.events.get(3), Some(StreamEvent::Eof))).is_true();
+    }
+
+    #[tokio::test]
+    async fn fast_reader_splits_input_into_configured_chunks_and_eof() {
+        let (sender, mut receiver) = broadcast::channel(8);
+        let closure_state = Arc::new(Mutex::new(FastClosureState {
+            closed: false,
+            read_error: None,
+        }));
+
+        read_chunked_fast(
+            Cursor::new(b"abcdef".to_vec()),
+            2.bytes(),
+            sender,
+            Arc::clone(&closure_state),
+            "custom",
+        )
+        .await;
+
+        let first = receiver.recv().await.unwrap();
+        let second = receiver.recv().await.unwrap();
+        let third = receiver.recv().await.unwrap();
+        let eof = receiver.recv().await.unwrap();
+
+        assert_chunk(&first, b"ab");
+        assert_chunk(&second, b"cd");
+        assert_chunk(&third, b"ef");
+        assert_that!(eof).is_equal_to(StreamEvent::Eof);
+        assert_that!(closure_state.lock().expect("closure_state poisoned").closed).is_true();
+    }
+}

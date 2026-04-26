@@ -1,12 +1,13 @@
 use crate::output_stream::OutputStream;
 use crate::output_stream::subscription::EventSubscription;
 
-pub(super) trait SubscribableOutputStream: OutputStream {
+pub(crate) trait SubscribableOutputStream: OutputStream {
     fn subscribe_for_consumer(&self) -> impl EventSubscription;
 }
 
 macro_rules! impl_output_stream_consumer_api {
     (impl $($impl_header:tt)*) => {
+        #[allow(dead_code)]
         impl $($impl_header)* {
             /// Inspects chunks of output from the stream without storing them.
             ///
@@ -19,7 +20,7 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Inspector {
                 $crate::output_stream::consumer::inspect::inspect_chunks(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     f,
                 )
             }
@@ -38,7 +39,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::inspect::inspect_chunks_async(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     f,
                 )
             }
@@ -55,7 +56,7 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Inspector {
                 $crate::output_stream::consumer::inspect::inspect_lines(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     f,
                     options,
                 )
@@ -76,7 +77,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::inspect::inspect_lines_async(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     f,
                     options,
                 )
@@ -93,7 +94,7 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Collector<S> {
                 $crate::output_stream::consumer::collect::collect_chunks(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     into,
                     collect,
                 )
@@ -110,7 +111,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::collect::collect_chunks_async(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     into,
                     collect,
                 )
@@ -131,7 +132,7 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Collector<S> {
                 $crate::output_stream::consumer::collect::collect_lines(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     into,
                     collect,
                     options,
@@ -156,7 +157,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::collect::collect_lines_async(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     into,
                     collect,
                     options,
@@ -174,25 +175,14 @@ macro_rules! impl_output_stream_consumer_api {
                 })
             }
 
-            /// Trusted-output-only convenience method to collect all chunks into a `Vec<u8>`.
+            /// Convenience method to collect lines into a line buffer.
             ///
-            /// This grows memory without a total output cap. Use it only when the child process and
-            /// its output volume are trusted.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-            pub fn collect_all_chunks_into_vec_trusted(&self) -> $crate::Collector<Vec<u8>> {
-                self.collect_chunks(Vec::new(), |chunk, vec| {
-                    vec.extend_from_slice(chunk.as_ref());
-                })
-            }
-
-            /// Convenience method to collect lines into a bounded line buffer.
-            ///
-            /// `parsing_options.max_line_length` must be non-zero. An unbounded single-line parser
-            /// can allocate without limit before this collector receives any complete line.
+            /// `parsing_options.max_line_length` must be non-zero unless
+            /// `collection_options` is [`crate::LineCollectionOptions::TrustedUnbounded`].
             ///
             /// # Panics
             ///
-            /// Panics if `parsing_options.max_line_length` is zero.
+            /// Panics if `parsing_options.max_line_length` is zero and bounded collection is used.
             #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_lines_into_vec(
                 &self,
@@ -200,8 +190,12 @@ macro_rules! impl_output_stream_consumer_api {
                 collection_options: $crate::LineCollectionOptions,
             ) -> $crate::Collector<$crate::CollectedLines> {
                 assert!(
-                    parsing_options.max_line_length.bytes() > 0,
-                    "parsing_options.max_line_length must be greater than zero for bounded line collection"
+                    parsing_options.max_line_length.bytes() > 0
+                        || matches!(
+                            collection_options,
+                            $crate::LineCollectionOptions::TrustedUnbounded
+                        ),
+                    "parsing_options.max_line_length must be greater than zero unless line collection is trusted-unbounded"
                 );
                 self.collect_lines(
                     $crate::CollectedLines::new(),
@@ -210,26 +204,6 @@ macro_rules! impl_output_stream_consumer_api {
                         $crate::Next::Continue
                     },
                     parsing_options,
-                )
-            }
-
-            /// Trusted-output-only convenience method to collect all lines into a `Vec<String>`.
-            ///
-            /// This grows memory without a total output cap. Use it only when the child process and
-            /// its output volume are trusted. `LineParsingOptions::max_line_length` still controls
-            /// the maximum size of one parsed line.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-            pub fn collect_all_lines_into_vec_trusted(
-                &self,
-                options: $crate::LineParsingOptions,
-            ) -> $crate::Collector<Vec<String>> {
-                self.collect_lines(
-                    Vec::new(),
-                    |line, vec| {
-                        vec.push(line.into_owned());
-                        $crate::Next::Continue
-                    },
-                    options,
                 )
             }
 
@@ -254,7 +228,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::write::collect_chunks_into_write(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     write,
                     write_options,
                 )
@@ -286,7 +260,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::write::collect_lines_into_write(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     write,
                     options,
                     mode,
@@ -317,7 +291,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::write::collect_chunks_into_write_mapped(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     write,
                     mapper,
                     write_options,
@@ -353,7 +327,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::write::collect_lines_into_write_mapped(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
                     write,
                     mapper,
                     options,
@@ -388,7 +362,7 @@ macro_rules! impl_output_stream_consumer_api {
                 predicate: impl Fn(::std::borrow::Cow<'_, str>) -> bool + Send + Sync + 'static,
                 options: $crate::LineParsingOptions,
             ) -> $crate::output_stream::line_waiter::LineWaiter {
-                let subscription = <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self);
+                let subscription = <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self);
                 $crate::output_stream::line_waiter::LineWaiter::new(
                     $crate::output_stream::consumer::wait::wait_for_line_with_optional_timeout(
                         subscription,
@@ -425,7 +399,7 @@ macro_rules! impl_output_stream_consumer_api {
                 options: $crate::LineParsingOptions,
                 timeout: ::std::time::Duration,
             ) -> $crate::output_stream::line_waiter::LineWaiter {
-                let subscription = <Self as $crate::output_stream::backend::consumer_api::SubscribableOutputStream>::subscribe_for_consumer(self);
+                let subscription = <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self);
                 $crate::output_stream::line_waiter::LineWaiter::new(
                     $crate::output_stream::consumer::wait::wait_for_line_with_optional_timeout(
                         subscription,
@@ -439,4 +413,195 @@ macro_rules! impl_output_stream_consumer_api {
     };
 }
 
-pub(super) use impl_output_stream_consumer_api;
+pub(crate) use impl_output_stream_consumer_api;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output_stream::{Chunk, NumBytes, OutputStream, StreamEvent};
+    use crate::{
+        CollectionOverflowBehavior, LineCollectionOptions, LineParsingOptions, Next, NumBytesExt,
+        WaitForLineResult,
+    };
+    use assertr::prelude::*;
+    use bytes::Bytes;
+    use std::cell::Cell;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    struct TestOutputStream {
+        receiver: Mutex<Option<mpsc::Receiver<StreamEvent>>>,
+    }
+
+    impl TestOutputStream {
+        fn new(receiver: mpsc::Receiver<StreamEvent>) -> Self {
+            Self {
+                receiver: Mutex::new(Some(receiver)),
+            }
+        }
+    }
+
+    impl OutputStream for TestOutputStream {
+        fn read_chunk_size(&self) -> NumBytes {
+            4.bytes()
+        }
+
+        fn max_buffered_chunks(&self) -> usize {
+            4
+        }
+
+        fn name(&self) -> &'static str {
+            "custom"
+        }
+    }
+
+    impl SubscribableOutputStream for TestOutputStream {
+        fn subscribe_for_consumer(
+            &self,
+        ) -> impl crate::output_stream::subscription::EventSubscription {
+            self.receiver
+                .lock()
+                .expect("test receiver mutex poisoned")
+                .take()
+                .expect("test stream supports one subscription")
+        }
+    }
+
+    impl_output_stream_consumer_api! {
+        impl TestOutputStream
+    }
+
+    fn stream_with_sender() -> (TestOutputStream, mpsc::Sender<StreamEvent>) {
+        let (tx, rx) = mpsc::channel(4);
+        (TestOutputStream::new(rx), tx)
+    }
+
+    #[tokio::test]
+    async fn wait_for_line_subscribes_before_polling() {
+        let (stream, tx) = stream_with_sender();
+
+        let waiter = stream.wait_for_line(|line| line == "ready", LineParsingOptions::default());
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"ready\n"))))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::Eof).await.unwrap();
+
+        assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Matched));
+    }
+
+    #[tokio::test]
+    async fn wait_for_line_with_timeout_subscribes_before_polling() {
+        let (stream, tx) = stream_with_sender();
+
+        let waiter = stream.wait_for_line_with_timeout(
+            |line| line == "ready",
+            LineParsingOptions::default(),
+            Duration::from_secs(1),
+        );
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"ready\n"))))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::Eof).await.unwrap();
+
+        assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Matched));
+    }
+
+    #[derive(Default)]
+    struct SendOnlyLineSink {
+        lines: Vec<String>,
+        line_count: Cell<usize>,
+    }
+
+    #[tokio::test]
+    async fn collect_lines_accepts_send_only_sink() {
+        let (stream, tx) = stream_with_sender();
+        let collector = stream.collect_lines(
+            SendOnlyLineSink::default(),
+            |line, sink| {
+                sink.lines.push(line.into_owned());
+                sink.line_count.set(sink.line_count.get() + 1);
+                Next::Continue
+            },
+            LineParsingOptions::default(),
+        );
+
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(
+            b"alpha\nbeta",
+        ))))
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Eof).await.unwrap();
+
+        let sink = collector.wait().await.unwrap();
+        assert_that!(sink.lines).is_equal_to(vec!["alpha".to_string(), "beta".to_string()]);
+        assert_that!(sink.line_count.get()).is_equal_to(2);
+    }
+
+    #[tokio::test]
+    async fn bounded_line_collection_drains_until_eof_after_limit_is_reached() {
+        let (stream, tx) = stream_with_sender();
+        let collector = stream.collect_lines_into_vec(
+            LineParsingOptions::default(),
+            LineCollectionOptions::Bounded {
+                max_bytes: 3.bytes(),
+                max_lines: 1,
+                overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+            },
+        );
+
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(
+            b"one\ntwo\nthree\n",
+        ))))
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Eof).await.unwrap();
+
+        let collected = collector.wait().await.unwrap();
+        assert_that!(collected.lines().iter().map(String::as_str)).contains_exactly(["one"]);
+        assert_that!(collected.truncated()).is_true();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "parsing_options.max_line_length must be greater than zero unless line collection is trusted-unbounded"
+    )]
+    fn bounded_line_collection_rejects_unbounded_line_parser() {
+        let (stream, _tx) = stream_with_sender();
+        let _collector = stream.collect_lines_into_vec(
+            LineParsingOptions::builder()
+                .max_line_length(0.bytes())
+                .overflow_behavior(crate::LineOverflowBehavior::default())
+                .build(),
+            LineCollectionOptions::Bounded {
+                max_bytes: 3.bytes(),
+                max_lines: 1,
+                overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_unbounded_line_collection_allows_unbounded_line_parser() {
+        let (stream, tx) = stream_with_sender();
+        let collector = stream.collect_lines_into_vec(
+            LineParsingOptions::builder()
+                .max_line_length(0.bytes())
+                .overflow_behavior(crate::LineOverflowBehavior::default())
+                .build(),
+            LineCollectionOptions::TrustedUnbounded,
+        );
+
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(
+            b"unterminated long line",
+        ))))
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Eof).await.unwrap();
+
+        let collected = collector.wait().await.unwrap();
+        assert_that!(collected.lines().iter().map(String::as_str))
+            .contains_exactly(["unterminated long line"]);
+        assert_that!(collected.truncated()).is_false();
+    }
+}

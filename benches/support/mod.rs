@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use assertr::prelude::*;
 use bytes::Bytes;
 use std::io;
 use std::pin::Pin;
@@ -24,6 +25,14 @@ pub const SHORT_LINE_READ_CHUNK_SIZE: usize = 16 * 1024;
 pub const LONG_LINE_LEN: usize = 4 * 1024;
 pub const LONG_LINE_COUNT: usize = 2_048;
 pub const LONG_LINE_READ_CHUNK_SIZE: usize = 64 * 1024;
+
+pub const UTF8_SHORT_LINE_LEN: usize = 64;
+pub const UTF8_SHORT_LINE_COUNT: usize = 16_384;
+pub const UTF8_SHORT_LINE_READ_CHUNK_SIZE: usize = 16 * 1024;
+
+pub const UTF8_LONG_LINE_LEN: usize = 4 * 1024;
+pub const UTF8_LONG_LINE_COUNT: usize = 2_048;
+pub const UTF8_LONG_LINE_READ_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ChunkedReader {
@@ -107,6 +116,49 @@ pub fn build_line_payload(
         }
         payload.push(b'\n');
     }
+
+    split_bytes(&payload, read_chunk_size)
+}
+
+#[must_use]
+pub fn build_utf8_line_payload(
+    line_len: usize,
+    line_count: usize,
+    read_chunk_size: usize,
+) -> Vec<Bytes> {
+    let pattern = "tokio-process-tools-line-éλЖ:";
+    assert_that!(line_len)
+        .with_detail_message("UTF-8 line length must fit the non-ASCII pattern")
+        .is_greater_or_equal_to(pattern.len());
+
+    let mut payload = Vec::with_capacity((line_len + 1) * line_count);
+
+    for _ in 0..line_count {
+        let line_start = payload.len();
+        payload.extend_from_slice(pattern.as_bytes());
+
+        while payload.len() - line_start < line_len {
+            let remaining = line_len - (payload.len() - line_start);
+            let ch = pattern
+                .chars()
+                .find(|ch| ch.len_utf8() <= remaining)
+                .expect("UTF-8 pattern should contain a character that fits the remaining bytes");
+            let mut encoded = [0_u8; 4];
+            payload.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+        }
+
+        let line = &payload[line_start..];
+        assert_that!(line.iter().any(|byte| !byte.is_ascii()))
+            .with_detail_message("UTF-8 benchmark line should contain non-ASCII bytes")
+            .is_true();
+        assert_that!(line.len())
+            .with_detail_message("UTF-8 benchmark line should match target byte length")
+            .is_equal_to(line_len);
+
+        payload.push(b'\n');
+    }
+
+    std::str::from_utf8(&payload).expect("UTF-8 benchmark payload should be valid");
 
     split_bytes(&payload, read_chunk_size)
 }

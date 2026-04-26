@@ -3,8 +3,8 @@ use std::process::ExitStatus;
 /// Full output of a process that terminated.
 ///
 /// `Stdout` and `Stderr` describe the collected payload type for each stream. For example,
-/// bounded line collection uses `ProcessOutput<CollectedLines>`, bounded raw byte collection uses
-/// `ProcessOutput<CollectedBytes>`, and trusted unbounded collection uses `ProcessOutput<Vec<_>>`.
+/// line collection uses `ProcessOutput<CollectedLines>` and raw byte collection uses
+/// `ProcessOutput<CollectedBytes>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessOutput<Stdout, Stderr = Stdout> {
     /// Status the process exited with.

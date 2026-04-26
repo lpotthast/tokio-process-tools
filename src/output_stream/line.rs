@@ -93,6 +93,20 @@ enum LineParserMode {
     PendingLimitDelimiter,
 }
 
+/// Converts bytes to text with a fast path for ASCII-only lines.
+///
+/// Non-ASCII input still uses Rust's lossy UTF-8 conversion, preserving invalid UTF-8 replacement
+/// behavior. ASCII input is always valid UTF-8, so it can be borrowed directly without running the
+/// general UTF-8 validator.
+fn decode_line_lossy(bytes: &[u8]) -> Cow<'_, str> {
+    if bytes.is_ascii() {
+        // SAFETY: `is_ascii` guarantees every byte is valid UTF-8.
+        Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(bytes) })
+    } else {
+        String::from_utf8_lossy(bytes)
+    }
+}
+
 /// Stateful parser for turning arbitrary byte chunks into lines.
 pub(crate) struct LineParserState {
     line_buffer: BytesMut,
@@ -170,7 +184,7 @@ impl LineParserState {
             if let Some(pos) = memchr(b'\n', scan) {
                 // Optimization: Complete line in chunk? Then do not copy into BytesMut first.
                 let result = if self.line_buffer.is_empty() {
-                    f(String::from_utf8_lossy(&scan[..pos]))
+                    f(decode_line_lossy(&scan[..pos]))
                 } else {
                     self.line_buffer.extend_from_slice(&scan[..pos]);
                     self.emit_line(&mut f)
@@ -220,7 +234,7 @@ impl LineParserState {
         if self.mode == LineParserMode::DiscardUntilNewline || self.line_buffer.is_empty() {
             Next::Continue
         } else {
-            f(String::from_utf8_lossy(&self.line_buffer))
+            f(decode_line_lossy(&self.line_buffer))
         }
     }
 
@@ -228,18 +242,18 @@ impl LineParserState {
         if self.mode == LineParserMode::DiscardUntilNewline || self.line_buffer.is_empty() {
             None
         } else {
-            Some(String::from_utf8_lossy(&self.line_buffer).into_owned())
+            Some(decode_line_lossy(&self.line_buffer).into_owned())
         }
     }
 
     fn emit_line(&mut self, f: &mut impl FnMut(Cow<'_, str>) -> Next) -> Next {
         let line = self.line_buffer.split().freeze();
-        f(String::from_utf8_lossy(&line))
+        f(decode_line_lossy(&line))
     }
 
     fn emit_owned_line(&mut self) -> String {
         let line = self.line_buffer.split().freeze();
-        String::from_utf8_lossy(&line).into_owned()
+        decode_line_lossy(&line).into_owned()
     }
 }
 
@@ -302,7 +316,7 @@ impl Iterator for OwnedLineReader<'_> {
             if let Some(pos) = memchr(b'\n', scan) {
                 self.chunk = &self.chunk[pos + 1..];
                 if self.parser.line_buffer.is_empty() {
-                    return Some(String::from_utf8_lossy(&scan[..pos]).into_owned());
+                    return Some(decode_line_lossy(&scan[..pos]).into_owned());
                 }
                 self.parser.line_buffer.extend_from_slice(&scan[..pos]);
                 return Some(self.parser.emit_owned_line());
@@ -404,57 +418,45 @@ mod tests {
     }
 
     #[test]
-    fn empty_chunk() {
-        run_test_case(&[b""], None, &[], LineParsingOptions::default());
-    }
+    fn basic_line_parsing_cases() {
+        let default_options = LineParsingOptions::default();
+        let drop_additional_options = LineParsingOptions {
+            max_line_length: 4.bytes(),
+            overflow_behavior: LineOverflowBehavior::DropAdditionalData,
+        };
 
-    #[test]
-    fn chunk_without_any_newlines() {
+        run_test_case(&[b""], None, &[], default_options);
         run_test_case(
             &[b"no newlines here"],
             None,
             &["no newlines here"],
-            LineParsingOptions::default(),
+            default_options,
         );
-    }
-
-    #[test]
-    fn single_completed_line() {
-        run_test_case(
-            &[b"one line\n"],
-            None,
-            &["one line"],
-            LineParsingOptions::default(),
-        );
-    }
-
-    #[test]
-    fn multiple_completed_lines() {
+        run_test_case(&[b"one line\n"], None, &["one line"], default_options);
         run_test_case(
             &[b"first line\nsecond line\nthird line\n"],
             None,
             &["first line", "second line", "third line"],
-            LineParsingOptions::default(),
+            default_options,
         );
-    }
-
-    #[test]
-    fn partial_line_at_the_end() {
         run_test_case(
             &[b"complete line\npartial"],
             None,
             &["complete line", "partial"],
-            LineParsingOptions::default(),
+            default_options,
         );
-    }
-
-    #[test]
-    fn initial_line_with_multiple_newlines() {
         run_test_case(
             &[b"previous: continuation\nmore lines\n"],
             None,
             &["previous: continuation", "more lines"],
-            LineParsingOptions::default(),
+            default_options,
+        );
+        run_test_case(&[b"1234\n\n"], None, &["1234", ""], drop_additional_options);
+        run_test_case(
+            &[b"ok\n123456789\nnext\n"],
+            None,
+            &["ok", "1234", "next"],
+            drop_additional_options,
         );
     }
 
@@ -499,11 +501,6 @@ mod tests {
         run_test_case(&[b"1234", b"\n"], None, &["1234"], options);
         run_test_case(&[b"12345678\n"], None, &["1234", "5678"], options);
         run_test_case(&[b"1234\n\n"], None, &["1234", ""], options);
-    }
-
-    #[test]
-    fn owned_lines_emit_additional_as_new_lines_does_not_emit_synthetic_empty_lines() {
-        let options = emit_additional_options();
 
         run_owned_test_case(&[b"1234\n"], None, &["1234"], options);
         run_owned_test_case(&[b"1234", b"\n"], None, &["1234"], options);
@@ -512,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn max_line_length_of_0_disables_line_length_checks_test1() {
+    fn max_line_length_of_0_disables_line_length_checks() {
         run_test_case(
             &[b"123456789\nabcdefghi\n"],
             None,
@@ -522,10 +519,6 @@ mod tests {
                 overflow_behavior: LineOverflowBehavior::DropAdditionalData,
             },
         );
-    }
-
-    #[test]
-    fn max_line_length_of_0_disables_line_length_checks_test2() {
         run_test_case(
             &[b"123456789\nabcdefghi\n"],
             None,

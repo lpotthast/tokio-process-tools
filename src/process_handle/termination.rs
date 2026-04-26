@@ -582,9 +582,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_stream::BroadcastOutputStream;
     use crate::panic_on_drop::PanicOnDrop;
-    use crate::test_support::long_running_command;
-    use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytesExt};
+    use crate::test_support::{ScriptedOutput, long_running_command};
+    use crate::{
+        BestEffortDelivery, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NoReplay,
+        NumBytesExt,
+    };
     use assertr::prelude::*;
 
     #[cfg(windows)]
@@ -643,12 +647,6 @@ fn main() {
 "#;
 
     #[cfg(windows)]
-    fn wait_options(timeout: Option<Duration>) -> crate::WaitForCompletionOptions {
-        crate::WaitForCompletionOptions::builder()
-            .timeout(timeout)
-            .build()
-    }
-
     #[cfg(windows)]
     fn compile_ctrl_break_helper(dir: &std::path::Path) -> std::path::PathBuf {
         let source_path = dir.join("ctrl_break_helper.rs");
@@ -675,22 +673,12 @@ fn main() {
         exe_path
     }
 
-    #[cfg(not(windows))]
     fn immediately_exiting_command() -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg("exit 0");
-        cmd
-    }
-
-    #[cfg(windows)]
-    fn immediately_exiting_command() -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new("cmd");
-        cmd.args(["/C", "exit", "0"]);
-        cmd
+        ScriptedOutput::builder().build()
     }
 
     fn spawn_long_running_process()
-    -> crate::BroadcastProcessHandle<crate::BestEffortDelivery, crate::NoReplay> {
+    -> ProcessHandle<BroadcastOutputStream<BestEffortDelivery, NoReplay>> {
         crate::Process::new(long_running_command(Duration::from_secs(5)))
             .name("long-running")
             .stdout_and_stderr(|stream| {
@@ -706,7 +694,7 @@ fn main() {
     }
 
     fn spawn_immediately_exiting_process()
-    -> crate::BroadcastProcessHandle<crate::BestEffortDelivery, crate::NoReplay> {
+    -> ProcessHandle<BroadcastOutputStream<BestEffortDelivery, NoReplay>> {
         crate::Process::new(immediately_exiting_command())
             .name("immediate-exit")
             .stdout_and_stderr(|stream| {
@@ -986,7 +974,7 @@ fn main() {
     }
 
     #[tokio::test]
-    async fn test_termination() {
+    async fn terminate_stops_process() {
         let started_at = jiff::Zoned::now();
         let mut handle = crate::Process::new(long_running_command(Duration::from_secs(5)))
             .name("long-running")
@@ -1011,6 +999,7 @@ fn main() {
         assert_that!(ran_for.as_secs_f32()).is_close_to(0.1, 0.5);
 
         assert_that!(exit_status.code()).is_none();
+        assert_that!(exit_status.success()).is_false();
         assert_that!(handle.cleanup_on_drop).is_false();
         assert_that!(&handle.panic_on_drop).is_none();
     }
@@ -1167,7 +1156,7 @@ fn main() {
         process.send_interrupt_signal().unwrap();
 
         let exit_status = process
-            .wait_for_completion(wait_options(Some(Duration::from_secs(5))))
+            .wait_for_completion(Some(Duration::from_secs(5)))
             .await
             .unwrap();
         assert_that!(exit_status.code())

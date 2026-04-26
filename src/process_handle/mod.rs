@@ -9,7 +9,6 @@ mod termination;
 mod wait;
 
 use crate::output_stream::OutputStream;
-use crate::output_stream::backend::broadcast::BroadcastOutputStream;
 use crate::panic_on_drop::PanicOnDrop;
 use std::borrow::Cow;
 use std::io;
@@ -17,30 +16,23 @@ use std::process::ExitStatus;
 use tokio::process::Child;
 use tokio::process::ChildStdin;
 
-pub use options::{
-    LineOutputOptions, RawOutputOptions, WaitForCompletionOptions,
-    WaitForCompletionOrTerminateOptions, WaitForCompletionOrTerminateWithOutputOptions,
-    WaitForCompletionOrTerminateWithRawOutputOptions,
-    WaitForCompletionOrTerminateWithTrustedLineOutputOptions, WaitForCompletionWithOutputOptions,
-    WaitForCompletionWithRawOutputOptions, WaitForCompletionWithTrustedLineOutputOptions,
-};
+pub use options::WaitForCompletionOrTerminateOptions;
+pub use output_collection::{LineOutputOptions, RawOutputOptions};
 
-/// Process handle returned by broadcast spawning.
-pub type BroadcastProcessHandle<StdoutD, StdoutR, StderrD = StdoutD, StderrR = StdoutR> =
-    ProcessHandle<BroadcastOutputStream<StdoutD, StdoutR>, BroadcastOutputStream<StderrD, StderrR>>;
-
-/// Represents the stdin stream of a child process.
+/// Represents the `stdin` stream of a child process.
 ///
 /// stdin is always configured as piped, so it starts as `Open` with a [`ChildStdin`] handle
 /// that can be used to write data to the process. It can be explicitly closed by calling
 /// [`Stdin::close`], or implicitly closed by terminal wait helpers such as
 /// [`ProcessHandle::wait_for_completion`] and [`ProcessHandle::kill`], after which it transitions
-/// to the `Closed` state.
+/// to the `Closed` state. Note that some operations (kill) close `stdin` early in order to match
+/// the behavior of tokio.
 #[derive(Debug)]
 pub enum Stdin {
-    /// stdin is open and available for writing.
+    /// `stdin` is open and available for writing.
     Open(ChildStdin),
-    /// stdin has been closed.
+
+    /// `stdin` has been closed.
     Closed,
 }
 
@@ -106,7 +98,11 @@ impl From<RunningState> for bool {
 /// If applicable, a process handle can be wrapped in a [`crate::TerminateOnDrop`] to be terminated
 /// automatically upon being dropped. Note that this requires a multi-threaded runtime!
 #[derive(Debug)]
-pub struct ProcessHandle<Stdout: OutputStream, Stderr: OutputStream = Stdout> {
+pub struct ProcessHandle<Stdout, Stderr = Stdout>
+where
+    Stdout: OutputStream,
+    Stderr: OutputStream,
+{
     pub(crate) name: Cow<'static, str>,
     child: Child,
     std_in: Stdin,
@@ -189,194 +185,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
-        LineCollectionOptions, LineOverflowBehavior, LineParsingOptions, NumBytesExt,
-    };
+    use crate::test_support::long_running_command;
     use assertr::prelude::*;
+    use std::process::Stdio;
     use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
-
-    fn wait_options(timeout: Option<Duration>) -> WaitForCompletionOptions {
-        WaitForCompletionOptions::builder().timeout(timeout).build()
-    }
-
-    fn line_parsing_options() -> LineParsingOptions {
-        LineParsingOptions::builder()
-            .max_line_length(16.kilobytes())
-            .overflow_behavior(LineOverflowBehavior::default())
-            .build()
-    }
-
-    fn line_collection_options() -> LineCollectionOptions {
-        LineCollectionOptions::builder()
-            .max_bytes(1.megabytes())
-            .max_lines(1024)
-            .overflow_behavior(CollectionOverflowBehavior::default())
-            .build()
-    }
-
-    fn line_output_options() -> LineOutputOptions {
-        let line_collection_options = line_collection_options();
-        LineOutputOptions::builder()
-            .line_parsing_options(line_parsing_options())
-            .stdout_collection_options(line_collection_options)
-            .stderr_collection_options(line_collection_options)
-            .build()
-    }
-
-    fn wait_with_line_output_options(
-        timeout: Option<Duration>,
-    ) -> WaitForCompletionWithOutputOptions {
-        WaitForCompletionWithOutputOptions::builder()
-            .timeout(timeout)
-            .line_output_options(line_output_options())
-            .build()
-    }
 
     #[tokio::test]
-    async fn test_stdin_write_and_read() {
-        let cmd = tokio::process::Command::new("cat");
-        let mut process = crate::Process::new(cmd)
-            .name("cat")
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .replay_last_bytes(1.megabytes())
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
+    async fn open_stdin_reports_open_until_closed() {
+        let mut child = long_running_command(Duration::from_secs(5))
+            .stdin(Stdio::piped())
             .spawn()
             .unwrap();
+        let child_stdin = child.stdin.take().unwrap();
+        let mut stdin = Stdin::Open(child_stdin);
 
-        assert_that!(process.stdin().is_open()).is_true();
+        assert_that!(stdin.is_open()).is_true();
+        assert_that!(stdin.as_mut().is_some()).is_true();
 
-        let test_data = b"Hello from stdin!\n";
-        if let Some(stdin) = process.stdin().as_mut() {
-            stdin.write_all(test_data).await.unwrap();
-            stdin.flush().await.unwrap();
-        }
+        stdin.close();
 
-        process.stdin().close();
-        assert_that!(process.stdin().is_open()).is_false();
+        assert_that!(stdin.is_open()).is_false();
+        assert_that!(stdin.as_mut()).is_none();
 
-        let output = process
-            .wait_for_completion_with_output(wait_with_line_output_options(Some(
-                Duration::from_secs(2),
-            )))
-            .await
-            .unwrap();
-
-        assert_that!(output.status.success()).is_true();
-        assert_that!(output.stdout.lines().len()).is_equal_to(1);
-        assert_that!(output.stdout[0].as_str()).is_equal_to("Hello from stdin!");
+        child.kill().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn test_stdin_close_sends_eof() {
-        let cmd = tokio::process::Command::new("cat");
-        let mut process = crate::Process::new(cmd)
-            .name("cat")
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .unwrap();
+    #[test]
+    fn closed_stdin_reports_closed() {
+        let mut stdin = Stdin::Closed;
 
-        process.stdin().close();
-        assert_that!(process.stdin().is_open()).is_false();
+        assert_that!(stdin.is_open()).is_false();
+        assert_that!(stdin.as_mut()).is_none();
 
-        let status = process
-            .wait_for_completion(wait_options(Some(Duration::from_secs(2))))
-            .await
-            .unwrap();
+        stdin.close();
 
-        assert_that!(status.success()).is_true();
-    }
-
-    #[tokio::test]
-    async fn test_stdin_multiple_writes() {
-        let cmd = tokio::process::Command::new("cat");
-        let mut process = crate::Process::new(cmd)
-            .name("cat")
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .replay_last_bytes(1.megabytes())
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .unwrap();
-
-        if let Some(stdin) = process.stdin().as_mut() {
-            stdin.write_all(b"Line 1\n").await.unwrap();
-            stdin.write_all(b"Line 2\n").await.unwrap();
-            stdin.write_all(b"Line 3\n").await.unwrap();
-            stdin.flush().await.unwrap();
-        }
-
-        process.stdin().close();
-
-        let output = process
-            .wait_for_completion_with_output(wait_with_line_output_options(Some(
-                Duration::from_secs(2),
-            )))
-            .await
-            .unwrap();
-
-        assert_that!(output.stdout.lines().len()).is_equal_to(3);
-        assert_that!(output.stdout[0].as_str()).is_equal_to("Line 1");
-        assert_that!(output.stdout[1].as_str()).is_equal_to("Line 2");
-        assert_that!(output.stdout[2].as_str()).is_equal_to("Line 3");
-    }
-
-    #[tokio::test]
-    async fn test_shell_command_dispatch() {
-        let cmd = tokio::process::Command::new("sh");
-
-        let mut process = crate::Process::new(cmd)
-            .name(AutoName::program_only())
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .replay_last_bytes(1.megabytes())
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .unwrap();
-
-        let collector = process
-            .stdout()
-            .collect_lines_into_vec(LineParsingOptions::default(), line_collection_options());
-
-        if let Some(stdin) = process.stdin().as_mut() {
-            stdin
-                .write_all(b"printf 'Hello from shell\\n'\nexit\n")
-                .await
-                .unwrap();
-            stdin.flush().await.unwrap();
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        process.stdin().close();
-        process
-            .wait_for_completion(wait_options(Some(Duration::from_secs(1))))
-            .await
-            .unwrap();
-
-        let collected = collector.wait().await.unwrap();
-        assert_that!(collected.lines().len()).is_equal_to(1);
-        assert_that!(collected[0].as_str()).is_equal_to("Hello from shell");
+        assert_that!(stdin.is_open()).is_false();
+        assert_that!(stdin.as_mut()).is_none();
     }
 }

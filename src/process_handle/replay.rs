@@ -71,19 +71,16 @@ impl ProcessHandle<SingleSubscriberOutputStream> {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::long_running_command;
     use crate::{
         AutoName, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytesExt, Process,
-        WaitForCompletionOptions,
     };
     use assertr::prelude::*;
-    use tokio::process::Command;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn process_handle_seal_output_replay_seals_stdout_and_stderr() {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sleep 0.1");
-
-        let process = Process::new(cmd)
+        let process = Process::new(long_running_command(Duration::from_millis(100)))
             .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
@@ -105,9 +102,6 @@ mod tests {
         assert_that!(process.stderr().is_replay_sealed()).is_true();
 
         let mut process = process;
-        let _ = process
-            .wait_for_completion(WaitForCompletionOptions::builder().timeout(None).build())
-            .await
-            .unwrap();
+        let _ = process.wait_for_completion(None).await.unwrap();
     }
 }
