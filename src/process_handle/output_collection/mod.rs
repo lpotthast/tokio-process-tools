@@ -1,23 +1,23 @@
 mod drain;
-mod options;
+pub(crate) mod options;
 #[cfg(test)]
 mod tests;
-
-pub use options::{LineOutputOptions, RawOutputOptions};
 
 use self::drain::{
     wait_for_completion_or_terminate_with_collectors, wait_for_completion_with_collectors,
 };
-use super::{ProcessHandle, WaitForCompletionOrTerminateOptions};
+use super::ProcessHandle;
 use crate::error::{WaitForCompletionWithOutputError, WaitForCompletionWithOutputOrTerminateError};
 use crate::output::ProcessOutput;
-use crate::output_stream::collectable::CollectableOutputStream;
+use crate::output_stream::Collectable;
+use crate::process_handle::options::WaitForCompletionOrTerminateOptions;
+use crate::process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
 use crate::{CollectedBytes, CollectedLines};
 
 impl<Stdout, Stderr> ProcessHandle<Stdout, Stderr>
 where
-    Stdout: CollectableOutputStream,
-    Stderr: CollectableOutputStream,
+    Stdout: Collectable,
+    Stderr: Collectable,
 {
     /// Waits for the process to complete while collecting line output.
     ///

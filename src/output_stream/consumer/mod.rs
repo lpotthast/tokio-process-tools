@@ -1,6 +1,8 @@
-use crate::output_stream::{LineParserState, LineParsingOptions, Next};
+use crate::output_stream::Next;
+use crate::output_stream::line::{LineParserState, LineParsingOptions};
 use std::borrow::Cow;
 
+#[macro_use]
 pub(crate) mod api;
 pub(crate) mod collect;
 pub(crate) mod inspect;

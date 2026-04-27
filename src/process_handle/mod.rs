@@ -1,7 +1,7 @@
 mod drop_guard;
 mod into_inner;
-mod options;
-mod output_collection;
+pub(crate) mod options;
+pub(crate) mod output_collection;
 mod replay;
 mod spawn;
 mod state;
@@ -15,9 +15,6 @@ use std::io;
 use std::process::ExitStatus;
 use tokio::process::Child;
 use tokio::process::ChildStdin;
-
-pub use options::WaitForCompletionOrTerminateOptions;
-pub use output_collection::{LineOutputOptions, RawOutputOptions};
 
 /// Represents the `stdin` stream of a child process.
 ///

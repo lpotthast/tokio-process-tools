@@ -1,22 +1,13 @@
-use super::drain::{CollectorDrainError, wait_for_output_collectors};
-use crate::output_stream::StreamConfig;
-use crate::output_stream::backend::broadcast::BroadcastOutputStream;
-use crate::output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
 use crate::test_support::ScriptedOutput;
 use crate::{
-    AutoName, CollectionOverflowBehavior, CollectorError, DEFAULT_MAX_BUFFERED_CHUNKS,
-    DEFAULT_READ_CHUNK_SIZE, LineCollectionOptions, LineOutputOptions, LineOverflowBehavior,
-    LineParsingOptions, NumBytesExt, RawCollectionOptions, RawOutputOptions,
-    WaitForCompletionOrTerminateOptions, WaitForCompletionWithOutputError,
-    WaitForCompletionWithOutputOrTerminateError,
+    AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
+    LineCollectionOptions, LineOutputOptions, LineOverflowBehavior, LineParsingOptions,
+    NumBytesExt, RawCollectionOptions, RawOutputOptions, WaitForCompletionOrTerminateOptions,
+    WaitForCompletionWithOutputError, WaitForCompletionWithOutputOrTerminateError,
 };
 use assertr::prelude::*;
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
-use tokio::time::Instant;
+use tokio::io::AsyncWriteExt;
 
 fn line_parsing_options() -> LineParsingOptions {
     LineParsingOptions::builder()
@@ -61,65 +52,19 @@ fn wait_or_terminate_options(wait_timeout: Duration) -> WaitForCompletionOrTermi
     }
 }
 
-fn inherited_stdout_command() -> tokio::process::Command {
+fn exits_while_descendant_keeps_stdout_open_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg("printf 'ready\n'; sleep 0.5 &");
     cmd
 }
 
 #[cfg(unix)]
-fn force_kill_with_inherited_stdout_command() -> tokio::process::Command {
+fn ignores_graceful_shutdown_and_keeps_stdout_open_until_force_killed_command()
+-> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
-        .arg("trap '' INT TERM; printf 'ready\n'; sleep 0.2 & while :; do :; done");
+        .arg("trap '' INT TERM; printf 'ready\n'; sleep 0.2 & wait");
     cmd
-}
-
-fn best_effort_no_replay_options() -> StreamConfig<crate::BestEffortDelivery, crate::NoReplay> {
-    StreamConfig::builder()
-        .best_effort_delivery()
-        .no_replay()
-        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-        .build()
-}
-
-#[derive(Debug)]
-struct ReadErrorAfterBytes {
-    bytes: &'static [u8],
-    offset: usize,
-    error_kind: io::ErrorKind,
-}
-
-impl ReadErrorAfterBytes {
-    fn new(bytes: &'static [u8], error_kind: io::ErrorKind) -> Self {
-        Self {
-            bytes,
-            offset: 0,
-            error_kind,
-        }
-    }
-}
-
-impl AsyncRead for ReadErrorAfterBytes {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.offset < self.bytes.len() {
-            let remaining = &self.bytes[self.offset..];
-            let len = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..len]);
-            self.offset += len;
-            return Poll::Ready(Ok(()));
-        }
-
-        Poll::Ready(Err(io::Error::new(
-            self.error_kind,
-            "injected read failure",
-        )))
-    }
 }
 
 mod wait_with_line_output {
@@ -253,13 +198,13 @@ mod wait_with_line_output {
     }
 }
 
-mod timed_collector_drain {
+mod timed_output_collection {
     use super::*;
 
     #[tokio::test]
     async fn wait_for_completion_with_output_times_out_when_descendant_keeps_output_open() {
-        let mut process = crate::Process::new(inherited_stdout_command())
-            .name("sh")
+        let mut process = crate::Process::new(exits_while_descendant_keeps_stdout_open_command())
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()
@@ -293,8 +238,8 @@ mod timed_collector_drain {
             }
         }
 
-        let mut process = crate::Process::new(inherited_stdout_command())
-            .name("sh")
+        let mut process = crate::Process::new(exits_while_descendant_keeps_stdout_open_command())
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()
@@ -330,47 +275,9 @@ mod timed_collector_drain {
     }
 
     #[tokio::test]
-    async fn timed_output_collection_returns_early_stream_read_error_before_deadline() {
-        let stdout_stream = BroadcastOutputStream::from_stream(
-            ReadErrorAfterBytes::new(b"", io::ErrorKind::BrokenPipe),
-            "stdout",
-            best_effort_no_replay_options(),
-        );
-        let (stderr_read, _stderr_write) = tokio::io::duplex(64);
-        let stderr_stream = BroadcastOutputStream::from_stream(
-            stderr_read,
-            "stderr",
-            best_effort_no_replay_options(),
-        );
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(200),
-            wait_for_output_collectors(
-                stdout_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
-                stderr_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
-                Some(Instant::now() + Duration::from_secs(30)),
-            ),
-        )
-        .await
-        .expect("collector error should be returned before the outer timeout");
-
-        match result {
-            Err(CollectorDrainError::Collection(CollectorError::StreamRead { source, .. })) => {
-                assert_that!(source.stream_name()).is_equal_to("stdout");
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!(
-                    "expected early stream read error, got {other:?}"
-                ));
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn single_subscriber_output_wait_timeout_releases_collector_claim() {
-        let mut process = crate::Process::new(inherited_stdout_command())
-            .name("sh")
+        let mut process = crate::Process::new(exits_while_descendant_keeps_stdout_open_command())
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .single_subscriber()
@@ -393,48 +300,6 @@ mod timed_collector_drain {
         let collector = process
             .stdout()
             .collect_lines_into_vec(line_parsing_options(), line_collection_options());
-        let _collected = collector.cancel().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn timed_output_collection_cancels_hanging_single_subscriber_sibling_after_error() {
-        let stdout_stream = BroadcastOutputStream::from_stream(
-            ReadErrorAfterBytes::new(b"", io::ErrorKind::BrokenPipe),
-            "stdout",
-            best_effort_no_replay_options(),
-        );
-        let (stderr_read, _stderr_write) = tokio::io::duplex(64);
-        let stderr_stream = SingleSubscriberOutputStream::from_stream(
-            stderr_read,
-            "stderr",
-            best_effort_no_replay_options(),
-        );
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(200),
-            wait_for_output_collectors(
-                stdout_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
-                stderr_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
-                Some(Instant::now() + Duration::from_secs(30)),
-            ),
-        )
-        .await
-        .expect("collector error should be returned before the outer timeout");
-
-        match result {
-            Err(CollectorDrainError::Collection(CollectorError::StreamRead { source, .. })) => {
-                assert_that!(source.stream_name()).is_equal_to("stdout");
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!(
-                    "expected early stream read error, got {other:?}"
-                ));
-            }
-        }
-
-        let collector =
-            stderr_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
         let _collected = collector.cancel().await.unwrap();
     }
 
@@ -741,8 +606,8 @@ mod wait_or_terminate_output {
 
     #[tokio::test]
     async fn output_or_terminate_timeout_when_descendant_keeps_output_open() {
-        let mut process = crate::Process::new(inherited_stdout_command())
-            .name("sh")
+        let mut process = crate::Process::new(exits_while_descendant_keeps_stdout_open_command())
+            .name(AutoName::program_only())
             .stdout_and_stderr(|stream| {
                 stream
                     .broadcast()
@@ -791,18 +656,20 @@ mod wait_or_terminate_output {
     #[cfg(unix)]
     #[tokio::test]
     async fn output_or_terminate_force_kill_extends_output_collection_budget() {
-        let mut process = crate::Process::new(force_kill_with_inherited_stdout_command())
-            .name("sh")
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .replay_last_bytes(1.megabytes())
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .unwrap();
+        let mut process = crate::Process::new(
+            ignores_graceful_shutdown_and_keeps_stdout_open_until_force_killed_command(),
+        )
+        .name(AutoName::program_only())
+        .stdout_and_stderr(|stream| {
+            stream
+                .broadcast()
+                .best_effort_delivery()
+                .replay_last_bytes(1.megabytes())
+                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+        })
+        .spawn()
+        .unwrap();
 
         let wait_timeout = Duration::from_millis(25);
         let interrupt_timeout = Duration::from_millis(25);

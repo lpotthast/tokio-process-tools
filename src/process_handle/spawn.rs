@@ -1,7 +1,7 @@
 use super::{ProcessHandle, Stdin};
 use crate::error::SpawnError;
 use crate::output_stream::OutputStream;
-use crate::process::ProcessStreamConfig;
+use crate::process::stream_config::ProcessStreamConfig;
 use crate::signal;
 use std::borrow::Cow;
 use std::process::Stdio;

@@ -1,6 +1,7 @@
 use super::{visit_final_line, visit_lines};
-use crate::output_stream::subscription::EventSubscription;
-use crate::output_stream::{LineParserState, LineParsingOptions, Next, StreamEvent};
+use crate::output_stream::event::StreamEvent;
+use crate::output_stream::line::{LineParserState, LineParsingOptions};
+use crate::output_stream::{Next, Subscription};
 use crate::{StreamReadError, WaitForLineResult};
 use std::borrow::Cow;
 use std::time::Duration;
@@ -11,7 +12,7 @@ pub(crate) async fn wait_for_line<S>(
     options: LineParsingOptions,
 ) -> Result<WaitForLineResult, StreamReadError>
 where
-    S: EventSubscription,
+    S: Subscription,
 {
     let mut parser = LineParserState::new();
 
@@ -55,7 +56,7 @@ pub(crate) async fn wait_for_line_with_optional_timeout<S>(
     timeout: Option<Duration>,
 ) -> Result<WaitForLineResult, StreamReadError>
 where
-    S: EventSubscription,
+    S: Subscription,
 {
     match timeout {
         None => wait_for_line(subscription, predicate, options).await,
@@ -70,7 +71,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_stream::Chunk;
+    use crate::output_stream::event::Chunk;
     use crate::{LineOverflowBehavior, NumBytesExt};
     use assertr::prelude::*;
     use bytes::Bytes;

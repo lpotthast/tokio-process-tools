@@ -13,7 +13,16 @@ use crate::CollectorError;
 
 /// Errors that can occur when terminating a process.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TerminationError {
+    /// Failed to manually send a graceful signal to the process.
+    SignalFailed {
+        /// The name of the process.
+        process_name: Cow<'static, str>,
+        /// Errors recorded while attempting to send the signal, in chronological order.
+        attempt_errors: Vec<TerminationAttemptError>,
+    },
+
     /// Failed to terminate the process after trying all platform termination signals.
     TerminationFailed {
         /// The name of the process.
@@ -26,25 +35,58 @@ pub enum TerminationError {
 impl fmt::Display for TerminationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SignalFailed {
+                process_name,
+                attempt_errors,
+            } => {
+                write!(f, "Failed to send signal to process '{process_name}'.")?;
+                write_attempt_errors(f, attempt_errors)
+            }
             Self::TerminationFailed {
                 process_name,
                 attempt_errors,
             } => {
                 write!(f, "Failed to terminate process '{process_name}'.")?;
-
-                if attempt_errors.is_empty() {
-                    return write!(f, " No termination attempt error was recorded.");
-                }
-
-                write!(f, " Attempt errors:")?;
-                for (index, attempt_error) in attempt_errors.iter().enumerate() {
-                    write!(f, " [{}] {attempt_error}", index + 1)?;
-                }
-
-                Ok(())
+                write_attempt_errors(f, attempt_errors)
             }
         }
     }
+}
+
+impl TerminationError {
+    /// The name of the process involved in the termination error.
+    #[must_use]
+    pub fn process_name(&self) -> &str {
+        match self {
+            Self::SignalFailed { process_name, .. }
+            | Self::TerminationFailed { process_name, .. } => process_name,
+        }
+    }
+
+    /// Errors recorded while attempting the operation, in chronological order.
+    #[must_use]
+    pub fn attempt_errors(&self) -> &[TerminationAttemptError] {
+        match self {
+            Self::SignalFailed { attempt_errors, .. }
+            | Self::TerminationFailed { attempt_errors, .. } => attempt_errors,
+        }
+    }
+}
+
+fn write_attempt_errors(
+    f: &mut fmt::Formatter<'_>,
+    attempt_errors: &[TerminationAttemptError],
+) -> fmt::Result {
+    if attempt_errors.is_empty() {
+        return write!(f, " No attempt error was recorded.");
+    }
+
+    write!(f, " Attempt errors:")?;
+    for (index, attempt_error) in attempt_errors.iter().enumerate() {
+        write!(f, " [{}] {attempt_error}", index + 1)?;
+    }
+
+    Ok(())
 }
 
 /// A failed operation recorded while attempting to terminate a process.
@@ -59,7 +101,7 @@ pub struct TerminationAttemptError {
     pub signal_name: Option<&'static str>,
     /// Original source error.
     #[source]
-    pub source: Box<dyn Error + 'static>,
+    pub source: Box<dyn Error + Send + Sync + 'static>,
 }
 
 impl fmt::Display for TerminationAttemptError {

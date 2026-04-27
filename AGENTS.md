@@ -2,36 +2,51 @@
 
 ## Project Structure & Module Organization
 
-This repository is a small Rust library crate. Core code lives in `src/`, with the public API exported from
-`src/lib.rs`. Process orchestration is centered around `src/process.rs` and `src/process_handle.rs`; error types live in
-`src/error.rs`; output handling is split across `src/output.rs`, `src/collector.rs`, `src/inspector.rs`, and
-`src/output_stream/`. Platform-specific termination logic is isolated in `src/signal.rs`.
+This repository is a Rust library crate. Public API surface is declared in `src/lib.rs`, which also re-exports
+`README.md` as crate-level Rustdoc. Treat the `pub use` block in `src/lib.rs` as the canonical export map before making
+API changes.
 
-The crate is a thin async wrapper around `tokio::process::Child` that adds structured output handling, graceful
-termination, and safe drop semantics. Keep these architectural constraints in mind when changing behavior:
+The crate wraps `tokio::process::Child` with typed stream backends, structured output consumption, graceful
+termination, and strict process-handle drop semantics. Core subsystems live under `src/`:
 
-- `Process` wraps a `tokio::process::Command` and exposes `.spawn_broadcast()` and `.spawn_single_subscriber()`. Each
-  returns a typed `ProcessHandle<O>` where `O: OutputStream`, so the stream backend choice is compile-time, not runtime.
-- `src/output_stream/broadcast.rs` is the multi-consumer backend built on `tokio::sync::broadcast`.
-  `src/output_stream/single_subscriber.rs` is the lower-overhead single-consumer backend and must continue to reject a
-  second subscriber.
-- Shared chunk and line parsing behavior lives in `src/output_stream/mod.rs` and `src/output_stream/impls.rs`.
-  `LineParsingOptions`, `LineOverflowBehavior`, EOF handling, and surfacing a final unterminated line are load-bearing
-  behavior.
-- `Inspector` and `Collector` each spawn Tokio tasks around stream consumption. Their handles must continue to support
-  clean `wait()` and `cancel()` behavior.
-- `ProcessHandle` drop semantics are intentionally strict. Dropping a live handle without explicit cleanup triggers
-  best-effort cleanup and a panic via `PanicOnDrop`. The opt-out paths are `wait_for_completion*`, `terminate*`,
-  `.terminate_on_drop(...)`, or `must_not_be_terminated()`.
-- `TerminateOnDrop` requires a multi-threaded Tokio runtime.
-- Termination escalates across platform-specific signals in `src/signal.rs`. Preserve the current Unix and Windows
+- `process/` owns the public spawn builder. `builder.rs` stages process naming and stdout/stderr configuration before
+  spawn, `stream_config.rs` maps typed stream-builder choices into concrete stream backends, and `name.rs` controls
+  explicit and auto-generated process names used in errors and tracing.
+- `process_handle/` owns the lifecycle of a spawned child. It is split by behavior: spawning and stdio capture,
+  stdin/state access, waiting, termination, output-collecting wait helpers, replay sealing, `into_inner`, and drop
+  guards. Keep cleanup and panic-on-drop behavior centralized here.
+- `output_stream/` owns stream configuration, delivery/replay policy marker types, chunk events, line parsing,
+  consumer APIs, and backend implementations. `config.rs`, `options.rs`, and `policy.rs` define shared typed
+  configuration; `event.rs`, `line.rs`, and `line_waiter.rs` define shared stream data and parsing behavior.
+- `output_stream/backend/broadcast/` is the multi-consumer backend. It has a fast `tokio::sync::broadcast` path for
+  best-effort/no-replay streams and a shared-state path for reliable delivery and replay retention.
+- `output_stream/backend/single_subscriber/` is the lower-overhead single-consumer backend. It must continue to reject a
+  second active consumer while preserving replay behavior for configured streams.
+- `output_stream/consumer/` implements the shared stream-consumer surface for both backends: inspection, collection,
+  line waiting, and writing into async sinks. The macro in `consumer/api.rs` attaches that API to backend types.
+- `collector.rs` and `inspector.rs` define the task handles returned by consumer APIs. They must keep cancellation-safe
+  `wait`, `cancel`, `abort`, and timeout cleanup semantics.
+- `error.rs` contains public error types, `output.rs` contains `ProcessOutput`, `terminate_on_drop.rs` and
+  `async_drop.rs` implement async cleanup during drop, `panic_on_drop.rs` implements the misuse guard, and `signal.rs`
+  isolates platform-specific interrupt/terminate/kill behavior.
+- `test_support.rs` provides crate-internal test utilities. Larger backend tests live beside their implementations in
+  backend-local `tests/` submodules. Benchmarks live in `benches/`.
+
+Keep these architectural constraints in mind when changing behavior:
+
+- Stream backend choice is compile-time typed through `ProcessStreamBuilder`, `StreamConfig<D, R>`, and
+  `ProcessHandle<Stdout, Stderr>`; do not replace this with runtime backend switching.
+- `LineParsingOptions`, `LineOverflowBehavior`, gap handling, EOF handling, and surfacing a final unterminated line are
+  shared load-bearing behavior for inspectors, collectors, waiters, and output-collection helpers.
+- `ProcessHandle` drop semantics are intentionally strict. Dropping a live armed handle performs best-effort cleanup
+  and panics through `PanicOnDrop`; explicit opt-out or cleanup paths are `wait_for_completion*`, `terminate*`, `kill`,
+  `.terminate_on_drop(...)`, `into_inner()`, or `must_not_be_terminated()`.
+- `TerminateOnDrop` requires a multi-threaded Tokio runtime because it runs async termination from synchronous `Drop`.
+- Termination escalates through platform-specific signaling in `src/signal.rs`; preserve the current Unix and Windows
   behavior when modifying shutdown logic.
-- `ProcessHandle::stdin()` exposes piped stdin via the `Stdin` enum. Closing stdin must continue to signal EOF to the
-  child process.
-
-The `pub use` block at the top of `src/lib.rs` is the canonical list of public types and the fastest way to orient
-yourself before making API changes. Use `README.md` as the primary user-facing behavior and example reference; it is
-also re-exported as crate-level Rustdoc.
+- `ProcessHandle::stdin()` exposes piped stdin through the `Stdin` enum. Closing stdin must continue to drop the pipe
+  and signal EOF to the child process.
+- Use `README.md` as the primary user-facing behavior and example reference when public behavior changes.
 
 ## Build, Test, and Development Commands
 
@@ -56,25 +71,34 @@ include concise Rustdoc comments. Prefer small, focused modules over large cross
 
 ## Testing Guidelines
 
-Prefer inline `#[cfg(test)]` modules beside the code they verify. When tests grow very large, consider an additional
-`{module_name}_tests.rs` next to the affected module. But: This may hint that the module is too large, having too many
-responsibilities and that it needs to be split.
+Prefer inline `#[cfg(test)]` modules beside the code they verify. Keep related behavior cases together and reuse
+existing test setup/helpers instead of creating parallel test scaffolding.
 
-This crate uses `#[tokio::test]` heavily. Any test that exercises `TerminateOnDrop` must use
-`#[tokio::test(flavor = "multi_thread")]`, because the single-threaded runtime cannot drive the async drop path
-correctly.
+When an inline test module becomes hard to navigate, consider moving cohesive tests into a `{module_name}_tests.rs` file
+next to the affected module. If too large for one file, consider a dedicated test submodule.
 
-Assertions use the `assertr` crate consistently via `assert_that!(...)`. Other relevant test dependencies include
-`tracing-test`, `tempfile`, `mockall`, and `tokio-test`.
+Do not use a separate test file as a dumping ground for unrelated regression cases; a large test module may indicate
+that the production module has too many responsibilities and should be split.
 
-Name tests after observable behavior.
+Name tests after observable behavior, not after implementation details, or the fact that the test is a regression. The
+test name should describe the contract being protected.
 
 Group tests into focused submodules. If there are multiple tests for a function, name the submodule after the function
 and do not repeat the function name in the test name.
 
-Run `cargo test` locally before pushing.
+When changing or fixing behavior, first inspect the existing tests for the affected module. Prefer extending, renaming,
+or broadening an existing behavior-focused test or test table when that keeps related cases together.
 
-Add regression coverage for bug fixes.
+Add a new regression test only when the changed behavior is not already covered by a suitable nearby test, or when a
+separate test makes the behavior clearer than extending an existing one. Avoid duplicate scenario tests whose only
+purpose is to prove that a change was made.
+
+Assertions should consistently be written using the `assertr` crate via `assert_that!(...)` and
+`use assertr::prelude::*;`.
+
+This crate uses `#[tokio::test]` heavily. Any test that exercises `TerminateOnDrop` must use
+`#[tokio::test(flavor = "multi_thread")]`, because the single-threaded runtime cannot drive the async drop path
+correctly.
 
 ## Required Change Workflow
 
@@ -86,7 +110,8 @@ Use `## [Unreleased]` in `CHANGELOG.md` as the default landing place for change 
    iterations.
 2. Re-evaluate the SemVer impact of the resulting changelog entry when you add or revise it.
 3. If a change is SemVer-breaking, start its markdown list item with `- **Breaking:** ...`.
-4. Do not bump crate versions or README dependency snippets for ordinary in-progress changes.
+4. Do not bump crate versions or README.md dependency snippets for ordinary in-progress changes.
+5. Do update README.md when relevant (e.g. change affects examples shown in it).
 
 Right before publishing:
 
@@ -99,9 +124,26 @@ Right before publishing:
    from the new tag.
 7. Run `just tidy` as the final verification step.
 
+## Change Verification
+
+For final validation, prefer the repository verification target:
+
+- `just verify`
+
+This runs the full validation suite defined in `Justfile`: formatting check, clippy, tests, build, and docs.
+
+When changing code, run `just fmt` before final verification if formatting may be needed.
+
+If `just` is unavailable, run the equivalent commands directly:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features`
+- `cargo test --all-features`
+- `cargo build`
+- `cargo doc`
+
 ## Commit & Pull Request Guidelines
 
-Recent history favors short, imperative commit subjects such as `Allow programmatic stdin handling` or
-`Update documentation`. Keep commits focused and descriptive. For pull requests, include a clear summary, note any API
-or behavior changes, update `README.md` or `CHANGELOG.md` when relevant, and confirm `cargo fmt`, `cargo clippy`, and
-`cargo test` all pass.
+Favor short, imperative commit subjects. Keep commits focused and descriptive.
+
+For pull requests, include a clear summary and note any API or behavior changes.

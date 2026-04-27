@@ -1,5 +1,6 @@
 use crate::StreamReadError;
-use crate::output_stream::{Chunk, Next};
+use crate::output_stream::Next;
+use crate::output_stream::event::Chunk;
 use std::borrow::Cow;
 use std::future::Future;
 use std::io;
@@ -408,6 +409,40 @@ impl<S: Sink> Drop for Collector<S> {
         }
         if let Some(task) = self.task.take() {
             task.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assertr::prelude::*;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn cancel_or_abort_after_returns_cancelled_when_cooperative() {
+        let (task_termination_sender, task_termination_receiver) = oneshot::channel();
+        let collector = Collector {
+            stream_name: "custom",
+            task: Some(tokio::spawn(async move {
+                let _res = task_termination_receiver.await;
+                Ok(Vec::<u8>::new())
+            })),
+            task_termination_sender: Some(task_termination_sender),
+        };
+
+        let outcome = collector
+            .cancel_or_abort_after(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        match outcome {
+            CollectorCancelOutcome::Cancelled(bytes) => {
+                assert_that!(bytes).is_empty();
+            }
+            CollectorCancelOutcome::Aborted => {
+                assert_that!(()).fail("expected cooperative cancellation");
+            }
         }
     }
 }

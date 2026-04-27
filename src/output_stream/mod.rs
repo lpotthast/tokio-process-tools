@@ -1,20 +1,16 @@
 //! Process output stream types and helpers.
 
+#[macro_use]
+pub(crate) mod consumer;
+
 /// Output stream backend implementations.
 pub mod backend;
-
-/// Bounded in-memory output collection types and options.
-pub mod collection;
-
-pub(crate) mod collectable;
 
 /// Shared stream consumption configuration.
 pub mod config;
 
-pub(crate) mod consumer;
-
-mod event;
-mod line_waiter;
+pub(crate) mod event;
+pub(crate) mod line_waiter;
 
 /// Line parsing types and options.
 pub mod line;
@@ -25,30 +21,17 @@ pub mod options;
 /// Delivery and replay policy types shared by output stream backends.
 pub mod policy;
 
-pub(crate) mod subscription;
-
-pub use event::Chunk;
-
-#[allow(unused_imports)]
-pub(crate) use backend::broadcast::BroadcastOutputStream;
-#[allow(unused_imports)]
-pub(crate) use backend::single_subscriber::SingleSubscriberOutputStream;
-pub(crate) use config::{
-    StreamConfig, StreamConfigBuilder, StreamConfigMaxBufferedChunksBuilder,
-    StreamConfigReadChunkSizeBuilder, StreamConfigReadyBuilder, StreamConfigReplayBuilder,
+use crate::{
+    CollectedBytes, CollectedLines, Collector, LineCollectionOptions, RawCollectionOptions,
 };
-pub(crate) use event::StreamEvent;
-pub(crate) use line::{LineParserState, LineParsingOptions, LineWriteMode};
-pub(crate) use options::NumBytes;
-pub(crate) use policy::{
-    BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, ReliableDelivery, Replay,
-    ReplayEnabled, ReplayRetention,
-};
+use event::StreamEvent;
+use line::LineParsingOptions;
+use options::NumBytes;
 
 /// We support the following implementations:
 ///
-/// - [`BroadcastOutputStream`]
-/// - [`SingleSubscriberOutputStream`]
+/// - [`crate::BroadcastOutputStream`]
+/// - [`crate::SingleSubscriberOutputStream`]
 pub trait OutputStream {
     /// The maximum size of every chunk read by the backing `stream_reader`.
     fn read_chunk_size(&self) -> NumBytes;
@@ -59,6 +42,32 @@ pub trait OutputStream {
     /// Type of stream. Can be "stdout" or "stderr". But we do not guarantee this output.
     /// It should only be used for logging/debugging.
     fn name(&self) -> &'static str;
+}
+
+/// Capability trait for stream backends that can attach built-in collectors.
+///
+/// [`OutputStream`] intentionally only describes stream metadata. Generic process-handle
+/// collection methods need an additional bound for the concrete collector constructors they call,
+/// so this trait marks backends that support collecting output into the crate's standard in-memory
+/// buffers.
+pub trait Collectable: OutputStream {
+    /// Starts a collector that parses stream output into lines and stores them in memory.
+    fn collect_lines_into_vec(
+        &self,
+        parsing_options: LineParsingOptions,
+        collection_options: LineCollectionOptions,
+    ) -> Collector<CollectedLines>;
+
+    /// Starts a collector that stores raw output chunks in memory.
+    fn collect_chunks_into_vec(&self, options: RawCollectionOptions) -> Collector<CollectedBytes>;
+}
+
+pub(crate) trait Subscription: Send + 'static {
+    fn next_event(&mut self) -> impl Future<Output = Option<StreamEvent>> + Send + '_;
+}
+
+pub(crate) trait Subscribable: OutputStream {
+    fn subscribe(&self) -> impl Subscription;
 }
 
 /// Control flag to indicate whether processing should continue or break.

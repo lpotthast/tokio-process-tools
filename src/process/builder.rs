@@ -5,7 +5,18 @@ use crate::output_stream::OutputStream;
 use crate::process_handle::ProcessHandle;
 use std::marker::PhantomData;
 
-/// Initial builder stage for configuring and spawning a process.
+#[doc(hidden)]
+pub struct Unnamed;
+
+#[doc(hidden)]
+pub struct Named {
+    name: ProcessName,
+}
+
+#[doc(hidden)]
+pub struct Unset;
+
+/// Typestate builder for configuring and spawning a process.
 ///
 /// A process must be named before configuring output streams. This keeps public errors and tracing
 /// fields intentional, while stdout and stderr stream configuration remains explicit at the spawn
@@ -33,8 +44,18 @@ use std::marker::PhantomData;
 /// # Ok::<_, SpawnError>(())
 /// # });
 /// ```
-pub struct Process {
+pub struct Process<
+    NameState = Unnamed,
+    StdoutConfig = Unset,
+    Stdout = Unset,
+    StderrConfig = Unset,
+    Stderr = Unset,
+> {
     cmd: tokio::process::Command,
+    name_state: NameState,
+    stdout_config: StdoutConfig,
+    stderr_config: StderrConfig,
+    _streams: PhantomData<fn() -> (Stdout, Stderr)>,
 }
 
 impl Process {
@@ -58,7 +79,13 @@ impl Process {
     /// ```
     #[must_use]
     pub fn new(cmd: tokio::process::Command) -> Self {
-        Self { cmd }
+        Self {
+            cmd,
+            name_state: Unnamed,
+            stdout_config: Unset,
+            stderr_config: Unset,
+            _streams: PhantomData,
+        }
     }
 
     /// Sets how the process should be named.
@@ -68,61 +95,32 @@ impl Process {
     /// naming captures only the program name. Prefer `.name(...)` for stable safe
     /// labels when command arguments or environment variables may contain secrets.
     #[must_use]
-    pub fn name(self, name: impl Into<ProcessName>) -> NamedProcess {
-        NamedProcess {
+    pub fn name(self, name: impl Into<ProcessName>) -> Process<Named> {
+        Process {
             cmd: self.cmd,
-            name: name.into(),
+            name_state: Named { name: name.into() },
+            stdout_config: Unset,
+            stderr_config: Unset,
+            _streams: PhantomData,
         }
     }
 }
 
-/// Builder stage after a process name has been selected.
-///
-/// Stream backend, delivery, replay, and stream options must be selected before spawning.
-///
-/// ```compile_fail
-/// use tokio::process::Command;
-/// use tokio_process_tools::{AutoName, Process};
-///
-/// let _process = Process::new(Command::new("ls"))
-///     .name(AutoName::program_only())
-///     .spawn();
-/// ```
-///
-/// ```compile_fail
-/// use tokio::process::Command;
-/// use tokio_process_tools::{AutoName, Process};
-///
-/// let _process = Process::new(Command::new("ls"))
-///     .name(AutoName::program_only())
-///     .stdout_and_stderr(|stream| {
-///         stream
-///             .broadcast()
-///             .best_effort_delivery()
-///             .no_replay()
-///     })
-///     .spawn();
-/// ```
-pub struct NamedProcess {
-    cmd: tokio::process::Command,
-    name: ProcessName,
-}
-
-impl NamedProcess {
+impl Process<Named> {
     /// Configures stdout and stderr with the same output stream settings.
     #[must_use]
     pub fn stdout_and_stderr<Config, Stream>(
         self,
         configure: impl FnOnce(ProcessStreamBuilder) -> Config,
-    ) -> ConfiguredProcessBuilder<Config, Stream, Config, Stream>
+    ) -> Process<Named, Config, Stream, Config, Stream>
     where
         Config: ProcessStreamConfig<Stream> + Copy,
         Stream: OutputStream,
     {
         let config = configure(ProcessStreamBuilder);
-        ConfiguredProcessBuilder {
+        Process {
             cmd: self.cmd,
-            name: self.name,
+            name_state: self.name_state,
             stdout_config: config,
             stderr_config: config,
             _streams: PhantomData,
@@ -134,16 +132,17 @@ impl NamedProcess {
     pub fn stdout<StdoutConfig, Stdout>(
         self,
         configure: impl FnOnce(ProcessStreamBuilder) -> StdoutConfig,
-    ) -> ProcessBuilderWithStdout<StdoutConfig, Stdout>
+    ) -> Process<Named, StdoutConfig, Stdout>
     where
         StdoutConfig: ProcessStreamConfig<Stdout>,
         Stdout: OutputStream,
     {
-        ProcessBuilderWithStdout {
+        Process {
             cmd: self.cmd,
-            name: self.name,
+            name_state: self.name_state,
             stdout_config: configure(ProcessStreamBuilder),
-            _stdout: PhantomData,
+            stderr_config: Unset,
+            _streams: PhantomData,
         }
     }
 
@@ -152,32 +151,22 @@ impl NamedProcess {
     pub fn stderr<StderrConfig, Stderr>(
         self,
         configure: impl FnOnce(ProcessStreamBuilder) -> StderrConfig,
-    ) -> ProcessBuilderWithStderr<StderrConfig, Stderr>
+    ) -> Process<Named, Unset, Unset, StderrConfig, Stderr>
     where
         StderrConfig: ProcessStreamConfig<Stderr>,
         Stderr: OutputStream,
     {
-        ProcessBuilderWithStderr {
+        Process {
             cmd: self.cmd,
-            name: self.name,
+            name_state: self.name_state,
+            stdout_config: Unset,
             stderr_config: configure(ProcessStreamBuilder),
-            _stderr: PhantomData,
+            _streams: PhantomData,
         }
     }
 }
 
-/// Builder stage with configured stdout and pending stderr configuration.
-pub struct ProcessBuilderWithStdout<StdoutConfig, Stdout>
-where
-    Stdout: OutputStream,
-{
-    cmd: tokio::process::Command,
-    name: ProcessName,
-    stdout_config: StdoutConfig,
-    _stdout: PhantomData<fn() -> Stdout>,
-}
-
-impl<StdoutConfig, Stdout> ProcessBuilderWithStdout<StdoutConfig, Stdout>
+impl<StdoutConfig, Stdout> Process<Named, StdoutConfig, Stdout>
 where
     Stdout: OutputStream,
 {
@@ -186,15 +175,15 @@ where
     pub fn stderr<StderrConfig, Stderr>(
         self,
         configure: impl FnOnce(ProcessStreamBuilder) -> StderrConfig,
-    ) -> ConfiguredProcessBuilder<StdoutConfig, Stdout, StderrConfig, Stderr>
+    ) -> Process<Named, StdoutConfig, Stdout, StderrConfig, Stderr>
     where
         StdoutConfig: ProcessStreamConfig<Stdout>,
         StderrConfig: ProcessStreamConfig<Stderr>,
         Stderr: OutputStream,
     {
-        ConfiguredProcessBuilder {
+        Process {
             cmd: self.cmd,
-            name: self.name,
+            name_state: self.name_state,
             stdout_config: self.stdout_config,
             stderr_config: configure(ProcessStreamBuilder),
             _streams: PhantomData,
@@ -202,18 +191,7 @@ where
     }
 }
 
-/// Builder stage with configured stderr and pending stdout configuration.
-pub struct ProcessBuilderWithStderr<StderrConfig, Stderr>
-where
-    Stderr: OutputStream,
-{
-    cmd: tokio::process::Command,
-    name: ProcessName,
-    stderr_config: StderrConfig,
-    _stderr: PhantomData<fn() -> Stderr>,
-}
-
-impl<StderrConfig, Stderr> ProcessBuilderWithStderr<StderrConfig, Stderr>
+impl<StderrConfig, Stderr> Process<Named, Unset, Unset, StderrConfig, Stderr>
 where
     Stderr: OutputStream,
 {
@@ -222,15 +200,15 @@ where
     pub fn stdout<StdoutConfig, Stdout>(
         self,
         configure: impl FnOnce(ProcessStreamBuilder) -> StdoutConfig,
-    ) -> ConfiguredProcessBuilder<StdoutConfig, Stdout, StderrConfig, Stderr>
+    ) -> Process<Named, StdoutConfig, Stdout, StderrConfig, Stderr>
     where
         StderrConfig: ProcessStreamConfig<Stderr>,
         StdoutConfig: ProcessStreamConfig<Stdout>,
         Stdout: OutputStream,
     {
-        ConfiguredProcessBuilder {
+        Process {
             cmd: self.cmd,
-            name: self.name,
+            name_state: self.name_state,
             stdout_config: configure(ProcessStreamBuilder),
             stderr_config: self.stderr_config,
             _streams: PhantomData,
@@ -238,25 +216,8 @@ where
     }
 }
 
-/// Final builder stage for a configured process.
-pub struct ConfiguredProcessBuilder<
-    StdoutConfig,
-    Stdout,
-    StderrConfig = StdoutConfig,
-    Stderr = Stdout,
-> where
-    Stdout: OutputStream,
-    Stderr: OutputStream,
-{
-    cmd: tokio::process::Command,
-    name: ProcessName,
-    stdout_config: StdoutConfig,
-    stderr_config: StderrConfig,
-    _streams: PhantomData<fn() -> (Stdout, Stderr)>,
-}
-
 impl<StdoutConfig, Stdout, StderrConfig, Stderr>
-    ConfiguredProcessBuilder<StdoutConfig, Stdout, StderrConfig, Stderr>
+    Process<Named, StdoutConfig, Stdout, StderrConfig, Stderr>
 where
     Stdout: OutputStream,
     Stderr: OutputStream,
@@ -271,7 +232,7 @@ where
         StdoutConfig: ProcessStreamConfig<Stdout>,
         StderrConfig: ProcessStreamConfig<Stderr>,
     {
-        let name = generate_name(&self.name, &self.cmd);
+        let name = generate_name(&self.name_state.name, &self.cmd);
         ProcessHandle::<Stdout, Stderr>::spawn_with_stream_configs(
             name,
             self.cmd,
@@ -284,7 +245,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_stream::collectable::CollectableOutputStream;
+    use crate::output_stream::Collectable;
     use crate::test_support::ScriptedOutput;
     use crate::{
         AutoName, AutoNameSettings, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS,
@@ -315,8 +276,8 @@ mod tests {
     async fn assert_successful_completion<Stdout, Stderr>(
         mut process: ProcessHandle<Stdout, Stderr>,
     ) where
-        Stdout: CollectableOutputStream,
-        Stderr: CollectableOutputStream,
+        Stdout: Collectable,
+        Stderr: Collectable,
     {
         let ProcessOutput {
             status,
@@ -335,8 +296,8 @@ mod tests {
     async fn assert_out_and_err_completion<Stdout, Stderr>(
         mut process: ProcessHandle<Stdout, Stderr>,
     ) where
-        Stdout: CollectableOutputStream,
-        Stderr: CollectableOutputStream,
+        Stdout: Collectable,
+        Stderr: Collectable,
     {
         let output = process
             .wait_for_completion_with_output(Some(Duration::from_secs(2)), line_output_options())

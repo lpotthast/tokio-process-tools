@@ -1,16 +1,193 @@
 use super::collect_owned_final_line;
 use crate::collector::{Collector, CollectorTaskError, Sink};
-use crate::output_stream::collection::{
-    SinkWriteError, SinkWriteErrorAction, SinkWriteErrorHandler, SinkWriteOperation,
-    WriteCollectionOptions,
-};
-use crate::output_stream::subscription::EventSubscription;
-use crate::output_stream::{
-    Chunk, LineParserState, LineParsingOptions, LineWriteMode, StreamEvent,
-};
+use crate::output_stream::Subscription;
+use crate::output_stream::event::{Chunk, StreamEvent};
+use crate::output_stream::line::{LineParserState, LineParsingOptions};
 use std::borrow::Cow;
 use std::io;
 use tokio::io::AsyncWriteExt;
+
+/// Controls how line-based write helpers delimit successive lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineWriteMode {
+    /// Write lines exactly as parsed, without appending any delimiter.
+    ///
+    /// Use this when your mapper already includes delimiters or when the downstream format does
+    /// not want line separators reintroduced.
+    AsIs,
+
+    /// Append a trailing `\n` after each emitted line.
+    ///
+    /// This reconstructs conventional line-oriented output after parsing removed the original
+    /// newline byte.
+    AppendLf,
+}
+
+/// Action to take after an async writer sink rejects collected output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkWriteErrorAction {
+    /// Stop collection and return [`crate::CollectorError::SinkWrite`] from the collector.
+    Stop,
+
+    /// Accept the individual write failure and keep collecting later stream output.
+    Continue,
+}
+
+/// The write operation that failed while forwarding collected output into an async writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkWriteOperation {
+    /// A raw output chunk failed to write.
+    Chunk,
+
+    /// Parsed line bytes failed to write.
+    Line,
+
+    /// The line delimiter requested by [`crate::LineWriteMode::AppendLf`] failed to write.
+    LineDelimiter,
+}
+
+/// Details about a failed async write into a collector sink.
+#[derive(Debug)]
+pub struct SinkWriteError {
+    stream_name: &'static str,
+    operation: SinkWriteOperation,
+    attempted_len: usize,
+    source: io::Error,
+}
+
+impl SinkWriteError {
+    pub(crate) fn new(
+        stream_name: &'static str,
+        operation: SinkWriteOperation,
+        attempted_len: usize,
+        source: io::Error,
+    ) -> Self {
+        Self {
+            stream_name,
+            operation,
+            attempted_len,
+            source,
+        }
+    }
+
+    /// The name of the stream this collector operates on.
+    #[must_use]
+    pub fn stream_name(&self) -> &'static str {
+        self.stream_name
+    }
+
+    /// The write operation that failed.
+    #[must_use]
+    pub fn operation(&self) -> SinkWriteOperation {
+        self.operation
+    }
+
+    /// Number of bytes passed to the failed `write_all` call.
+    #[must_use]
+    pub fn attempted_len(&self) -> usize {
+        self.attempted_len
+    }
+
+    /// The underlying async writer error.
+    #[must_use]
+    pub fn source(&self) -> &io::Error {
+        &self.source
+    }
+
+    pub(crate) fn into_source(self) -> io::Error {
+        self.source
+    }
+}
+
+/// Handles async writer sink failures observed by writer collectors.
+pub trait SinkWriteErrorHandler: Send + 'static {
+    /// Decide whether collection should continue after a sink write failure.
+    fn handle(&mut self, error: &SinkWriteError) -> SinkWriteErrorAction;
+}
+
+impl<F> SinkWriteErrorHandler for F
+where
+    F: FnMut(&SinkWriteError) -> SinkWriteErrorAction + Send + 'static,
+{
+    fn handle(&mut self, error: &SinkWriteError) -> SinkWriteErrorAction {
+        self(error)
+    }
+}
+
+/// Default sink write error handler that stops collection on the first write failure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailOnSinkWriteError;
+
+impl SinkWriteErrorHandler for FailOnSinkWriteError {
+    fn handle(&mut self, _error: &SinkWriteError) -> SinkWriteErrorAction {
+        SinkWriteErrorAction::Stop
+    }
+}
+
+/// Sink write error handler that logs every failure and keeps collecting.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LogAndContinueSinkWriteErrors;
+
+impl SinkWriteErrorHandler for LogAndContinueSinkWriteErrors {
+    fn handle(&mut self, error: &SinkWriteError) -> SinkWriteErrorAction {
+        tracing::warn!(
+            stream = error.stream_name(),
+            operation = ?error.operation(),
+            attempted_len = error.attempted_len(),
+            source = %error.source(),
+            "Could not write collected output to write sink; continuing"
+        );
+        SinkWriteErrorAction::Continue
+    }
+}
+
+/// Options for forwarding collected stream output into an async writer.
+///
+/// Use [`WriteCollectionOptions::fail_fast`] to stop on the first sink write failure,
+/// [`WriteCollectionOptions::log_and_continue`] to preserve best-effort logging behavior, or
+/// [`WriteCollectionOptions::with_error_handler`] to make a custom per-error decision.
+///
+/// The handler type is part of this options type so custom handlers remain statically dispatched
+/// and allocation-free.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteCollectionOptions<H = FailOnSinkWriteError> {
+    error_handler: H,
+}
+
+impl WriteCollectionOptions<FailOnSinkWriteError> {
+    /// Creates writer collection options that fail on the first sink write error.
+    #[must_use]
+    pub fn fail_fast() -> Self {
+        Self {
+            error_handler: FailOnSinkWriteError,
+        }
+    }
+
+    /// Creates writer collection options that log sink write errors and keep collecting.
+    #[must_use]
+    pub fn log_and_continue() -> WriteCollectionOptions<LogAndContinueSinkWriteErrors> {
+        WriteCollectionOptions {
+            error_handler: LogAndContinueSinkWriteErrors,
+        }
+    }
+
+    /// Creates writer collection options with a custom sink write error handler.
+    #[must_use]
+    pub fn with_error_handler<H>(handler: H) -> WriteCollectionOptions<H>
+    where
+        H: FnMut(&SinkWriteError) -> SinkWriteErrorAction + Send + 'static,
+    {
+        WriteCollectionOptions {
+            error_handler: handler,
+        }
+    }
+}
+
+impl<H> WriteCollectionOptions<H> {
+    pub(crate) fn into_error_handler(self) -> H {
+        self.error_handler
+    }
+}
 
 pub(crate) fn collect_chunks_into_write<S, W, H>(
     stream_name: &'static str,
@@ -19,7 +196,7 @@ pub(crate) fn collect_chunks_into_write<S, W, H>(
     write_options: WriteCollectionOptions<H>,
 ) -> Collector<W>
 where
-    S: EventSubscription,
+    S: Subscription,
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
 {
@@ -64,7 +241,7 @@ pub(crate) fn collect_chunks_into_write_mapped<S, W, B, F, H>(
     write_options: WriteCollectionOptions<H>,
 ) -> Collector<W>
 where
-    S: EventSubscription,
+    S: Subscription,
     W: Sink + AsyncWriteExt + Unpin,
     B: AsRef<[u8]> + Send,
     F: Fn(Chunk) -> B + Send + Sync + Copy + 'static,
@@ -113,7 +290,7 @@ pub(crate) fn collect_lines_into_write<S, W, H>(
     write_options: WriteCollectionOptions<H>,
 ) -> Collector<W>
 where
-    S: EventSubscription,
+    S: Subscription,
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
 {
@@ -176,7 +353,7 @@ pub(crate) fn collect_lines_into_write_mapped<S, W, B, F, H>(
     write_options: WriteCollectionOptions<H>,
 ) -> Collector<W>
 where
-    S: EventSubscription,
+    S: Subscription,
     W: Sink + AsyncWriteExt + Unpin,
     B: AsRef<[u8]> + Send,
     F: Fn(Cow<'_, str>) -> B + Send + Sync + Copy + 'static,

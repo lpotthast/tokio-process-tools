@@ -1,7 +1,8 @@
 use super::{collect_owned_final_line, visit_final_line, visit_lines};
 use crate::inspector::Inspector;
-use crate::output_stream::subscription::EventSubscription;
-use crate::output_stream::{Chunk, LineParserState, LineParsingOptions, Next, StreamEvent};
+use crate::output_stream::event::{Chunk, StreamEvent};
+use crate::output_stream::line::{LineParserState, LineParsingOptions};
+use crate::output_stream::{Next, Subscription};
 use std::borrow::Cow;
 use std::future::Future;
 
@@ -11,7 +12,7 @@ pub(crate) fn inspect_chunks<S, F>(
     mut f: F,
 ) -> Inspector
 where
-    S: EventSubscription,
+    S: Subscription,
     F: FnMut(Chunk) -> Next + Send + 'static,
 {
     let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
@@ -47,7 +48,7 @@ pub(crate) fn inspect_chunks_async<S, F, Fut>(
     mut f: F,
 ) -> Inspector
 where
-    S: EventSubscription,
+    S: Subscription,
     F: FnMut(Chunk) -> Fut + Send + 'static,
     Fut: Future<Output = Next> + Send,
 {
@@ -85,7 +86,7 @@ pub(crate) fn inspect_lines<S, F>(
     options: LineParsingOptions,
 ) -> Inspector
 where
-    S: EventSubscription,
+    S: Subscription,
     F: FnMut(Cow<'_, str>) -> Next + Send + 'static,
 {
     let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
@@ -128,7 +129,7 @@ pub(crate) fn inspect_lines_async<S, F, Fut>(
     options: LineParsingOptions,
 ) -> Inspector
 where
-    S: EventSubscription,
+    S: Subscription,
     F: FnMut(Cow<'_, str>) -> Fut + Send + 'static,
     Fut: Future<Output = Next> + Send,
 {

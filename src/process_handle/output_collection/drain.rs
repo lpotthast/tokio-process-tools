@@ -242,3 +242,106 @@ where
 
     Ok((outcome.exit_status, stdout, stderr))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output_stream::backend::broadcast::BroadcastOutputStream;
+    use crate::output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
+    use crate::output_stream::config::StreamConfig;
+    use crate::test_support::ReadErrorAfterBytes;
+    use crate::{
+        CollectorError, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, RawCollectionOptions,
+    };
+    use assertr::prelude::*;
+    use std::io;
+
+    fn best_effort_no_replay_options() -> StreamConfig<crate::BestEffortDelivery, crate::NoReplay> {
+        StreamConfig::builder()
+            .best_effort_delivery()
+            .no_replay()
+            .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+            .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn timed_output_collection_returns_early_stream_read_error_before_deadline() {
+        let stdout_stream = BroadcastOutputStream::from_stream(
+            ReadErrorAfterBytes::new(b"", io::ErrorKind::BrokenPipe),
+            "stdout",
+            best_effort_no_replay_options(),
+        );
+        let (stderr_read, _stderr_write) = tokio::io::duplex(64);
+        let stderr_stream = BroadcastOutputStream::from_stream(
+            stderr_read,
+            "stderr",
+            best_effort_no_replay_options(),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_output_collectors(
+                stdout_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
+                stderr_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
+                Some(Instant::now() + Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .expect("collector error should be returned before the outer timeout");
+
+        match result {
+            Err(CollectorDrainError::Collection(CollectorError::StreamRead { source, .. })) => {
+                assert_that!(source.stream_name()).is_equal_to("stdout");
+                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
+            }
+            other => {
+                assert_that!(&other).fail(format_args!(
+                    "expected early stream read error, got {other:?}"
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_output_collection_cancels_hanging_single_subscriber_sibling_after_error() {
+        let stdout_stream = BroadcastOutputStream::from_stream(
+            ReadErrorAfterBytes::new(b"", io::ErrorKind::BrokenPipe),
+            "stdout",
+            best_effort_no_replay_options(),
+        );
+        let (stderr_read, _stderr_write) = tokio::io::duplex(64);
+        let stderr_stream = SingleSubscriberOutputStream::from_stream(
+            stderr_read,
+            "stderr",
+            best_effort_no_replay_options(),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_output_collectors(
+                stdout_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
+                stderr_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
+                Some(Instant::now() + Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .expect("collector error should be returned before the outer timeout");
+
+        match result {
+            Err(CollectorDrainError::Collection(CollectorError::StreamRead { source, .. })) => {
+                assert_that!(source.stream_name()).is_equal_to("stdout");
+                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
+            }
+            other => {
+                assert_that!(&other).fail(format_args!(
+                    "expected early stream read error, got {other:?}"
+                ));
+            }
+        }
+
+        let collector =
+            stderr_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+        let _collected = collector.cancel().await.unwrap();
+    }
+}

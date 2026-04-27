@@ -1,7 +1,10 @@
-use crate::NumBytes;
-use crate::output_stream::subscription::EventSubscription;
-use crate::output_stream::{
-    Delivery, OutputStream, Replay, ReplayRetention, StreamConfig, StreamEvent,
+use crate::output_stream::config::StreamConfig;
+use crate::output_stream::event::StreamEvent;
+use crate::output_stream::policy::{Delivery, Replay, ReplayRetention};
+use crate::output_stream::{OutputStream, Subscribable, Subscription};
+use crate::{
+    CollectedBytes, CollectedLines, Collector, LineCollectionOptions, LineParsingOptions, NumBytes,
+    RawCollectionOptions,
 };
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
@@ -15,14 +18,12 @@ mod reader;
 mod state;
 mod subscription;
 
-#[cfg(test)]
-use crate::DeliveryGuarantee;
-pub use crate::output_stream::line_waiter::LineWaiter;
+use crate::output_stream::Collectable;
 use reader::read_chunked;
 use state::{ActiveSubscriber, ConfiguredShared};
-use subscription::{ConfiguredSubscription, SingleSubscription};
+use subscription::SingleSubscriberSubscription;
 
-impl EventSubscription for mpsc::Receiver<StreamEvent> {
+impl Subscription for mpsc::Receiver<StreamEvent> {
     fn next_event(&mut self) -> impl Future<Output = Option<StreamEvent>> + Send + '_ {
         self.recv()
     }
@@ -58,20 +59,6 @@ pub struct SingleSubscriberOutputStream {
     name: &'static str,
 }
 
-impl OutputStream for SingleSubscriberOutputStream {
-    fn read_chunk_size(&self) -> NumBytes {
-        self.read_chunk_size
-    }
-
-    fn max_buffered_chunks(&self) -> usize {
-        self.max_buffered_chunks
-    }
-
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
-
 impl Drop for SingleSubscriberOutputStream {
     fn drop(&mut self) {
         self.stream_reader.abort();
@@ -90,39 +77,39 @@ impl Debug for SingleSubscriberOutputStream {
     }
 }
 
-impl SingleSubscriberOutputStream {
-    #[cfg(test)]
-    pub(crate) fn from_stream_with_delivery_guarantee<S: AsyncRead + Unpin + Send + 'static>(
-        stream: S,
-        stream_name: &'static str,
-        delivery_guarantee: DeliveryGuarantee,
-        read_chunk_size: NumBytes,
-        max_buffered_chunks: usize,
-    ) -> SingleSubscriberOutputStream {
-        match delivery_guarantee {
-            DeliveryGuarantee::BestEffort => Self::from_stream(
-                stream,
-                stream_name,
-                StreamConfig::builder()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(read_chunk_size)
-                    .max_buffered_chunks(max_buffered_chunks)
-                    .build(),
-            ),
-            DeliveryGuarantee::ReliableForActiveSubscribers => Self::from_stream(
-                stream,
-                stream_name,
-                StreamConfig::builder()
-                    .reliable_for_active_subscribers()
-                    .no_replay()
-                    .read_chunk_size(read_chunk_size)
-                    .max_buffered_chunks(max_buffered_chunks)
-                    .build(),
-            ),
-        }
+impl OutputStream for SingleSubscriberOutputStream {
+    fn read_chunk_size(&self) -> NumBytes {
+        self.read_chunk_size
     }
 
+    fn max_buffered_chunks(&self) -> usize {
+        self.max_buffered_chunks
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+impl Collectable for SingleSubscriberOutputStream {
+    fn collect_lines_into_vec(
+        &self,
+        parsing_options: LineParsingOptions,
+        collection_options: LineCollectionOptions,
+    ) -> Collector<CollectedLines> {
+        SingleSubscriberOutputStream::collect_lines_into_vec(
+            self,
+            parsing_options,
+            collection_options,
+        )
+    }
+
+    fn collect_chunks_into_vec(&self, options: RawCollectionOptions) -> Collector<CollectedBytes> {
+        SingleSubscriberOutputStream::collect_chunks_into_vec(self, options)
+    }
+}
+
+impl SingleSubscriberOutputStream {
     /// Creates a new single-subscriber output stream from an async read stream and typed stream config.
     pub fn from_stream<S, D, R>(
         stream: S,
@@ -184,11 +171,7 @@ impl SingleSubscriberOutputStream {
         )
     }
 
-    fn take_subscription(&self) -> SingleSubscription {
-        self.take_configured_subscription()
-    }
-
-    fn take_configured_subscription(&self) -> SingleSubscription {
+    fn take_subscription(&self) -> SingleSubscriberSubscription {
         let Some(shared) = &self.configured_shared else {
             panic!("configured single-subscriber subscription requested without shared state");
         };
@@ -217,7 +200,7 @@ impl SingleSubscriberOutputStream {
             (id, replay, state.terminal_event.clone())
         };
 
-        ConfiguredSubscription {
+        SingleSubscriberSubscription {
             id,
             shared: Arc::clone(shared),
             replay,
@@ -263,15 +246,13 @@ impl SingleSubscriberOutputStream {
     }
 }
 
-impl crate::output_stream::consumer::api::SubscribableOutputStream
-    for SingleSubscriberOutputStream
-{
-    fn subscribe_for_consumer(&self) -> impl crate::output_stream::subscription::EventSubscription {
+impl Subscribable for SingleSubscriberOutputStream {
+    fn subscribe(&self) -> impl Subscription {
         self.take_subscription()
     }
 }
 
-crate::output_stream::consumer::api::impl_output_stream_consumer_api! {
+impl_output_stream_consumer_api! {
     impl SingleSubscriberOutputStream
 }
 

@@ -1,10 +1,3 @@
-use crate::output_stream::OutputStream;
-use crate::output_stream::subscription::EventSubscription;
-
-pub(crate) trait SubscribableOutputStream: OutputStream {
-    fn subscribe_for_consumer(&self) -> impl EventSubscription;
-}
-
 macro_rules! impl_output_stream_consumer_api {
     (impl $($impl_header:tt)*) => {
         #[allow(dead_code)]
@@ -20,7 +13,7 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Inspector {
                 $crate::output_stream::consumer::inspect::inspect_chunks(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     f,
                 )
             }
@@ -39,7 +32,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::inspect::inspect_chunks_async(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     f,
                 )
             }
@@ -56,7 +49,7 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Inspector {
                 $crate::output_stream::consumer::inspect::inspect_lines(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     f,
                     options,
                 )
@@ -77,7 +70,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::inspect::inspect_lines_async(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     f,
                     options,
                 )
@@ -94,7 +87,7 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Collector<S> {
                 $crate::output_stream::consumer::collect::collect_chunks(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     into,
                     collect,
                 )
@@ -111,7 +104,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::collect::collect_chunks_async(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     into,
                     collect,
                 )
@@ -132,7 +125,7 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Collector<S> {
                 $crate::output_stream::consumer::collect::collect_lines(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     into,
                     collect,
                     options,
@@ -157,7 +150,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::collect::collect_lines_async(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     into,
                     collect,
                     options,
@@ -228,7 +221,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::write::collect_chunks_into_write(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     write,
                     write_options,
                 )
@@ -260,7 +253,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::write::collect_lines_into_write(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     write,
                     options,
                     mode,
@@ -291,7 +284,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::write::collect_chunks_into_write_mapped(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     write,
                     mapper,
                     write_options,
@@ -327,7 +320,7 @@ macro_rules! impl_output_stream_consumer_api {
             {
                 $crate::output_stream::consumer::write::collect_lines_into_write_mapped(
                     <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self),
+                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
                     write,
                     mapper,
                     options,
@@ -362,7 +355,7 @@ macro_rules! impl_output_stream_consumer_api {
                 predicate: impl Fn(::std::borrow::Cow<'_, str>) -> bool + Send + Sync + 'static,
                 options: $crate::LineParsingOptions,
             ) -> $crate::output_stream::line_waiter::LineWaiter {
-                let subscription = <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self);
+                let subscription = <Self as $crate::output_stream::Subscribable>::subscribe(self);
                 $crate::output_stream::line_waiter::LineWaiter::new(
                     $crate::output_stream::consumer::wait::wait_for_line_with_optional_timeout(
                         subscription,
@@ -399,7 +392,7 @@ macro_rules! impl_output_stream_consumer_api {
                 options: $crate::LineParsingOptions,
                 timeout: ::std::time::Duration,
             ) -> $crate::output_stream::line_waiter::LineWaiter {
-                let subscription = <Self as $crate::output_stream::consumer::api::SubscribableOutputStream>::subscribe_for_consumer(self);
+                let subscription = <Self as $crate::output_stream::Subscribable>::subscribe(self);
                 $crate::output_stream::line_waiter::LineWaiter::new(
                     $crate::output_stream::consumer::wait::wait_for_line_with_optional_timeout(
                         subscription,
@@ -412,13 +405,11 @@ macro_rules! impl_output_stream_consumer_api {
         }
     };
 }
-
-pub(crate) use impl_output_stream_consumer_api;
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::output_stream::{Chunk, NumBytes, OutputStream, StreamEvent};
+    use crate::output_stream::event::{Chunk, StreamEvent};
+    use crate::output_stream::options::NumBytes;
+    use crate::output_stream::{OutputStream, Subscribable, Subscription};
     use crate::{
         CollectionOverflowBehavior, LineCollectionOptions, LineParsingOptions, Next, NumBytesExt,
         WaitForLineResult,
@@ -456,10 +447,8 @@ mod tests {
         }
     }
 
-    impl SubscribableOutputStream for TestOutputStream {
-        fn subscribe_for_consumer(
-            &self,
-        ) -> impl crate::output_stream::subscription::EventSubscription {
+    impl Subscribable for TestOutputStream {
+        fn subscribe(&self) -> impl Subscription {
             self.receiver
                 .lock()
                 .expect("test receiver mutex poisoned")

@@ -26,22 +26,6 @@ pub enum LineOverflowBehavior {
     EmitAdditionalAsNewLines,
 }
 
-/// Controls how line-based write helpers delimit successive lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineWriteMode {
-    /// Write lines exactly as parsed, without appending any delimiter.
-    ///
-    /// Use this when your mapper already includes delimiters or when the downstream format does
-    /// not want line separators reintroduced.
-    AsIs,
-
-    /// Append a trailing `\n` after each emitted line.
-    ///
-    /// This reconstructs conventional line-oriented output after parsing removed the original
-    /// newline byte.
-    AppendLf,
-}
-
 /// Configuration options for parsing lines from a stream.
 ///
 /// The builder requires both fields:
@@ -93,18 +77,9 @@ enum LineParserMode {
     PendingLimitDelimiter,
 }
 
-/// Converts bytes to text with a fast path for ASCII-only lines.
-///
-/// Non-ASCII input still uses Rust's lossy UTF-8 conversion, preserving invalid UTF-8 replacement
-/// behavior. ASCII input is always valid UTF-8, so it can be borrowed directly without running the
-/// general UTF-8 validator.
+/// Converts bytes to text with a fast path for proper UTF-8 text.
 fn decode_line_lossy(bytes: &[u8]) -> Cow<'_, str> {
-    if bytes.is_ascii() {
-        // SAFETY: `is_ascii` guarantees every byte is valid UTF-8.
-        Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(bytes) })
-    } else {
-        String::from_utf8_lossy(bytes)
-    }
+    String::from_utf8_lossy(bytes)
 }
 
 /// Stateful parser for turning arbitrary byte chunks into lines.

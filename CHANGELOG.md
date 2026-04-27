@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added `StreamConfig` and a required type-state `StreamConfig::builder()` API for direct stream
-  construction and process stdout/stderr stream configuration. The builder requires selecting
-  delivery, replay, read chunk size, and maximum buffered chunks.
+  construction. The builder requires selecting delivery, replay, read chunk size, and maximum
+  buffered chunks.
 - Added sealed typed delivery and replay policy markers: `BestEffortDelivery`, `ReliableDelivery`,
   `NoReplay`, `ReplayEnabled`, `Delivery`, `Replay`, `DeliveryGuarantee`, and
   `ReplayRetention`.
@@ -56,9 +56,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Consolidated public re-exports in `lib.rs`; internal modules now import deeply nested types
+  directly instead of re-exporting them through module-local hubs.
+- Reworked chunk and line benchmarks into documented, curated cases that compare best-effort and
+  reliable delivery with allocation-light count-only consumers and practical collection consumers.
 - **Breaking:** Changed `Process` into a staged builder: name the process with `.name(...)`,
   configure stdout and stderr with `.broadcast()` or `.single_subscriber()` stream builders, then
   call `.spawn()`.
+- **Breaking:** Collapsed process builder stage structs into the generic `Process` typestate
+  builder and removed the public `NamedProcess`, `ProcessBuilderWithStdout`,
+  `ProcessBuilderWithStderr`, and `ConfiguredProcessBuilder` stage types.
 - **Breaking:** Removed `Process::with_name(...)` and `Process::with_auto_name(...)`. Use
   `.name(...)` for explicit or automatic naming, including `.name(AutoName::program_only())` for
   the safe program-only default.
@@ -85,11 +92,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Changed normal stream consumers to subscribe from the earliest output currently
   available. Replay-enabled unsealed streams may provide retained past output; no-replay or sealed
   streams start future consumers at live output.
+- **Breaking:** Changed replay-capable broadcast streams to use per-subscriber live queues backed
+  by a separate retained replay log. Slow active subscribers on `best_effort/replay` streams are
+  now bounded by their own live queue and receive a gap marker on overflow instead of pinning the
+  shared replay buffer.
 - **Breaking:** Changed `wait_for_completion_or_terminate` to return the dedicated
   `WaitOrTerminateError` type, and changed output-collecting wait helpers to return dedicated
   compound error types instead of overloading `WaitError`.
+- **Breaking:** Changed `send_interrupt_signal()`, `send_terminate_signal()`, and `kill()` to
+  return typed `TerminationError` diagnostics instead of raw `io::Error`.
 - **Breaking:** Replaced per-phase `TerminationError::TerminationFailed` diagnostic fields with
-  chronological `TerminationAttemptError` entries that preserve all recorded source errors.
+  chronological `TerminationAttemptError` entries that preserve all recorded source errors as
+  `Send + Sync` values.
 - **Breaking:** Changed `collect_chunks_into_vec`, `collect_lines_into_vec`,
   `wait_for_completion_with_output`, and `wait_for_completion_with_raw_output` to require explicit
   collection options. Removed trusted-output-only variants; use `TrustedUnbounded` collection
@@ -120,9 +134,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved line-delivery throughput for ASCII output by fast-pathing line text conversion while
   preserving lossy handling for non-ASCII and invalid UTF-8 bytes.
 - Simplified the Criterion benchmark suite to focused chunk-delivery and line-delivery targets for
-  the single-subscriber and broadcast backends, added dedicated `just bench-smoke`,
-  `just bench-chunks`, and `just bench-lines` commands, and made compile-only benchmark smoke the
-  default workflow.
+  the single-subscriber and broadcast backends, added targeted replay-aware line-delivery cases,
+  added dedicated `just bench-smoke`, `just bench-chunks`, and `just bench-lines` commands, and
+  made compile-only benchmark smoke the default workflow.
 
 ### Fixed
 

@@ -1,8 +1,13 @@
-use crate::output_stream::{
-    BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, OutputStream, Replay, ReplayEnabled,
-    ReplayRetention, StreamConfig, StreamEvent,
+use crate::output_stream::config::StreamConfig;
+use crate::output_stream::event::StreamEvent;
+use crate::output_stream::policy::{
+    BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, Replay, ReplayEnabled,
 };
-use crate::{NumBytes, StreamReadError};
+use crate::output_stream::{OutputStream, Subscribable};
+use crate::{
+    CollectedBytes, CollectedLines, Collector, LineCollectionOptions, LineParsingOptions, NumBytes,
+    RawCollectionOptions, StreamReadError,
+};
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncRead;
@@ -13,10 +18,10 @@ mod reader;
 mod state;
 mod subscription;
 
-pub use crate::output_stream::line_waiter::LineWaiter;
+use crate::output_stream::Collectable;
 use reader::{read_chunked_fast, read_chunked_shared};
-use state::{Shared, evict_locked};
-use subscription::{FastSubscription, SharedSubscription, Subscription};
+use state::{BestEffortLiveQueue, Shared, SubscriberSender};
+use subscription::{BroadcastSubscription, FastSubscription, LiveReceiver, SharedSubscription};
 
 struct FastClosureState {
     closed: bool,
@@ -31,7 +36,7 @@ struct FastBackend {
     name: &'static str,
 }
 
-struct SharedBackend<D, R>
+struct FanoutReplayBackend<D, R>
 where
     D: Delivery,
     R: Replay,
@@ -48,7 +53,7 @@ where
     R: Replay,
 {
     Fast(FastBackend),
-    Shared(SharedBackend<D, R>),
+    FanoutReplay(FanoutReplayBackend<D, R>),
 }
 
 /// The output stream from a process using a multi-consumer broadcast backend.
@@ -63,33 +68,6 @@ where
     backend: Backend<D, R>,
 }
 
-impl<D, R> OutputStream for BroadcastOutputStream<D, R>
-where
-    D: Delivery,
-    R: Replay,
-{
-    fn read_chunk_size(&self) -> NumBytes {
-        match &self.backend {
-            Backend::Fast(backend) => backend.options.read_chunk_size,
-            Backend::Shared(backend) => backend.options.read_chunk_size,
-        }
-    }
-
-    fn max_buffered_chunks(&self) -> usize {
-        match &self.backend {
-            Backend::Fast(backend) => backend.options.max_buffered_chunks,
-            Backend::Shared(backend) => backend.options.max_buffered_chunks,
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match &self.backend {
-            Backend::Fast(backend) => backend.name,
-            Backend::Shared(backend) => backend.name,
-        }
-    }
-}
-
 impl<D, R> Drop for BroadcastOutputStream<D, R>
 where
     D: Delivery,
@@ -100,7 +78,7 @@ where
             Backend::Fast(backend) => {
                 backend.stream_reader.abort();
             }
-            Backend::Shared(backend) => {
+            Backend::FanoutReplay(backend) => {
                 backend.stream_reader.abort();
                 {
                     let mut state = backend
@@ -108,10 +86,8 @@ where
                         .state
                         .lock()
                         .expect("broadcast state poisoned");
-                    state.closed = true;
+                    state.close_for_drop();
                 }
-                backend.shared.output_available.notify_waiters();
-                backend.shared.reader_available.notify_waiters();
             }
         }
     }
@@ -131,13 +107,58 @@ where
                 debug.field("options", &backend.options);
                 debug.field("name", &backend.name);
             }
-            Backend::Shared(backend) => {
-                debug.field("backend", &"shared replay");
+            Backend::FanoutReplay(backend) => {
+                debug.field("backend", &"fanout replay");
                 debug.field("options", &backend.options);
                 debug.field("name", &backend.name);
             }
         }
         debug.finish_non_exhaustive()
+    }
+}
+
+impl<D, R> OutputStream for BroadcastOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
+    fn read_chunk_size(&self) -> NumBytes {
+        match &self.backend {
+            Backend::Fast(backend) => backend.options.read_chunk_size,
+            Backend::FanoutReplay(backend) => backend.options.read_chunk_size,
+        }
+    }
+
+    fn max_buffered_chunks(&self) -> usize {
+        match &self.backend {
+            Backend::Fast(backend) => backend.options.max_buffered_chunks,
+            Backend::FanoutReplay(backend) => backend.options.max_buffered_chunks,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match &self.backend {
+            Backend::Fast(backend) => backend.name,
+            Backend::FanoutReplay(backend) => backend.name,
+        }
+    }
+}
+
+impl<D, R> Collectable for BroadcastOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
+    fn collect_lines_into_vec(
+        &self,
+        parsing_options: LineParsingOptions,
+        collection_options: LineCollectionOptions,
+    ) -> Collector<CollectedLines> {
+        BroadcastOutputStream::collect_lines_into_vec(self, parsing_options, collection_options)
+    }
+
+    fn collect_chunks_into_vec(&self, options: RawCollectionOptions) -> Collector<CollectedBytes> {
+        BroadcastOutputStream::collect_chunks_into_vec(self, options)
     }
 }
 
@@ -197,7 +218,7 @@ where
         ));
 
         Self {
-            backend: Backend::Shared(SharedBackend {
+            backend: Backend::FanoutReplay(FanoutReplayBackend {
                 stream_reader,
                 shared,
                 options,
@@ -220,7 +241,7 @@ where
     ///
     /// Panics if the internal state mutex is poisoned.
     pub fn seal_replay(&self) {
-        let Backend::Shared(backend) = &self.backend else {
+        let Backend::FanoutReplay(backend) = &self.backend else {
             return;
         };
         {
@@ -229,11 +250,8 @@ where
                 .state
                 .lock()
                 .expect("broadcast state poisoned");
-            state.replay_sealed = true;
-            evict_locked(&mut state, backend.options);
+            state.seal_replay();
         }
-        backend.shared.reader_available.notify_waiters();
-        backend.shared.output_available.notify_waiters();
     }
 
     /// Returns `true` once replay history has been sealed.
@@ -243,7 +261,7 @@ where
     /// Panics if the internal state mutex is poisoned.
     #[must_use]
     pub fn is_replay_sealed(&self) -> bool {
-        let Backend::Shared(backend) = &self.backend else {
+        let Backend::FanoutReplay(backend) = &self.backend else {
             return false;
         };
         backend
@@ -260,34 +278,58 @@ where
     D: Delivery,
     R: Replay,
 {
-    fn subscribe(&self) -> Subscription<D, R> {
-        let Backend::Shared(backend) = &self.backend else {
-            panic!("shared broadcast subscription requested for fast backend");
+    fn subscribe(&self) -> BroadcastSubscription<D, R> {
+        let Backend::FanoutReplay(backend) = &self.backend else {
+            panic!("fanout broadcast subscription requested for fast backend");
         };
         let mut state = backend
             .shared
             .state
             .lock()
             .expect("broadcast state poisoned");
-        let cursor = match backend.options.replay_retention() {
-            Some(
-                ReplayRetention::LastChunks(_)
-                | ReplayRetention::LastBytes(_)
-                | ReplayRetention::All,
-            ) if !state.replay_sealed => state.replay_start_seq,
-            None | Some(_) => state.next_seq,
+
+        let (subscriber_sender, live_receiver) = match backend.options.delivery_guarantee() {
+            DeliveryGuarantee::ReliableForActiveSubscribers => {
+                let (sender, receiver) =
+                    tokio::sync::mpsc::channel(backend.options.max_buffered_chunks);
+                (
+                    SubscriberSender::Reliable(sender),
+                    LiveReceiver::Reliable(receiver),
+                )
+            }
+            DeliveryGuarantee::BestEffort => {
+                let queue = Arc::new(BestEffortLiveQueue::new(
+                    backend.options.max_buffered_chunks,
+                ));
+                (
+                    SubscriberSender::BestEffort(Arc::clone(&queue)),
+                    LiveReceiver::BestEffort(queue),
+                )
+            }
+        };
+        let (replay, live_start_seq) = state.replay_snapshot(backend.options);
+        let id = if state.closed || state.terminal.is_some() {
+            None
+        } else {
+            Some(state.add_subscriber(subscriber_sender))
         };
 
-        let id = state.add_subscriber(cursor);
-        Subscription::Shared(SharedSubscription {
+        BroadcastSubscription::Shared(SharedSubscription {
             shared: Arc::clone(&backend.shared),
             id,
-            options: backend.options,
+            replay,
+            live_start_seq,
+            live_receiver: if id.is_some() {
+                live_receiver
+            } else {
+                LiveReceiver::Closed
+            },
+            _marker: std::marker::PhantomData,
             done: false,
         })
     }
 
-    fn subscribe_normal(&self) -> Subscription<D, R> {
+    fn subscribe_normal(&self) -> BroadcastSubscription<D, R> {
         match &self.backend {
             Backend::Fast(backend) => {
                 let (receiver, emit_terminal_event) = {
@@ -304,28 +346,27 @@ where
                     (receiver, terminal_event)
                 };
 
-                Subscription::Fast(FastSubscription {
+                BroadcastSubscription::Fast(FastSubscription {
                     receiver,
                     emit_terminal_event,
                 })
             }
-            Backend::Shared(_) => self.subscribe(),
+            Backend::FanoutReplay(_) => self.subscribe(),
         }
     }
 }
 
-impl<D, R> crate::output_stream::consumer::api::SubscribableOutputStream
-    for BroadcastOutputStream<D, R>
+impl<D, R> Subscribable for BroadcastOutputStream<D, R>
 where
     D: Delivery,
     R: Replay,
 {
-    fn subscribe_for_consumer(&self) -> impl crate::output_stream::subscription::EventSubscription {
+    fn subscribe(&self) -> impl crate::output_stream::Subscription {
         self.subscribe_normal()
     }
 }
 
-crate::output_stream::consumer::api::impl_output_stream_consumer_api! {
+impl_output_stream_consumer_api! {
     impl<D, R> BroadcastOutputStream<D, R>
     where
         D: Delivery,

@@ -1,4 +1,5 @@
-use crate::output_stream::{ReplayRetention, StreamEvent};
+use crate::output_stream::event::StreamEvent;
+use crate::output_stream::policy::ReplayRetention;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -156,5 +157,138 @@ impl ConfiguredShared {
 
         state.active_id = None;
         self.active_tx.send_replace(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output_stream::event::Chunk;
+    use crate::{NumBytesExt, StreamReadError};
+    use assertr::prelude::*;
+    use bytes::Bytes;
+    use std::io;
+
+    fn chunk(bytes: &'static [u8]) -> StreamEvent {
+        StreamEvent::Chunk(Chunk(Bytes::from_static(bytes)))
+    }
+
+    fn retained_bytes(state: &ReplayState) -> Vec<u8> {
+        state
+            .snapshot_events()
+            .into_iter()
+            .flat_map(|event| match event {
+                StreamEvent::Chunk(chunk) => chunk.as_ref().to_vec(),
+                StreamEvent::Gap | StreamEvent::Eof | StreamEvent::ReadError(_) => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_replay_retains_no_chunks() {
+        let mut state = ReplayState::new();
+
+        state.push_replay_event(chunk(b"old"), None);
+
+        assert_that!(state.events).is_empty();
+        assert_that!(state.chunk_count).is_equal_to(0);
+        assert_that!(state.byte_count).is_equal_to(0);
+    }
+
+    #[test]
+    fn replay_all_retains_all_chunks() {
+        let mut state = ReplayState::new();
+
+        state.push_replay_event(chunk(b"old"), Some(ReplayRetention::All));
+        state.push_replay_event(chunk(b"live"), Some(ReplayRetention::All));
+
+        assert_that!(retained_bytes(&state)).is_equal_to(b"oldlive".to_vec());
+        assert_that!(state.chunk_count).is_equal_to(2);
+        assert_that!(state.byte_count).is_equal_to(7);
+    }
+
+    #[test]
+    fn replay_last_chunks_retains_bounded_tail() {
+        let mut state = ReplayState::new();
+
+        state.push_replay_event(chunk(b"aa"), Some(ReplayRetention::LastChunks(2)));
+        state.push_replay_event(chunk(b"bb"), Some(ReplayRetention::LastChunks(2)));
+        state.push_replay_event(chunk(b"cc"), Some(ReplayRetention::LastChunks(2)));
+
+        assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
+        assert_that!(state.chunk_count).is_equal_to(2);
+        assert_that!(state.byte_count).is_equal_to(4);
+    }
+
+    #[test]
+    fn replay_last_bytes_retains_bounded_tail() {
+        let mut state = ReplayState::new();
+
+        state.push_replay_event(chunk(b"aa"), Some(ReplayRetention::LastBytes(4.bytes())));
+        state.push_replay_event(chunk(b"bb"), Some(ReplayRetention::LastBytes(4.bytes())));
+        state.push_replay_event(chunk(b"cc"), Some(ReplayRetention::LastBytes(4.bytes())));
+
+        assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
+        assert_that!(state.chunk_count).is_equal_to(2);
+        assert_that!(state.byte_count).is_equal_to(4);
+    }
+
+    #[test]
+    fn replay_last_bytes_keeps_whole_chunks_covering_boundary() {
+        let mut state = ReplayState::new();
+
+        state.push_replay_event(chunk(b"aa"), Some(ReplayRetention::LastBytes(3.bytes())));
+        state.push_replay_event(chunk(b"bb"), Some(ReplayRetention::LastBytes(3.bytes())));
+        state.push_replay_event(chunk(b"cc"), Some(ReplayRetention::LastBytes(3.bytes())));
+
+        assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
+        assert_that!(state.byte_count).is_equal_to(4);
+    }
+
+    #[test]
+    fn seal_trims_retained_replay() {
+        let mut state = ReplayState::new();
+
+        state.push_replay_event(chunk(b"old"), Some(ReplayRetention::All));
+        state.replay_sealed = true;
+        state.trim_replay_window(Some(ReplayRetention::All));
+
+        assert_that!(state.events).is_empty();
+        assert_that!(state.chunk_count).is_equal_to(0);
+        assert_that!(state.byte_count).is_equal_to(0);
+    }
+
+    #[test]
+    fn eof_is_stored_as_terminal_state_not_replay_chunk() {
+        let mut state = ReplayState::new();
+
+        state.push_replay_event(StreamEvent::Eof, Some(ReplayRetention::All));
+
+        assert_that!(state.events).is_empty();
+        assert_that!(state.terminal_event).is_equal_to(Some(StreamEvent::Eof));
+    }
+
+    #[test]
+    fn read_error_is_stored_as_terminal_state_not_replay_chunk() {
+        let mut state = ReplayState::new();
+
+        state.push_replay_event(
+            StreamEvent::ReadError(StreamReadError::new(
+                "custom",
+                io::Error::from(io::ErrorKind::BrokenPipe),
+            )),
+            Some(ReplayRetention::All),
+        );
+
+        assert_that!(state.events).is_empty();
+        match state.terminal_event {
+            Some(StreamEvent::ReadError(err)) => {
+                assert_that!(err.stream_name()).is_equal_to("custom");
+                assert_that!(err.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
+            }
+            other => {
+                assert_that!(&other).fail(format_args!("expected read error, got {other:?}"));
+            }
+        }
     }
 }

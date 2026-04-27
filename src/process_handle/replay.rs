@@ -1,7 +1,8 @@
 use super::ProcessHandle;
+use crate::output_stream::OutputStream;
 use crate::output_stream::backend::broadcast::BroadcastOutputStream;
 use crate::output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
-use crate::output_stream::{Delivery, OutputStream, ReplayEnabled};
+use crate::output_stream::policy::{Delivery, ReplayEnabled};
 
 impl<StdoutD, Stderr> ProcessHandle<BroadcastOutputStream<StdoutD, ReplayEnabled>, Stderr>
 where

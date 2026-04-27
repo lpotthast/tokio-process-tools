@@ -1,6 +1,8 @@
 use super::FastClosureState;
 use super::state::{Shared, append_event};
-use crate::output_stream::{Chunk, Delivery, Replay, StreamConfig, StreamEvent};
+use crate::output_stream::config::StreamConfig;
+use crate::output_stream::event::{Chunk, StreamEvent};
+use crate::output_stream::policy::{Delivery, Replay};
 use crate::{NumBytes, StreamReadError};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -40,7 +42,6 @@ pub(super) async fn read_chunked_shared<S, D, R>(
                 let err = StreamReadError::new(stream_name, err);
                 tracing::warn!(error = %err, "Could not read from stream");
                 append_event(&shared, options, StreamEvent::ReadError(err)).await;
-                shared.reader_available.notify_waiters();
                 break;
             }
         }
@@ -126,7 +127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_reader_splits_input_into_configured_chunks_and_eof() {
+    async fn fanout_reader_splits_input_into_configured_chunks_and_eof() {
         let shared = Arc::new(Shared::new());
         let options = replay_all_options();
 
@@ -139,11 +140,13 @@ mod tests {
         .await;
 
         let state = shared.state.lock().expect("broadcast state poisoned");
-        assert_that!(state.events.len()).is_equal_to(4);
-        assert_chunk(&state.events[0], b"ab");
-        assert_chunk(&state.events[1], b"cd");
-        assert_chunk(&state.events[2], b"ef");
-        assert_that!(matches!(state.events.get(3), Some(StreamEvent::Eof))).is_true();
+        assert_that!(state.replay.len()).is_equal_to(3);
+        assert_chunk(&state.replay[0].event, b"ab");
+        assert_chunk(&state.replay[1].event, b"cd");
+        assert_chunk(&state.replay[2].event, b"ef");
+        assert_that!(state.terminal.as_ref().map(|event| &event.event))
+            .is_some()
+            .is_equal_to(&StreamEvent::Eof);
     }
 
     #[tokio::test]

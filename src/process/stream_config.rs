@@ -1,9 +1,12 @@
+use crate::output_stream::OutputStream;
 use crate::output_stream::backend::broadcast::BroadcastOutputStream;
 use crate::output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
-use crate::output_stream::{
-    BestEffortDelivery, Delivery, OutputStream, ReliableDelivery, Replay, ReplayEnabled,
+use crate::output_stream::config::{
     StreamConfig, StreamConfigBuilder, StreamConfigMaxBufferedChunksBuilder,
     StreamConfigReadChunkSizeBuilder, StreamConfigReadyBuilder, StreamConfigReplayBuilder,
+};
+use crate::output_stream::policy::{
+    BestEffortDelivery, Delivery, ReliableDelivery, Replay, ReplayEnabled,
 };
 use std::marker::PhantomData;
 use tokio::io::AsyncRead;
@@ -83,7 +86,7 @@ pub struct SingleSubscriberBackend;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessStreamConfigStage<Backend, Stage> {
     stage: Stage,
-    _backend: PhantomData<fn() -> Backend>,
+    _backend: PhantomData<Backend>,
 }
 
 impl<Backend, Stage> ProcessStreamConfigStage<Backend, Stage> {
@@ -180,18 +183,6 @@ where
         max_buffered_chunks: usize,
     ) -> ProcessStreamConfigStage<Backend, StreamConfigReadyBuilder<D, R>> {
         ProcessStreamConfigStage::new(self.stage.max_buffered_chunks(max_buffered_chunks))
-    }
-}
-
-impl<Backend, D, R> ProcessStreamConfigStage<Backend, StreamConfigReadyBuilder<D, R>>
-where
-    D: Delivery,
-    R: Replay,
-{
-    /// Builds the shared stream configuration payload.
-    #[must_use]
-    pub fn build(self) -> StreamConfig<D, R> {
-        self.stage.build()
     }
 }
 

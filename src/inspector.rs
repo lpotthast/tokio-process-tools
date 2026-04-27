@@ -271,3 +271,30 @@ impl Drop for Inspector {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assertr::prelude::*;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn cancel_or_abort_after_returns_cancelled_when_cooperative() {
+        let (task_termination_sender, task_termination_receiver) = oneshot::channel();
+        let inspector = Inspector {
+            stream_name: "custom",
+            task: Some(tokio::spawn(async move {
+                let _res = task_termination_receiver.await;
+                Ok(())
+            })),
+            task_termination_sender: Some(task_termination_sender),
+        };
+
+        let outcome = inspector
+            .cancel_or_abort_after(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_that!(outcome).is_equal_to(InspectorCancelOutcome::Cancelled);
+    }
+}

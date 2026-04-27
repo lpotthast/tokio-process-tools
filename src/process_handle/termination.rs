@@ -59,7 +59,7 @@ struct TerminationDiagnostics {
 }
 
 impl TerminationDiagnostics {
-    fn record_preflight_status_error(&mut self, error: impl Error + 'static) {
+    fn record_preflight_status_error(&mut self, error: impl Error + Send + Sync + 'static) {
         self.record(
             TerminationAttemptPhase::Preflight,
             TerminationAttemptOperation::CheckStatus,
@@ -72,7 +72,7 @@ impl TerminationDiagnostics {
         &mut self,
         phase: GracefulTerminationPhase,
         signal_name: &'static str,
-        error: impl Error + 'static,
+        error: impl Error + Send + Sync + 'static,
     ) {
         self.record(
             phase.attempt_phase(),
@@ -86,7 +86,7 @@ impl TerminationDiagnostics {
         &mut self,
         phase: GracefulTerminationPhase,
         signal_name: &'static str,
-        error: impl Error + 'static,
+        error: impl Error + Send + Sync + 'static,
     ) {
         self.record(
             phase.attempt_phase(),
@@ -100,7 +100,7 @@ impl TerminationDiagnostics {
         &mut self,
         phase: GracefulTerminationPhase,
         signal_name: &'static str,
-        error: impl Error + 'static,
+        error: impl Error + Send + Sync + 'static,
     ) {
         self.record(
             phase.attempt_phase(),
@@ -110,7 +110,7 @@ impl TerminationDiagnostics {
         );
     }
 
-    fn record_kill_signal_error(&mut self, error: impl Error + 'static) {
+    fn record_kill_signal_error(&mut self, error: impl Error + Send + Sync + 'static) {
         self.record(
             TerminationAttemptPhase::Kill,
             TerminationAttemptOperation::SendSignal,
@@ -119,7 +119,7 @@ impl TerminationDiagnostics {
         );
     }
 
-    fn record_kill_wait_error(&mut self, error: impl Error + 'static) {
+    fn record_kill_wait_error(&mut self, error: impl Error + Send + Sync + 'static) {
         self.record(
             TerminationAttemptPhase::Kill,
             TerminationAttemptOperation::WaitForExit,
@@ -128,7 +128,7 @@ impl TerminationDiagnostics {
         );
     }
 
-    fn record_kill_status_error(&mut self, error: impl Error + 'static) {
+    fn record_kill_status_error(&mut self, error: impl Error + Send + Sync + 'static) {
         self.record(
             TerminationAttemptPhase::Kill,
             TerminationAttemptOperation::CheckStatus,
@@ -142,7 +142,7 @@ impl TerminationDiagnostics {
         phase: TerminationAttemptPhase,
         operation: TerminationAttemptOperation,
         signal_name: Option<&'static str>,
-        error: impl Error + 'static,
+        error: impl Error + Send + Sync + 'static,
     ) {
         self.attempt_errors.push(TerminationAttemptError {
             phase,
@@ -160,6 +160,19 @@ impl TerminationDiagnostics {
         );
 
         TerminationError::TerminationFailed {
+            process_name,
+            attempt_errors: self.attempt_errors,
+        }
+    }
+
+    #[must_use]
+    fn into_signal_failed(self, process_name: Cow<'static, str>) -> TerminationError {
+        assert!(
+            !self.attempt_errors.is_empty(),
+            "into_signal_failed must not be used when no error was recorded!",
+        );
+
+        TerminationError::SignalFailed {
             process_name,
             attempt_errors: self.attempt_errors,
         }
@@ -184,10 +197,14 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if the process status could not be checked or if the platform signal could
-    /// not be sent.
-    pub fn send_interrupt_signal(&mut self) -> Result<(), io::Error> {
-        self.send_signal_with_preflight_reap(signal::send_interrupt)
+    /// Returns [`TerminationError`] if the process status could not be checked or if the platform
+    /// signal could not be sent.
+    pub fn send_interrupt_signal(&mut self) -> Result<(), TerminationError> {
+        self.send_signal_with_preflight_reap(
+            GracefulTerminationPhase::Interrupt,
+            signal::INTERRUPT_SIGNAL_NAME,
+            signal::send_interrupt,
+        )
     }
 
     /// Manually send a termination signal to this process.
@@ -202,10 +219,14 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if the process status could not be checked or if the platform signal could
-    /// not be sent.
-    pub fn send_terminate_signal(&mut self) -> Result<(), io::Error> {
-        self.send_signal_with_preflight_reap(signal::send_terminate)
+    /// Returns [`TerminationError`] if the process status could not be checked or if the platform
+    /// signal could not be sent.
+    pub fn send_terminate_signal(&mut self) -> Result<(), TerminationError> {
+        self.send_signal_with_preflight_reap(
+            GracefulTerminationPhase::Terminate,
+            signal::TERMINATE_SIGNAL_NAME,
+            signal::send_terminate,
+        )
     }
 
     /// Terminates this process by sending platform graceful shutdown signals first, then killing
@@ -368,32 +389,50 @@ where
 
     fn send_signal_with_preflight_reap<SignalSender>(
         &mut self,
+        phase: GracefulTerminationPhase,
+        signal_name: &'static str,
         send_signal: SignalSender,
-    ) -> Result<(), io::Error>
+    ) -> Result<(), TerminationError>
     where
         SignalSender: FnOnce(&tokio::process::Child) -> Result<(), io::Error>,
     {
-        self.send_signal_with_reaper(send_signal, Self::try_reap_exit_status)
+        self.send_signal_with_reaper(phase, signal_name, send_signal, Self::try_reap_exit_status)
     }
 
     fn send_signal_with_reaper<SignalSender, Reaper>(
         &mut self,
+        phase: GracefulTerminationPhase,
+        signal_name: &'static str,
         send_signal: SignalSender,
         mut try_reap_exit_status: Reaper,
-    ) -> Result<(), io::Error>
+    ) -> Result<(), TerminationError>
     where
         SignalSender: FnOnce(&tokio::process::Child) -> Result<(), io::Error>,
         Reaper: FnMut(&mut Self) -> Result<Option<ExitStatus>, io::Error>,
     {
-        match try_reap_exit_status(self)? {
-            Some(_) => Ok(()),
-            None => match send_signal(&self.child) {
+        let mut diagnostics = TerminationDiagnostics::default();
+
+        match try_reap_exit_status(self) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => match send_signal(&self.child) {
                 Ok(()) => Ok(()),
                 Err(signal_error) => match try_reap_exit_status(self) {
                     Ok(Some(_)) => Ok(()),
-                    Ok(None) | Err(_) => Err(signal_error),
+                    Ok(None) => {
+                        diagnostics.record_graceful_signal_error(phase, signal_name, signal_error);
+                        Err(diagnostics.into_signal_failed(self.name.clone()))
+                    }
+                    Err(reap_error) => {
+                        diagnostics.record_graceful_signal_error(phase, signal_name, signal_error);
+                        diagnostics.record_graceful_status_error(phase, signal_name, reap_error);
+                        Err(diagnostics.into_signal_failed(self.name.clone()))
+                    }
                 },
             },
+            Err(status_error) => {
+                diagnostics.record_graceful_status_error(phase, signal_name, status_error);
+                Err(diagnostics.into_signal_failed(self.name.clone()))
+            }
         }
     }
 
@@ -570,19 +609,43 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if Tokio cannot kill or wait for the child process.
-    pub async fn kill(&mut self) -> io::Result<()> {
+    /// Returns [`TerminationError`] if Tokio cannot kill or wait for the child process.
+    pub async fn kill(&mut self) -> Result<(), TerminationError> {
+        self.kill_inner(Self::start_kill_raw).await
+    }
+
+    async fn kill_inner<StartKill>(
+        &mut self,
+        mut start_kill: StartKill,
+    ) -> Result<(), TerminationError>
+    where
+        StartKill: FnMut(&mut Self) -> Result<(), io::Error>,
+    {
         self.stdin().close();
-        self.child.kill().await?;
-        self.must_not_be_terminated();
+        let mut diagnostics = TerminationDiagnostics::default();
+
+        if let Err(err) = start_kill(self) {
+            diagnostics.record_kill_signal_error(err);
+            return Err(diagnostics.into_termination_failed(self.name.clone()));
+        }
+
+        if let Err(err) = self.wait_for_completion_inner(None).await {
+            diagnostics.record_kill_wait_error(err);
+            return Err(diagnostics.into_termination_failed(self.name.clone()));
+        }
+
         Ok(())
+    }
+
+    fn start_kill_raw(&mut self) -> Result<(), io::Error> {
+        self.child.start_kill()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_stream::BroadcastOutputStream;
+    use crate::output_stream::backend::broadcast::BroadcastOutputStream;
     use crate::panic_on_drop::PanicOnDrop;
     use crate::test_support::{ScriptedOutput, long_running_command};
     use crate::{
@@ -646,7 +709,6 @@ fn main() {
 }
 "#;
 
-    #[cfg(windows)]
     #[cfg(windows)]
     fn compile_ctrl_break_helper(dir: &std::path::Path) -> std::path::PathBuf {
         let source_path = dir.join("ctrl_break_helper.rs");
@@ -726,6 +788,32 @@ fn main() {
         {
             unimplemented!("test exit status construction is only implemented on Unix and Windows")
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminate_future_can_be_spawned_on_tokio_task() {
+        let mut process = spawn_long_running_process();
+
+        let result = tokio::spawn(async move {
+            process
+                .terminate(Duration::from_secs(1), Duration::from_secs(1))
+                .await
+        })
+        .await
+        .unwrap();
+
+        assert_that!(result).is_ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kill_future_can_be_spawned_on_tokio_task() {
+        let mut process = spawn_long_running_process();
+
+        let result = tokio::spawn(async move { process.kill().await })
+            .await
+            .unwrap();
+
+        assert_that!(result).is_ok();
     }
 
     #[tokio::test]
@@ -898,8 +986,7 @@ fn main() {
         ));
 
         let error = diagnostics.into_termination_failed(Cow::Borrowed("diagnostic-test"));
-
-        let TerminationError::TerminationFailed { attempt_errors, .. } = error;
+        let attempt_errors = error.attempt_errors();
 
         assert_that!(attempt_errors.len()).is_equal_to(6);
         assert_attempt_error(
@@ -1055,6 +1142,8 @@ fn main() {
         let mut reap_attempts = 0;
 
         let result = process.send_signal_with_reaper(
+            GracefulTerminationPhase::Interrupt,
+            signal::INTERRUPT_SIGNAL_NAME,
             |_| {
                 signal_attempts += 1;
                 Err(io::Error::new(
@@ -1085,13 +1174,15 @@ fn main() {
     }
 
     #[tokio::test]
-    async fn send_signal_returns_original_error_when_child_is_still_running_after_signal_failure() {
+    async fn send_signal_returns_typed_error_when_child_is_still_running_after_signal_failure() {
         let mut process = spawn_long_running_process();
         let mut signal_attempts = 0;
         let mut reap_attempts = 0;
 
         let error = process
             .send_signal_with_reaper(
+                GracefulTerminationPhase::Interrupt,
+                signal::INTERRUPT_SIGNAL_NAME,
                 |_| {
                     signal_attempts += 1;
                     Err(io::Error::new(
@@ -1106,8 +1197,17 @@ fn main() {
             )
             .unwrap_err();
 
-        assert_that!(error.kind()).is_equal_to(io::ErrorKind::PermissionDenied);
-        assert_that!(error.to_string().as_str()).contains("injected signal failure");
+        assert_that!(error.process_name()).is_equal_to("long-running");
+        assert_that!(matches!(&error, TerminationError::SignalFailed { .. })).is_true();
+        assert_that!(error.attempt_errors().len()).is_equal_to(1);
+        assert_attempt_error(
+            &error.attempt_errors()[0],
+            TerminationAttemptPhase::Interrupt,
+            TerminationAttemptOperation::SendSignal,
+            Some(signal::INTERRUPT_SIGNAL_NAME),
+            io::ErrorKind::PermissionDenied,
+            "injected signal failure",
+        );
         assert_that!(signal_attempts).is_equal_to(1);
         assert_that!(reap_attempts).is_equal_to(2);
         assert_that!(process.cleanup_on_drop).is_true();
@@ -1118,6 +1218,55 @@ fn main() {
                 .is_some_and(PanicOnDrop::is_armed)
         )
         .is_true();
+
+        process.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_signal_reports_signal_and_reap_failures_in_order() {
+        let mut process = spawn_long_running_process();
+        let mut reap_attempts = 0;
+
+        let error = process
+            .send_signal_with_reaper(
+                GracefulTerminationPhase::Terminate,
+                signal::TERMINATE_SIGNAL_NAME,
+                |_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "injected signal failure",
+                    ))
+                },
+                |_| {
+                    reap_attempts += 1;
+                    match reap_attempts {
+                        1 => Ok(None),
+                        2 => Err(io::Error::other("injected status failure")),
+                        _ => panic!("unexpected reap attempt"),
+                    }
+                },
+            )
+            .unwrap_err();
+
+        assert_that!(error.process_name()).is_equal_to("long-running");
+        assert_that!(matches!(&error, TerminationError::SignalFailed { .. })).is_true();
+        assert_that!(error.attempt_errors().len()).is_equal_to(2);
+        assert_attempt_error(
+            &error.attempt_errors()[0],
+            TerminationAttemptPhase::Terminate,
+            TerminationAttemptOperation::SendSignal,
+            Some(signal::TERMINATE_SIGNAL_NAME),
+            io::ErrorKind::PermissionDenied,
+            "injected signal failure",
+        );
+        assert_attempt_error(
+            &error.attempt_errors()[1],
+            TerminationAttemptPhase::Terminate,
+            TerminationAttemptOperation::CheckStatus,
+            Some(signal::TERMINATE_SIGNAL_NAME),
+            io::ErrorKind::Other,
+            "injected status failure",
+        );
 
         process.kill().await.unwrap();
     }
@@ -1239,5 +1388,42 @@ fn main() {
         assert_that!(&process.panic_on_drop).is_none();
 
         drop(process);
+    }
+
+    #[tokio::test]
+    async fn kill_reports_start_kill_failure_as_termination_error() {
+        let mut process = spawn_long_running_process();
+
+        let error = process
+            .kill_inner(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected kill failure",
+                ))
+            })
+            .await
+            .unwrap_err();
+
+        assert_that!(error.process_name()).is_equal_to("long-running");
+        assert_that!(matches!(&error, TerminationError::TerminationFailed { .. })).is_true();
+        assert_that!(error.attempt_errors().len()).is_equal_to(1);
+        assert_attempt_error(
+            &error.attempt_errors()[0],
+            TerminationAttemptPhase::Kill,
+            TerminationAttemptOperation::SendSignal,
+            Some(signal::KILL_SIGNAL_NAME),
+            io::ErrorKind::PermissionDenied,
+            "injected kill failure",
+        );
+        assert_that!(process.cleanup_on_drop).is_true();
+        assert_that!(
+            process
+                .panic_on_drop
+                .as_ref()
+                .is_some_and(PanicOnDrop::is_armed)
+        )
+        .is_true();
+
+        process.kill().await.unwrap();
     }
 }

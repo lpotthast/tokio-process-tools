@@ -366,8 +366,8 @@ async fn main() {
 - Use `LineParsingOptions`, `LineOverflowBehavior`, `wait_for_line()`, and
   `wait_for_line_with_timeout()` when line parsing or readiness detection needs custom behavior.
 - Use `send_interrupt_signal()`, `send_terminate_signal()`, `terminate()`, and `kill()` for manual
-  shutdown control, and use `seal_stdout_replay()`, `seal_stderr_replay()`, or
-  `seal_output_replay()` when replay should end on one stream or both.
+  shutdown control with typed `TerminationError` diagnostics, and use `seal_stdout_replay()`,
+  `seal_stderr_replay()`, or `seal_output_replay()` when replay should end on one stream or both.
 
 ## Process Management
 

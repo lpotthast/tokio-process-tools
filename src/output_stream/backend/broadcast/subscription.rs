@@ -1,12 +1,14 @@
-use super::state::{Shared, SubscriberId, evict_locked};
-use crate::output_stream::subscription::EventSubscription;
-use crate::output_stream::{
-    BestEffortDelivery, Delivery, NoReplay, Replay, StreamConfig, StreamEvent,
-};
+use super::state::{BestEffortLiveQueue, IndexedEvent, Shared, SubscriberId};
+use crate::output_stream::Subscription;
+use crate::output_stream::event::StreamEvent;
+use crate::output_stream::policy::{BestEffortDelivery, Delivery, NoReplay, Replay};
+use std::collections::VecDeque;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub(super) struct FastSubscription {
@@ -32,14 +34,34 @@ impl FastSubscription {
 }
 
 #[derive(Debug)]
+pub(super) enum LiveReceiver {
+    Reliable(mpsc::Receiver<IndexedEvent>),
+    BestEffort(Arc<BestEffortLiveQueue>),
+    Closed,
+}
+
+impl LiveReceiver {
+    async fn recv(&mut self) -> Option<IndexedEvent> {
+        match self {
+            Self::Reliable(receiver) => receiver.recv().await,
+            Self::BestEffort(queue) => queue.recv().await,
+            Self::Closed => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct SharedSubscription<D = BestEffortDelivery, R = NoReplay>
 where
     D: Delivery,
     R: Replay,
 {
     pub(super) shared: Arc<Shared>,
-    pub(super) id: SubscriberId,
-    pub(super) options: StreamConfig<D, R>,
+    pub(super) id: Option<SubscriberId>,
+    pub(super) replay: VecDeque<IndexedEvent>,
+    pub(super) live_start_seq: u64,
+    pub(super) live_receiver: LiveReceiver,
+    pub(super) _marker: PhantomData<fn() -> (D, R)>,
     pub(super) done: bool,
 }
 
@@ -49,12 +71,11 @@ where
     R: Replay,
 {
     fn drop(&mut self) {
-        if !self.done {
+        if !self.done
+            && let Some(id) = self.id.take()
+        {
             let mut state = self.shared.state.lock().expect("broadcast state poisoned");
-            state.remove_subscriber(self.id);
-            evict_locked(&mut state, self.options);
-            drop(state);
-            self.shared.reader_available.notify_waiters();
+            state.remove_subscriber(id);
         }
     }
 }
@@ -65,73 +86,36 @@ where
     R: Replay,
 {
     pub(super) async fn recv(&mut self) -> Option<StreamEvent> {
-        loop {
-            let notified = self.shared.output_available.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            {
-                let mut state = self.shared.state.lock().expect("broadcast state poisoned");
-                let Some(subscriber) = state.subscribers.get(&self.id) else {
-                    self.done = true;
-                    return None;
-                };
-                let cursor = subscriber.cursor;
-
-                if cursor < state.buffer_start_seq {
-                    let buffer_start_seq = state.buffer_start_seq;
-                    if let Some(subscriber) = state.subscribers.get_mut(&self.id) {
-                        subscriber.cursor = buffer_start_seq;
-                    }
-                    return Some(StreamEvent::Gap);
-                }
-
-                if let Some(event) = state.event_at(cursor) {
-                    if let Some(subscriber) = state.subscribers.get_mut(&self.id) {
-                        subscriber.cursor += 1;
-                    }
-                    if matches!(event, StreamEvent::Eof | StreamEvent::ReadError(_)) {
-                        state.remove_subscriber(self.id);
-                        self.done = true;
-                    }
-                    evict_locked(&mut state, self.options);
-                    drop(state);
-                    self.shared.reader_available.notify_waiters();
-                    return Some(event);
-                }
-
-                if state.eof {
-                    state.remove_subscriber(self.id);
-                    self.done = true;
-                    drop(state);
-                    self.shared.reader_available.notify_waiters();
-                    return Some(StreamEvent::Eof);
-                }
-
-                if let Some(err) = state.read_error.clone() {
-                    state.remove_subscriber(self.id);
-                    self.done = true;
-                    drop(state);
-                    self.shared.reader_available.notify_waiters();
-                    return Some(StreamEvent::ReadError(err));
-                }
-
-                if state.closed {
-                    state.remove_subscriber(self.id);
-                    self.done = true;
-                    drop(state);
-                    self.shared.reader_available.notify_waiters();
-                    return None;
-                }
-            };
-
-            notified.as_mut().await;
+        if let Some(event) = self.replay.pop_front() {
+            if matches!(event.event, StreamEvent::Eof | StreamEvent::ReadError(_)) {
+                self.detach();
+            }
+            return Some(event.event);
         }
+
+        loop {
+            let event = self.live_receiver.recv().await?;
+            if event.seq < self.live_start_seq {
+                continue;
+            }
+            if matches!(event.event, StreamEvent::Eof | StreamEvent::ReadError(_)) {
+                self.detach();
+            }
+            return Some(event.event);
+        }
+    }
+
+    fn detach(&mut self) {
+        if let Some(id) = self.id.take() {
+            let mut state = self.shared.state.lock().expect("broadcast state poisoned");
+            state.remove_subscriber(id);
+        }
+        self.done = true;
     }
 }
 
 #[derive(Debug)]
-pub(super) enum Subscription<D = BestEffortDelivery, R = NoReplay>
+pub(super) enum BroadcastSubscription<D = BestEffortDelivery, R = NoReplay>
 where
     D: Delivery,
     R: Replay,
@@ -140,20 +124,20 @@ where
     Shared(SharedSubscription<D, R>),
 }
 
-impl<D, R> Subscription<D, R>
+impl<D, R> BroadcastSubscription<D, R>
 where
     D: Delivery,
     R: Replay,
 {
     pub(super) async fn recv(&mut self) -> Option<StreamEvent> {
         match self {
-            Subscription::Fast(subscription) => subscription.recv().await,
-            Subscription::Shared(subscription) => subscription.recv().await,
+            BroadcastSubscription::Fast(subscription) => subscription.recv().await,
+            BroadcastSubscription::Shared(subscription) => subscription.recv().await,
         }
     }
 }
 
-impl<D, R> EventSubscription for Subscription<D, R>
+impl<D, R> Subscription for BroadcastSubscription<D, R>
 where
     D: Delivery,
     R: Replay,
@@ -169,16 +153,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::state::{Shared, append_event, evict_locked};
+    use super::super::state::{SubscriberSender, append_event};
     use super::*;
     use crate::StreamReadError;
-    use crate::output_stream::Chunk;
-    use crate::{NumBytesExt, ReliableDelivery, ReplayEnabled, ReplayRetention};
+    use crate::output_stream::event::Chunk;
+    use crate::{NumBytesExt, ReliableDelivery, ReplayEnabled, ReplayRetention, StreamConfig};
     use assertr::prelude::*;
     use bytes::Bytes;
     use std::io;
-    use std::sync::Arc;
-    use std::time::Duration;
 
     fn chunk(bytes: &'static [u8]) -> StreamEvent {
         StreamEvent::Chunk(Chunk(Bytes::from_static(bytes)))
@@ -223,40 +205,47 @@ mod tests {
 
     fn subscribe<D, R>(
         shared: &Arc<Shared>,
-        cursor: u64,
         options: StreamConfig<D, R>,
     ) -> SharedSubscription<D, R>
     where
         D: Delivery,
         R: Replay,
     {
-        let id = shared
-            .state
-            .lock()
-            .expect("broadcast state poisoned")
-            .add_subscriber(cursor);
+        let (sender, live_receiver) = match options.delivery_guarantee() {
+            crate::DeliveryGuarantee::ReliableForActiveSubscribers => {
+                let (sender, receiver) = mpsc::channel(options.max_buffered_chunks);
+                (
+                    SubscriberSender::Reliable(sender),
+                    LiveReceiver::Reliable(receiver),
+                )
+            }
+            crate::DeliveryGuarantee::BestEffort => {
+                let queue = Arc::new(BestEffortLiveQueue::new(options.max_buffered_chunks));
+                (
+                    SubscriberSender::BestEffort(Arc::clone(&queue)),
+                    LiveReceiver::BestEffort(queue),
+                )
+            }
+        };
+
+        let mut state = shared.state.lock().expect("broadcast state poisoned");
+        let (replay, live_start_seq) = state.replay_snapshot(options);
+        let id = if state.closed || state.terminal.is_some() {
+            None
+        } else {
+            Some(state.add_subscriber(sender))
+        };
+        drop(state);
+
         SharedSubscription {
             shared: Arc::clone(shared),
             id,
-            options,
+            replay,
+            live_start_seq,
+            live_receiver,
+            _marker: PhantomData,
             done: false,
         }
-    }
-
-    fn late_replay_cursor(shared: &Shared) -> u64 {
-        shared
-            .state
-            .lock()
-            .expect("broadcast state poisoned")
-            .replay_start_seq
-    }
-
-    fn late_live_cursor(shared: &Shared) -> u64 {
-        shared
-            .state
-            .lock()
-            .expect("broadcast state poisoned")
-            .next_seq
     }
 
     async fn assert_next_chunk<D, R>(
@@ -277,19 +266,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_best_effort_subscriber_observes_gap_then_retained_tail() {
+    async fn slow_best_effort_subscriber_observes_gap_then_newer_tail() {
         let options = best_effort_options(ReplayRetention::LastChunks(1));
         let shared = Arc::new(Shared::new());
-        let mut subscription = subscribe(&shared, 0, options);
+        let mut subscription = subscribe(&shared, options);
 
-        append_event(&shared, options, chunk(b"rea")).await;
-        append_event(&shared, options, chunk(b"dy\n")).await;
+        append_event(&shared, options, chunk(b"old")).await;
+        append_event(&shared, options, chunk(b"new")).await;
         append_event(&shared, options, StreamEvent::Eof).await;
 
         assert_that!(subscription.recv().await)
             .is_some()
             .is_equal_to(StreamEvent::Gap);
-        assert_next_chunk(&mut subscription, b"dy\n").await;
         assert_that!(subscription.recv().await)
             .is_some()
             .is_equal_to(StreamEvent::Eof);
@@ -303,8 +291,7 @@ mod tests {
         append_event(&shared, options, chunk(b"tail")).await;
         append_event(&shared, options, StreamEvent::Eof).await;
 
-        let cursor = late_replay_cursor(&shared);
-        let mut subscription = subscribe(&shared, cursor, options);
+        let mut subscription = subscribe(&shared, options);
         assert_next_chunk(&mut subscription, b"tail").await;
         assert_that!(subscription.recv().await)
             .is_some()
@@ -327,8 +314,7 @@ mod tests {
         )
         .await;
 
-        let cursor = late_live_cursor(&shared);
-        let mut subscription = subscribe(&shared, cursor, options);
+        let mut subscription = subscribe(&shared, options);
         match subscription.recv().await {
             Some(StreamEvent::ReadError(err)) => {
                 assert_that!(err.stream_name()).is_equal_to("custom");
@@ -356,8 +342,7 @@ mod tests {
         )
         .await;
 
-        let cursor = late_replay_cursor(&shared);
-        let mut subscription = subscribe(&shared, cursor, options);
+        let mut subscription = subscribe(&shared, options);
         assert_next_chunk(&mut subscription, b"booting\npartial").await;
         match subscription.recv().await {
             Some(StreamEvent::ReadError(err)) => {
@@ -371,100 +356,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_slow_subscriber_after_seal_frees_retained_history() {
+    async fn active_subscription_does_not_duplicate_live_handoff() {
         let options = reliable_replay_options(ReplayRetention::All);
         let shared = Arc::new(Shared::new());
-        let slow = subscribe(&shared, 0, options);
 
-        append_event(&shared, options, chunk(b"old\n")).await;
-        {
-            let mut state = shared.state.lock().expect("broadcast state poisoned");
-            state.replay_sealed = true;
-            evict_locked(&mut state, options);
-            assert_that!(state.events.len()).is_equal_to(1);
-            assert_that!(state.retained_chunk_count).is_equal_to(1);
-            assert_that!(state.retained_byte_count).is_equal_to(4);
-            assert_that!(state.replay_byte_count).is_equal_to(0);
-        }
+        append_event(&shared, options, chunk(b"replay")).await;
+        let mut subscription = subscribe(&shared, options);
+        append_event(&shared, options, chunk(b"live")).await;
+        append_event(&shared, options, StreamEvent::Eof).await;
 
-        drop(slow);
-
-        let state = shared.state.lock().expect("broadcast state poisoned");
-        assert_that!(state.events.len()).is_equal_to(0);
-        assert_that!(state.retained_chunk_count).is_equal_to(0);
-        assert_that!(state.retained_byte_count).is_equal_to(0);
-    }
-
-    #[tokio::test]
-    async fn dropping_slow_reliable_subscriber_unpins_buffer() {
-        let options = reliable_no_replay_options();
-        let shared = Arc::new(Shared::new());
-        let slow = subscribe(&shared, 0, options);
-        let mut fast = subscribe(&shared, 0, options);
-
-        append_event(&shared, options, chunk(b"a")).await;
-        assert_next_chunk(&mut fast, b"a").await;
-
-        {
-            let state = shared.state.lock().expect("broadcast state poisoned");
-            assert_that!(state.events.len()).is_equal_to(1);
-            assert_that!(state.retained_chunk_count).is_equal_to(1);
-            assert_that!(state.retained_byte_count).is_equal_to(1);
-        }
-
-        drop(slow);
-
-        let state = shared.state.lock().expect("broadcast state poisoned");
-        assert_that!(state.events.len()).is_equal_to(0);
-        assert_that!(state.retained_chunk_count).is_equal_to(0);
-        assert_that!(state.retained_byte_count).is_equal_to(0);
-    }
-
-    #[tokio::test]
-    async fn dropping_slow_subscriber_unblocks_stream_consumption() {
-        let options = reliable_no_replay_options();
-        let shared = Arc::new(Shared::new());
-        let slow = subscribe(&shared, 0, options);
-
-        append_event(&shared, options, chunk(b"a")).await;
-        let shared_for_append = Arc::clone(&shared);
-        let mut second_append =
-            tokio::spawn(
-                async move { append_event(&shared_for_append, options, chunk(b"b")).await },
-            );
-
-        assert_that!(
-            tokio::time::timeout(Duration::from_millis(25), &mut second_append)
-                .await
-                .is_err()
-        )
-        .is_true();
-
-        drop(slow);
-
-        second_append.await.unwrap();
-        let state = shared.state.lock().expect("broadcast state poisoned");
-        assert_that!(state.next_seq).is_equal_to(2);
-        assert_that!(state.events.len()).is_equal_to(0);
-    }
-
-    #[tokio::test]
-    async fn late_replay_subscriber_starts_at_bounded_replay_window_when_buffer_start_is_pinned() {
-        let options = reliable_replay_options(ReplayRetention::LastChunks(1));
-        let shared = Arc::new(Shared::new());
-        let _pinned_subscription = subscribe(&shared, 0, options);
-
-        append_event(&shared, options, chunk(b"a")).await;
-        append_event(&shared, options, chunk(b"b")).await;
-
-        {
-            let state = shared.state.lock().expect("broadcast state poisoned");
-            assert_that!(state.buffer_start_seq).is_equal_to(0);
-            assert_that!(state.replay_start_seq).is_equal_to(1);
-        }
-
-        let cursor = late_replay_cursor(&shared);
-        let mut subscription = subscribe(&shared, cursor, options);
-        assert_next_chunk(&mut subscription, b"b").await;
+        assert_next_chunk(&mut subscription, b"replay").await;
+        assert_next_chunk(&mut subscription, b"live").await;
+        assert_that!(subscription.recv().await)
+            .is_some()
+            .is_equal_to(StreamEvent::Eof);
     }
 }

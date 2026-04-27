@@ -1,8 +1,250 @@
 use super::{collect_owned_final_line, visit_lines};
 use crate::collector::{AsyncChunkCollector, AsyncLineCollector, Collector, Sink};
-use crate::output_stream::subscription::EventSubscription;
-use crate::output_stream::{Chunk, LineParserState, LineParsingOptions, Next, StreamEvent};
+use crate::output_stream::event::{Chunk, StreamEvent};
+use crate::output_stream::line::{LineParserState, LineParsingOptions};
+use crate::output_stream::options::NumBytes;
+use crate::output_stream::{Next, Subscription};
 use std::borrow::Cow;
+use std::collections::VecDeque;
+
+/// Controls which output is retained once a bounded in-memory collection reaches its limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollectionOverflowBehavior {
+    /// Keep the first retained output and discard additional output.
+    #[default]
+    DropAdditionalData,
+
+    /// Keep the newest retained output by evicting older retained output.
+    DropOldestData,
+}
+
+/// Options for collecting raw output bytes into memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawCollectionOptions {
+    /// Retain at most `max_bytes` bytes in memory.
+    Bounded {
+        /// Maximum number of bytes retained in memory.
+        max_bytes: NumBytes,
+
+        /// Which retained bytes to keep when more output is observed.
+        overflow_behavior: CollectionOverflowBehavior,
+    },
+
+    /// Retain all observed bytes in memory without a total output cap.
+    ///
+    /// Use only when the output source and its output volume are trusted.
+    TrustedUnbounded,
+}
+
+/// Options for collecting parsed output lines into memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineCollectionOptions {
+    /// Retain at most `max_bytes` total line bytes and at most `max_lines` lines in memory.
+    Bounded {
+        /// Maximum total bytes retained across all collected lines.
+        max_bytes: NumBytes,
+
+        /// Maximum number of lines retained in memory.
+        max_lines: usize,
+
+        /// Which retained lines to keep when more output is observed.
+        overflow_behavior: CollectionOverflowBehavior,
+    },
+
+    /// Retain all observed lines in memory without a total output cap.
+    ///
+    /// Use only when the output source and its output volume are trusted.
+    TrustedUnbounded,
+}
+
+/// Raw bytes collected from an output stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedBytes {
+    /// Retained output bytes.
+    pub bytes: Vec<u8>,
+
+    /// Whether any bytes were discarded because the configured limit was exceeded.
+    pub truncated: bool,
+}
+
+impl CollectedBytes {
+    /// Creates an empty collected byte buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    pub(crate) fn push_chunk(&mut self, chunk: &[u8], options: RawCollectionOptions) {
+        match options {
+            RawCollectionOptions::TrustedUnbounded => self.bytes.extend_from_slice(chunk),
+            RawCollectionOptions::Bounded {
+                max_bytes,
+                overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+            } => {
+                let max_bytes = max_bytes.bytes();
+                let remaining = max_bytes.saturating_sub(self.bytes.len());
+                if chunk.len() > remaining {
+                    self.truncated = true;
+                }
+                self.bytes
+                    .extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+            }
+            RawCollectionOptions::Bounded {
+                max_bytes,
+                overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+            } => {
+                let max_bytes = max_bytes.bytes();
+                if chunk.len() > max_bytes {
+                    self.bytes.clear();
+                    self.bytes
+                        .extend_from_slice(&chunk[chunk.len().saturating_sub(max_bytes)..]);
+                    self.truncated = true;
+                    return;
+                }
+
+                let required = self.bytes.len() + chunk.len();
+                if required > max_bytes {
+                    self.bytes.drain(0..required - max_bytes);
+                    self.truncated = true;
+                }
+                self.bytes.extend_from_slice(chunk);
+            }
+        }
+    }
+}
+
+impl Default for CollectedBytes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for CollectedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+/// Parsed lines collected from an output stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedLines {
+    lines: VecDeque<String>,
+    truncated: bool,
+    retained_bytes: usize,
+}
+
+impl CollectedLines {
+    /// Creates an empty collected line buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            lines: VecDeque::new(),
+            truncated: false,
+            retained_bytes: 0,
+        }
+    }
+
+    /// Retained output lines.
+    #[must_use]
+    pub fn lines(&self) -> &VecDeque<String> {
+        &self.lines
+    }
+
+    /// Whether any lines were discarded because the configured limit was exceeded.
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Converts this collection into its retained output lines.
+    #[must_use]
+    pub fn into_lines(self) -> VecDeque<String> {
+        self.lines
+    }
+
+    /// Converts this collection into its retained output lines and truncation flag.
+    #[must_use]
+    pub fn into_parts(self) -> (VecDeque<String>, bool) {
+        (self.lines, self.truncated)
+    }
+
+    pub(crate) fn push_line(&mut self, line: String, options: LineCollectionOptions) {
+        match options {
+            LineCollectionOptions::TrustedUnbounded => self.push_back(line),
+            LineCollectionOptions::Bounded {
+                max_bytes,
+                max_lines,
+                overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+            } => {
+                let line_len = line.len();
+                let max_bytes = max_bytes.bytes();
+                if self.lines.len() >= max_lines
+                    || line_len > max_bytes
+                    || line_len > max_bytes.saturating_sub(self.retained_bytes)
+                {
+                    self.truncated = true;
+                    return;
+                }
+                self.push_back(line);
+            }
+            LineCollectionOptions::Bounded {
+                max_bytes,
+                max_lines,
+                overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+            } => {
+                let line_len = line.len();
+                let max_bytes = max_bytes.bytes();
+                if max_lines == 0 {
+                    self.truncated = true;
+                    return;
+                }
+                if line_len > max_bytes {
+                    self.truncated = true;
+                    return;
+                }
+
+                while self.lines.len() >= max_lines
+                    || line_len > max_bytes.saturating_sub(self.retained_bytes)
+                {
+                    self.pop_front()
+                        .expect("line buffer to contain an evictable line");
+                    self.truncated = true;
+                }
+                self.push_back(line);
+            }
+        }
+    }
+
+    fn push_back(&mut self, line: String) {
+        self.retained_bytes += line.len();
+        self.lines.push_back(line);
+    }
+
+    fn pop_front(&mut self) -> Option<String> {
+        let line = self.lines.pop_front()?;
+        self.retained_bytes -= line.len();
+        Some(line)
+    }
+}
+
+impl Default for CollectedLines {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for CollectedLines {
+    type Target = VecDeque<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lines
+    }
+}
 
 pub(crate) fn collect_chunks<S, T, F>(
     stream_name: &'static str,
@@ -11,7 +253,7 @@ pub(crate) fn collect_chunks<S, T, F>(
     mut collect: F,
 ) -> Collector<T>
 where
-    S: EventSubscription,
+    S: Subscription,
     T: Sink,
     F: FnMut(Chunk, &mut T) + Send + 'static,
 {
@@ -46,7 +288,7 @@ pub(crate) fn collect_chunks_async<S, T, C>(
     mut collect: C,
 ) -> Collector<T>
 where
-    S: EventSubscription,
+    S: Subscription,
     T: Sink,
     C: AsyncChunkCollector<T>,
 {
@@ -86,7 +328,7 @@ pub(crate) fn collect_lines<S, T, F>(
     options: LineParsingOptions,
 ) -> Collector<T>
 where
-    S: EventSubscription,
+    S: Subscription,
     T: Sink,
     F: FnMut(Cow<'_, str>, &mut T) -> Next + Send + 'static,
 {
@@ -135,7 +377,7 @@ pub(crate) fn collect_lines_async<S, T, C>(
     options: LineParsingOptions,
 ) -> Collector<T>
 where
-    S: EventSubscription,
+    S: Subscription,
     T: Sink,
     C: AsyncLineCollector<T>,
 {
@@ -187,6 +429,7 @@ where
 mod tests {
     use super::*;
     use crate::CollectorError;
+    use crate::output_stream::options::NumBytesExt;
     use crate::{AsyncChunkCollector, AsyncLineCollector};
     use assertr::prelude::*;
     use bytes::Bytes;
@@ -201,6 +444,207 @@ mod tests {
         }
         drop(tx);
         rx
+    }
+
+    fn drop_oldest_options(max_bytes: usize, max_lines: usize) -> LineCollectionOptions {
+        LineCollectionOptions::Bounded {
+            max_bytes: max_bytes.bytes(),
+            max_lines,
+            overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+        }
+    }
+
+    fn assert_retained_bytes_match_lines(collected: &CollectedLines) {
+        assert_that!(collected.retained_bytes)
+            .is_equal_to(collected.lines.iter().map(String::len).sum::<usize>());
+    }
+
+    #[test]
+    fn raw_collection_keeps_expected_bytes_when_truncated() {
+        let mut collected = CollectedBytes::new();
+        let options = RawCollectionOptions::Bounded {
+            max_bytes: 5.bytes(),
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
+
+        collected.push_chunk(b"abc", options);
+        collected.push_chunk(b"def", options);
+
+        assert_that!(collected.bytes.as_slice()).is_equal_to(b"abcde".as_slice());
+        assert_that!(collected.truncated).is_true();
+
+        let mut collected = CollectedBytes::new();
+        let options = RawCollectionOptions::Bounded {
+            max_bytes: 5.bytes(),
+            overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+        };
+
+        collected.push_chunk(b"abc", options);
+        collected.push_chunk(b"def", options);
+
+        assert_that!(collected.bytes.as_slice()).is_equal_to(b"bcdef".as_slice());
+        assert_that!(collected.truncated).is_true();
+    }
+
+    #[test]
+    fn basic_line_collection_limit_modes() {
+        let mut collected = CollectedLines::new();
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 7.bytes(),
+            max_lines: 2,
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
+
+        collected.push_line("one".to_string(), options);
+        collected.push_line("two".to_string(), options);
+        collected.push_line("three".to_string(), options);
+
+        assert_that!(
+            collected
+                .lines()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec!["one", "two"]);
+        assert_that!(collected.truncated()).is_true();
+
+        let mut collected = CollectedLines::new();
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 6.bytes(),
+            max_lines: 2,
+            overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+        };
+
+        collected.push_line("one".to_string(), options);
+        collected.push_line("two".to_string(), options);
+        collected.push_line("six".to_string(), options);
+
+        assert_that!(
+            collected
+                .lines()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        )
+        .is_equal_to(vec!["two", "six"]);
+        assert_that!(collected.truncated()).is_true();
+    }
+
+    #[test]
+    fn retained_bytes_tracks_appended_lines() {
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 100.bytes(),
+            max_lines: 100,
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
+        let mut collected = CollectedLines::new();
+
+        collected.push_line("aaa".to_string(), options);
+        collected.push_line("bbbb".to_string(), options);
+
+        assert_that!(collected.retained_bytes).is_equal_to(7);
+        assert_retained_bytes_match_lines(&collected);
+    }
+
+    #[test]
+    fn drop_oldest_preserves_retained_lines_when_oversized_line_arrives() {
+        let options = drop_oldest_options(10, 100);
+        let mut collected = CollectedLines::new();
+
+        collected.push_line("aaa".to_string(), options);
+        collected.push_line("bbb".to_string(), options);
+        collected.push_line("x".repeat(13), options);
+
+        assert_that!(collected.lines())
+            .with_detail_message(
+                "previously-retained lines must survive an oversized incoming line",
+            )
+            .is_equal_to(VecDeque::from(["aaa".to_string(), "bbb".to_string()]));
+        assert_that!(collected.retained_bytes).is_equal_to(6);
+        assert_retained_bytes_match_lines(&collected);
+        assert_that!(collected.truncated()).is_true();
+    }
+
+    #[test]
+    fn drop_oldest_evicts_old_lines_when_new_line_fits_but_budget_is_exceeded() {
+        let options = drop_oldest_options(10, 100);
+        let mut collected = CollectedLines::new();
+
+        collected.push_line("aaaa".to_string(), options);
+        collected.push_line("bbbb".to_string(), options);
+        collected.push_line("cccc".to_string(), options);
+
+        assert_that!(collected.lines())
+            .is_equal_to(VecDeque::from(["bbbb".to_string(), "cccc".to_string()]));
+        assert_that!(collected.retained_bytes).is_equal_to(8);
+        assert_retained_bytes_match_lines(&collected);
+        assert_that!(collected.truncated()).is_true();
+    }
+
+    #[test]
+    fn drop_oldest_updates_retained_bytes_when_evicting_by_line_count() {
+        let options = drop_oldest_options(100, 2);
+        let mut collected = CollectedLines::new();
+
+        collected.push_line("a".to_string(), options);
+        collected.push_line("bb".to_string(), options);
+        collected.push_line("ccc".to_string(), options);
+
+        assert_that!(collected.lines())
+            .is_equal_to(VecDeque::from(["bb".to_string(), "ccc".to_string()]));
+        assert_that!(collected.retained_bytes).is_equal_to(5);
+        assert_retained_bytes_match_lines(&collected);
+        assert_that!(collected.truncated()).is_true();
+    }
+
+    #[test]
+    fn drop_oldest_with_zero_max_lines_retains_nothing() {
+        let options = drop_oldest_options(100, 0);
+        let mut collected = CollectedLines::new();
+
+        collected.push_line("aaa".to_string(), options);
+
+        assert_that!(collected.lines().is_empty()).is_true();
+        assert_that!(collected.retained_bytes).is_equal_to(0);
+        assert_retained_bytes_match_lines(&collected);
+        assert_that!(collected.truncated()).is_true();
+    }
+
+    #[test]
+    fn drop_additional_preserves_retained_lines_when_oversized_line_arrives() {
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 10.bytes(),
+            max_lines: 100,
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
+        let mut collected = CollectedLines::new();
+
+        collected.push_line("aaa".to_string(), options);
+        collected.push_line("x".repeat(13), options);
+
+        assert_that!(collected.lines()).is_equal_to(VecDeque::from(["aaa".to_string()]));
+        assert_that!(collected.retained_bytes).is_equal_to(3);
+        assert_retained_bytes_match_lines(&collected);
+        assert_that!(collected.truncated()).is_true();
+    }
+
+    #[test]
+    fn drop_additional_preserves_retained_bytes_when_limit_rejects_line() {
+        let options = LineCollectionOptions::Bounded {
+            max_bytes: 6.bytes(),
+            max_lines: 100,
+            overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+        };
+        let mut collected = CollectedLines::new();
+
+        collected.push_line("aaa".to_string(), options);
+        collected.push_line("bbbb".to_string(), options);
+
+        assert_that!(collected.lines()).is_equal_to(VecDeque::from(["aaa".to_string()]));
+        assert_that!(collected.retained_bytes).is_equal_to(3);
+        assert_retained_bytes_match_lines(&collected);
+        assert_that!(collected.truncated()).is_true();
     }
 
     #[tokio::test]
