@@ -1,13 +1,12 @@
-use super::{visit_final_line, visit_lines};
-use crate::output_stream::event::StreamEvent;
+use super::visitor::{WaitForLine, drive_sync};
+use crate::output_stream::Subscription;
 use crate::output_stream::line::{LineParserState, LineParsingOptions};
-use crate::output_stream::{Next, Subscription};
 use crate::{StreamReadError, WaitForLineResult};
 use std::borrow::Cow;
 use std::time::Duration;
 
 pub(crate) async fn wait_for_line<S>(
-    mut subscription: S,
+    subscription: S,
     predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
     options: LineParsingOptions,
 ) -> Result<WaitForLineResult, StreamReadError>
@@ -18,38 +17,21 @@ where
         options.max_line_length.bytes() > 0,
         "LineParsingOptions::max_line_length must be greater than zero"
     );
-    let mut parser = LineParserState::new();
 
-    loop {
-        match subscription.next_event().await {
-            Some(StreamEvent::Chunk(chunk)) => {
-                if visit_lines(chunk.as_ref(), &mut parser, options, |line| {
-                    if predicate(line) {
-                        Next::Break
-                    } else {
-                        Next::Continue
-                    }
-                }) == Next::Break
-                {
-                    return Ok(WaitForLineResult::Matched);
-                }
-            }
-            Some(StreamEvent::Gap) => parser.on_gap(),
-            Some(StreamEvent::Eof) | None => {
-                if visit_final_line(&parser, |line| {
-                    if predicate(line) {
-                        Next::Break
-                    } else {
-                        Next::Continue
-                    }
-                }) == Next::Break
-                {
-                    return Ok(WaitForLineResult::Matched);
-                }
-                return Ok(WaitForLineResult::StreamClosed);
-            }
-            Some(StreamEvent::ReadError(err)) => return Err(err),
-        }
+    // Hold the sender on this stack frame so the receiver never fires while the future is alive.
+    // The sender drops naturally when this future returns or is cancelled.
+    let (_term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let visitor = WaitForLine {
+        parser: LineParserState::new(),
+        options,
+        predicate,
+        matched: false,
+    };
+    let matched = drive_sync(subscription, visitor, term_sig_rx).await?;
+    if matched {
+        Ok(WaitForLineResult::Matched)
+    } else {
+        Ok(WaitForLineResult::StreamClosed)
     }
 }
 
@@ -70,7 +52,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_stream::event::Chunk;
+    use crate::output_stream::event::{Chunk, StreamEvent};
     use crate::{LineOverflowBehavior, NumBytesExt};
     use assertr::prelude::*;
     use bytes::Bytes;

@@ -1,3 +1,4 @@
+use super::collect::{Collector, CollectorCancelOutcome, CollectorError, CollectorTaskError};
 use super::visitor::{
     InspectChunks, InspectChunksAsync, InspectLines, InspectLinesAsync, drive_async, drive_sync,
 };
@@ -9,29 +10,21 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::oneshot::Sender;
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep_until};
 
-pub(crate) fn inspect_chunks<S, F>(
-    stream_name: &'static str,
-    subscription: S,
-    f: F,
-) -> Inspector
+pub(crate) fn inspect_chunks<S, F>(stream_name: &'static str, subscription: S, f: F) -> Inspector
 where
     S: Subscription,
     F: FnMut(Chunk) -> Next + Send + 'static,
 {
     let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    Inspector {
+    let driver = drive_sync(subscription, InspectChunks { f }, term_sig_rx);
+    Inspector(Collector {
         stream_name,
-        task: Some(tokio::spawn(drive_sync(
-            subscription,
-            InspectChunks { f },
-            term_sig_rx,
-        ))),
+        task: Some(tokio::spawn(async move {
+            driver.await.map_err(CollectorTaskError::from)
+        })),
         task_termination_sender: Some(term_sig_tx),
-    }
+    })
 }
 
 pub(crate) fn inspect_chunks_async<S, F, Fut>(
@@ -45,15 +38,14 @@ where
     Fut: Future<Output = Next> + Send + 'static,
 {
     let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    Inspector {
+    let driver = drive_async(subscription, InspectChunksAsync { f }, term_sig_rx);
+    Inspector(Collector {
         stream_name,
-        task: Some(tokio::spawn(drive_async(
-            subscription,
-            InspectChunksAsync { f },
-            term_sig_rx,
-        ))),
+        task: Some(tokio::spawn(async move {
+            driver.await.map_err(CollectorTaskError::from)
+        })),
         task_termination_sender: Some(term_sig_tx),
-    }
+    })
 }
 
 pub(crate) fn inspect_lines<S, F>(
@@ -71,19 +63,22 @@ where
         "LineParsingOptions::max_line_length must be greater than zero"
     );
     let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    Inspector {
+    let driver = drive_sync(
+        subscription,
+        InspectLines {
+            parser: LineParserState::new(),
+            options,
+            f,
+        },
+        term_sig_rx,
+    );
+    Inspector(Collector {
         stream_name,
-        task: Some(tokio::spawn(drive_sync(
-            subscription,
-            InspectLines {
-                parser: LineParserState::new(),
-                options,
-                f,
-            },
-            term_sig_rx,
-        ))),
+        task: Some(tokio::spawn(async move {
+            driver.await.map_err(CollectorTaskError::from)
+        })),
         task_termination_sender: Some(term_sig_tx),
-    }
+    })
 }
 
 pub(crate) fn inspect_lines_async<S, F, Fut>(
@@ -102,19 +97,22 @@ where
         "LineParsingOptions::max_line_length must be greater than zero"
     );
     let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    Inspector {
+    let driver = drive_async(
+        subscription,
+        InspectLinesAsync {
+            parser: LineParserState::new(),
+            options,
+            f,
+        },
+        term_sig_rx,
+    );
+    Inspector(Collector {
         stream_name,
-        task: Some(tokio::spawn(drive_async(
-            subscription,
-            InspectLinesAsync {
-                parser: LineParserState::new(),
-                options,
-                f,
-            },
-            term_sig_rx,
-        ))),
+        task: Some(tokio::spawn(async move {
+            driver.await.map_err(CollectorTaskError::from)
+        })),
         task_termination_sender: Some(term_sig_tx),
-    }
+    })
 }
 
 /// Errors that can occur when inspecting stream data.
@@ -163,72 +161,23 @@ pub enum InspectorCancelOutcome {
 ///
 /// If not cleaned up, the termination signal will be sent when dropping this inspector,
 /// but the task will be aborted (forceful, not waiting for its regular completion).
-pub struct Inspector {
-    /// The name of the stream this inspector operates on.
-    pub(crate) stream_name: &'static str,
+pub struct Inspector(pub(crate) Collector<()>);
 
-    pub(crate) task: Option<JoinHandle<Result<(), StreamReadError>>>,
-    pub(crate) task_termination_sender: Option<Sender<()>>,
-}
-
-/// Owns an inspector task while [`Inspector::wait`] is pending.
-///
-/// `Inspector::wait` consumes the inspector and then awaits its task. Without this guard, dropping
-/// that wait future after the task handle has been taken would detach the task instead of applying
-/// the same cleanup behavior as dropping an unused inspector. The guard makes `wait` cancellation
-/// safe by signalling termination and aborting the task if the wait future is dropped early.
-struct InspectorWaitGuard {
-    task: Option<JoinHandle<Result<(), StreamReadError>>>,
-    task_termination_sender: Option<Sender<()>>,
-}
-
-impl InspectorWaitGuard {
-    fn cancel(&mut self) {
-        let _res = self
-            .task_termination_sender
-            .take()
-            .expect("`task_termination_sender` to be present.")
-            .send(());
-    }
-
-    async fn wait(&mut self, stream_name: &'static str) -> Result<(), InspectorError> {
-        self.task
-            .as_mut()
-            .expect("`task` to be present.")
-            .await
-            .map_err(|err| InspectorError::TaskJoin {
-                stream_name,
-                source: err,
-            })?
-            .map_err(|err| InspectorError::StreamRead { source: err })?;
-
-        self.task = None;
-        self.task_termination_sender = None;
-
-        Ok(())
-    }
-
-    async fn abort(&mut self) {
-        if let Some(task_termination_sender) = self.task_termination_sender.take() {
-            let _res = task_termination_sender.send(());
-        }
-        if let Some(task) = &self.task {
-            task.abort();
-        }
-        if let Some(task) = self.task.as_mut() {
-            let _res = task.await;
-        }
-        self.task = None;
-    }
-}
-
-impl Drop for InspectorWaitGuard {
-    fn drop(&mut self) {
-        if let Some(task_termination_sender) = self.task_termination_sender.take() {
-            let _res = task_termination_sender.send(());
-        }
-        if let Some(task) = self.task.take() {
-            task.abort();
+fn into_inspector_error(err: CollectorError) -> InspectorError {
+    match err {
+        CollectorError::TaskJoin {
+            stream_name,
+            source,
+        } => InspectorError::TaskJoin {
+            stream_name,
+            source,
+        },
+        CollectorError::StreamRead { source } => InspectorError::StreamRead { source },
+        // SinkWrite is unreachable: an Inspector wraps Collector<()>, whose task body never calls
+        // a writer sink. The variant exists on CollectorError because writer-backed collectors
+        // share the same type.
+        CollectorError::SinkWrite { .. } => {
+            unreachable!("Inspector tasks never produce SinkWrite errors")
         }
     }
 }
@@ -241,7 +190,7 @@ impl Inspector {
     /// [`cancel_or_abort_after`](Self::cancel_or_abort_after) consumes it.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+        self.0.is_finished()
     }
 
     /// Waits for the inspector to terminate naturally.
@@ -263,13 +212,8 @@ impl Inspector {
     /// # Panics
     ///
     /// Panics if the inspector's internal task has already been taken.
-    pub async fn wait(mut self) -> Result<(), InspectorError> {
-        let mut guard = InspectorWaitGuard {
-            task: self.task.take(),
-            task_termination_sender: self.task_termination_sender.take(),
-        };
-
-        guard.wait(self.stream_name).await
+    pub async fn wait(self) -> Result<(), InspectorError> {
+        self.0.wait().await.map_err(into_inspector_error)
     }
 
     /// Sends a cooperative cancellation event to the inspector and waits for it to stop.
@@ -291,14 +235,8 @@ impl Inspector {
     /// # Panics
     ///
     /// Panics if the inspector's internal cancellation sender has already been taken.
-    pub async fn cancel(mut self) -> Result<(), InspectorError> {
-        let mut guard = InspectorWaitGuard {
-            task: self.task.take(),
-            task_termination_sender: self.task_termination_sender.take(),
-        };
-
-        guard.cancel();
-        guard.wait(self.stream_name).await
+    pub async fn cancel(self) -> Result<(), InspectorError> {
+        self.0.cancel().await.map_err(into_inspector_error)
     }
 
     /// Forcefully aborts the inspector task.
@@ -309,13 +247,8 @@ impl Inspector {
     ///
     /// For single-subscriber streams, the consumer claim is released after the aborted task has
     /// been joined during this method.
-    pub async fn abort(mut self) {
-        let mut guard = InspectorWaitGuard {
-            task: self.task.take(),
-            task_termination_sender: self.task_termination_sender.take(),
-        };
-
-        guard.abort().await;
+    pub async fn abort(self) {
+        self.0.abort().await;
     }
 
     /// Cooperatively cancels the inspector, aborting it if `timeout` elapses first.
@@ -340,41 +273,13 @@ impl Inspector {
     ///
     /// Panics if the inspector's internal cancellation sender has already been taken.
     pub async fn cancel_or_abort_after(
-        mut self,
+        self,
         timeout: Duration,
     ) -> Result<InspectorCancelOutcome, InspectorError> {
-        let mut guard = InspectorWaitGuard {
-            task: self.task.take(),
-            task_termination_sender: self.task_termination_sender.take(),
-        };
-
-        guard.cancel();
-        let timeout = sleep_until(Instant::now() + timeout);
-        tokio::pin!(timeout);
-
-        tokio::select! {
-            result = guard.wait(self.stream_name) => {
-                result?;
-                Ok(InspectorCancelOutcome::Cancelled)
-            }
-            () = &mut timeout => {
-                guard.abort().await;
-                Ok(InspectorCancelOutcome::Aborted)
-            }
-        }
-    }
-}
-
-impl Drop for Inspector {
-    fn drop(&mut self) {
-        if let Some(task_termination_sender) = self.task_termination_sender.take() {
-            // We ignore any potential error here.
-            // Sending may fail if the task is already terminated (for example, by reaching EOF),
-            // which in turn dropped the receiver end!
-            let _res = task_termination_sender.send(());
-        }
-        if let Some(task) = self.task.take() {
-            task.abort();
+        match self.0.cancel_or_abort_after(timeout).await {
+            Ok(CollectorCancelOutcome::Cancelled(())) => Ok(InspectorCancelOutcome::Cancelled),
+            Ok(CollectorCancelOutcome::Aborted) => Ok(InspectorCancelOutcome::Aborted),
+            Err(err) => Err(into_inspector_error(err)),
         }
     }
 }
@@ -393,10 +298,7 @@ mod tests {
 
     #[test]
     fn stream_read_display_uses_source_context() {
-        let source = StreamReadError::new(
-            "stderr",
-            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
-        );
+        let source = StreamReadError::new("stderr", io::Error::from(io::ErrorKind::BrokenPipe));
         let expected = source.to_string();
         let err = InspectorError::StreamRead { source };
 
@@ -406,14 +308,14 @@ mod tests {
     #[tokio::test]
     async fn cancel_or_abort_after_returns_cancelled_when_cooperative() {
         let (task_termination_sender, task_termination_receiver) = oneshot::channel();
-        let inspector = Inspector {
+        let inspector = Inspector(Collector {
             stream_name: "custom",
             task: Some(tokio::spawn(async move {
                 let _res = task_termination_receiver.await;
                 Ok(())
             })),
             task_termination_sender: Some(task_termination_sender),
-        };
+        });
 
         let outcome = inspector
             .cancel_or_abort_after(Duration::from_secs(1))
@@ -443,8 +345,7 @@ mod tests {
 
         #[tokio::test]
         async fn inspectors_return_stream_read_error() {
-            let error =
-                crate::StreamReadError::new("custom", io::Error::from(io::ErrorKind::BrokenPipe));
+            let error = StreamReadError::new("custom", io::Error::from(io::ErrorKind::BrokenPipe));
             let inspector = inspect_lines(
                 "custom",
                 event_receiver(vec![
@@ -501,7 +402,7 @@ mod tests {
 
         #[tokio::test]
         async fn accepts_stateful_callback() {
-            let (count_tx, count_rx) = tokio::sync::oneshot::channel();
+            let (count_tx, count_rx) = oneshot::channel();
             let mut chunk_count = 0;
             let mut count_tx = Some(count_tx);
             let inspector = inspect_chunks(

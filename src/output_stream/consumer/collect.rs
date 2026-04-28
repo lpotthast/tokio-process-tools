@@ -675,7 +675,9 @@ where
     );
     Collector {
         stream_name,
-        task: Some(tokio::spawn(async move { driver.await.map_err(Into::into) })),
+        task: Some(tokio::spawn(
+            async move { driver.await.map_err(Into::into) },
+        )),
         task_termination_sender: Some(term_sig_tx),
     }
 }
@@ -720,7 +722,9 @@ where
     );
     Collector {
         stream_name,
-        task: Some(tokio::spawn(async move { driver.await.map_err(Into::into) })),
+        task: Some(tokio::spawn(
+            async move { driver.await.map_err(Into::into) },
+        )),
         task_termination_sender: Some(term_sig_tx),
     }
 }
@@ -750,7 +754,9 @@ where
     );
     Collector {
         stream_name,
-        task: Some(tokio::spawn(async move { driver.await.map_err(Into::into) })),
+        task: Some(tokio::spawn(
+            async move { driver.await.map_err(Into::into) },
+        )),
         task_termination_sender: Some(term_sig_tx),
     }
 }
@@ -806,7 +812,9 @@ where
     );
     Collector {
         stream_name,
-        task: Some(tokio::spawn(async move { driver.await.map_err(Into::into) })),
+        task: Some(tokio::spawn(
+            async move { driver.await.map_err(Into::into) },
+        )),
         task_termination_sender: Some(term_sig_tx),
     }
 }

@@ -1,3 +1,27 @@
+/// Internal helper that emits a consumer-method body. Both the infallible and the fallible
+/// top-level macros expand to calls of the form
+/// `consumer_fn(stream_name, subscription, ...)`; this helper hides that boilerplate.
+///
+/// `Direct` mode produces an unwrapped expression for the infallible API; `Fallible` mode
+/// uses `try_subscribe()?` and wraps the result in `Ok(...)` for the result-returning API.
+/// Pass `self` explicitly because macro hygiene hides the surrounding method's `self` binding.
+macro_rules! __consumer_call {
+    (Direct, $self:ident, $fn:path $(, $arg:expr)* $(,)?) => {
+        $fn(
+            <Self as $crate::output_stream::OutputStream>::name($self),
+            <Self as $crate::output_stream::Subscribable>::subscribe($self)
+            $(, $arg)*
+        )
+    };
+    (Fallible, $self:ident, $fn:path $(, $arg:expr)* $(,)?) => {
+        Ok($fn(
+            <Self as $crate::output_stream::OutputStream>::name($self),
+            <Self as $crate::output_stream::TrySubscribable>::try_subscribe($self)?
+            $(, $arg)*
+        ))
+    };
+}
+
 macro_rules! impl_output_stream_consumer_api {
     (impl $($impl_header:tt)*) => {
         #[allow(dead_code)]
@@ -11,9 +35,10 @@ macro_rules! impl_output_stream_consumer_api {
                 &self,
                 f: impl FnMut($crate::Chunk) -> $crate::Next + Send + 'static,
             ) -> $crate::Inspector {
-                $crate::output_stream::consumer::inspect::inspect_chunks(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::inspect::inspect_chunks,
                     f,
                 )
             }
@@ -30,9 +55,10 @@ macro_rules! impl_output_stream_consumer_api {
             where
                 Fut: ::std::future::Future<Output = $crate::Next> + Send + 'static,
             {
-                $crate::output_stream::consumer::inspect::inspect_chunks_async(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::inspect::inspect_chunks_async,
                     f,
                 )
             }
@@ -51,9 +77,10 @@ macro_rules! impl_output_stream_consumer_api {
                 f: impl FnMut(::std::borrow::Cow<'_, str>) -> $crate::Next + Send + 'static,
                 options: $crate::LineParsingOptions,
             ) -> $crate::Inspector {
-                $crate::output_stream::consumer::inspect::inspect_lines(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::inspect::inspect_lines,
                     f,
                     options,
                 )
@@ -76,9 +103,10 @@ macro_rules! impl_output_stream_consumer_api {
             where
                 Fut: ::std::future::Future<Output = $crate::Next> + Send + 'static,
             {
-                $crate::output_stream::consumer::inspect::inspect_lines_async(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::inspect::inspect_lines_async,
                     f,
                     options,
                 )
@@ -93,9 +121,10 @@ macro_rules! impl_output_stream_consumer_api {
                 into: S,
                 collect: impl FnMut($crate::Chunk, &mut S) + Send + 'static,
             ) -> $crate::Collector<S> {
-                $crate::output_stream::consumer::collect::collect_chunks(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_chunks,
                     into,
                     collect,
                 )
@@ -110,9 +139,10 @@ macro_rules! impl_output_stream_consumer_api {
                 S: $crate::Sink,
                 C: $crate::AsyncChunkCollector<S>,
             {
-                $crate::output_stream::consumer::collect::collect_chunks_async(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_chunks_async,
                     into,
                     collect,
                 )
@@ -139,9 +169,10 @@ macro_rules! impl_output_stream_consumer_api {
                     options.max_line_length.bytes() > 0,
                     "LineParsingOptions::max_line_length must be greater than zero"
                 );
-                $crate::output_stream::consumer::collect::collect_lines(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_lines,
                     into,
                     collect,
                     options,
@@ -164,9 +195,10 @@ macro_rules! impl_output_stream_consumer_api {
                 S: $crate::Sink,
                 C: $crate::AsyncLineCollector<S>,
             {
-                $crate::output_stream::consumer::collect::collect_lines_async(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_lines_async,
                     into,
                     collect,
                     options,
@@ -179,9 +211,10 @@ macro_rules! impl_output_stream_consumer_api {
                 &self,
                 options: $crate::RawCollectionOptions,
             ) -> $crate::Collector<$crate::CollectedBytes> {
-                $crate::output_stream::consumer::collect::collect_chunks_into_vec(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_chunks_into_vec,
                     options,
                 )
             }
@@ -200,9 +233,10 @@ macro_rules! impl_output_stream_consumer_api {
                 parsing_options: $crate::LineParsingOptions,
                 collection_options: $crate::LineCollectionOptions,
             ) -> $crate::Collector<$crate::CollectedLines> {
-                $crate::output_stream::consumer::collect::collect_lines_into_vec(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_lines_into_vec,
                     parsing_options,
                     collection_options,
                 )
@@ -227,9 +261,10 @@ macro_rules! impl_output_stream_consumer_api {
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 H: $crate::SinkWriteErrorHandler,
             {
-                $crate::output_stream::consumer::write::collect_chunks_into_write(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::write::collect_chunks_into_write,
                     write,
                     write_options,
                 )
@@ -259,9 +294,10 @@ macro_rules! impl_output_stream_consumer_api {
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 H: $crate::SinkWriteErrorHandler,
             {
-                $crate::output_stream::consumer::write::collect_lines_into_write(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::write::collect_lines_into_write,
                     write,
                     options,
                     mode,
@@ -287,12 +323,13 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Collector<W>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
-                B: AsRef<[u8]> + Send,
+                B: AsRef<[u8]> + Send + 'static,
                 H: $crate::SinkWriteErrorHandler,
             {
-                $crate::output_stream::consumer::write::collect_chunks_into_write_mapped(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::write::collect_chunks_into_write_mapped,
                     write,
                     mapper,
                     write_options,
@@ -323,12 +360,13 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::Collector<W>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
-                B: AsRef<[u8]> + Send,
+                B: AsRef<[u8]> + Send + 'static,
                 H: $crate::SinkWriteErrorHandler,
             {
-                $crate::output_stream::consumer::write::collect_lines_into_write_mapped(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::Subscribable>::subscribe(self),
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::write::collect_lines_into_write_mapped,
                     write,
                     mapper,
                     options,
@@ -394,11 +432,12 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 &self,
                 f: impl FnMut($crate::Chunk) -> $crate::Next + Send + 'static,
             ) -> Result<$crate::Inspector, $crate::StreamConsumerError> {
-                Ok($crate::output_stream::consumer::inspect::inspect_chunks(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::inspect::inspect_chunks,
                     f,
-                ))
+                )
             }
 
             /// Tries to inspect chunks of output from the stream without storing them, using an async closure.
@@ -413,11 +452,12 @@ macro_rules! impl_fallible_output_stream_consumer_api {
             where
                 Fut: ::std::future::Future<Output = $crate::Next> + Send + 'static,
             {
-                Ok($crate::output_stream::consumer::inspect::inspect_chunks_async(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::inspect::inspect_chunks_async,
                     f,
-                ))
+                )
             }
 
             /// Tries to inspect lines of output from the stream without storing them.
@@ -434,12 +474,13 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 f: impl FnMut(::std::borrow::Cow<'_, str>) -> $crate::Next + Send + 'static,
                 options: $crate::LineParsingOptions,
             ) -> Result<$crate::Inspector, $crate::StreamConsumerError> {
-                Ok($crate::output_stream::consumer::inspect::inspect_lines(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::inspect::inspect_lines,
                     f,
                     options,
-                ))
+                )
             }
 
             /// Tries to inspect lines of output from the stream without storing them, using an async closure.
@@ -459,12 +500,13 @@ macro_rules! impl_fallible_output_stream_consumer_api {
             where
                 Fut: ::std::future::Future<Output = $crate::Next> + Send + 'static,
             {
-                Ok($crate::output_stream::consumer::inspect::inspect_lines_async(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::inspect::inspect_lines_async,
                     f,
                     options,
-                ))
+                )
             }
 
             /// Tries to collect chunks from the stream into a sink.
@@ -477,12 +519,13 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 into: S,
                 collect: impl FnMut($crate::Chunk, &mut S) + Send + 'static,
             ) -> Result<$crate::Collector<S>, $crate::StreamConsumerError> {
-                Ok($crate::output_stream::consumer::collect::collect_chunks(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_chunks,
                     into,
                     collect,
-                ))
+                )
             }
 
             /// Tries to collect chunks from the stream into a sink using an async collector.
@@ -499,12 +542,13 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 S: $crate::Sink,
                 C: $crate::AsyncChunkCollector<S>,
             {
-                Ok($crate::output_stream::consumer::collect::collect_chunks_async(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_chunks_async,
                     into,
                     collect,
-                ))
+                )
             }
 
             /// Tries to collect lines from the stream into a sink.
@@ -528,13 +572,14 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                     options.max_line_length.bytes() > 0,
                     "LineParsingOptions::max_line_length must be greater than zero"
                 );
-                Ok($crate::output_stream::consumer::collect::collect_lines(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_lines,
                     into,
                     collect,
                     options,
-                ))
+                )
             }
 
             /// Tries to collect lines from the stream into a sink using an async collector.
@@ -552,13 +597,14 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 S: $crate::Sink,
                 C: $crate::AsyncLineCollector<S>,
             {
-                Ok($crate::output_stream::consumer::collect::collect_lines_async(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_lines_async,
                     into,
                     collect,
                     options,
-                ))
+                )
             }
 
             /// Tries to collect chunks into a bounded byte vector.
@@ -570,11 +616,12 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 &self,
                 options: $crate::RawCollectionOptions,
             ) -> Result<$crate::Collector<$crate::CollectedBytes>, $crate::StreamConsumerError> {
-                Ok($crate::output_stream::consumer::collect::collect_chunks_into_vec(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_chunks_into_vec,
                     options,
-                ))
+                )
             }
 
             /// Tries to collect lines into a line buffer.
@@ -591,12 +638,13 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 parsing_options: $crate::LineParsingOptions,
                 collection_options: $crate::LineCollectionOptions,
             ) -> Result<$crate::Collector<$crate::CollectedLines>, $crate::StreamConsumerError> {
-                Ok($crate::output_stream::consumer::collect::collect_lines_into_vec(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::collect::collect_lines_into_vec,
                     parsing_options,
                     collection_options,
-                ))
+                )
             }
 
             /// Tries to collect chunks into an async writer.
@@ -613,12 +661,13 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 H: $crate::SinkWriteErrorHandler,
             {
-                Ok($crate::output_stream::consumer::write::collect_chunks_into_write(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::write::collect_chunks_into_write,
                     write,
                     write_options,
-                ))
+                )
             }
 
             /// Tries to collect lines into an async writer.
@@ -637,14 +686,15 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 H: $crate::SinkWriteErrorHandler,
             {
-                Ok($crate::output_stream::consumer::write::collect_lines_into_write(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::write::collect_lines_into_write,
                     write,
                     options,
                     mode,
                     write_options,
-                ))
+                )
             }
 
             /// Tries to collect chunks into an async writer after mapping them.
@@ -660,16 +710,17 @@ macro_rules! impl_fallible_output_stream_consumer_api {
             ) -> Result<$crate::Collector<W>, $crate::StreamConsumerError>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
-                B: AsRef<[u8]> + Send,
+                B: AsRef<[u8]> + Send + 'static,
                 H: $crate::SinkWriteErrorHandler,
             {
-                Ok($crate::output_stream::consumer::write::collect_chunks_into_write_mapped(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::write::collect_chunks_into_write_mapped,
                     write,
                     mapper,
                     write_options,
-                ))
+                )
             }
 
             /// Tries to collect lines into an async writer after mapping them.
@@ -687,18 +738,19 @@ macro_rules! impl_fallible_output_stream_consumer_api {
             ) -> Result<$crate::Collector<W>, $crate::StreamConsumerError>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
-                B: AsRef<[u8]> + Send,
+                B: AsRef<[u8]> + Send + 'static,
                 H: $crate::SinkWriteErrorHandler,
             {
-                Ok($crate::output_stream::consumer::write::collect_lines_into_write_mapped(
-                    <Self as $crate::output_stream::OutputStream>::name(self),
-                    <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?,
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::write::collect_lines_into_write_mapped,
                     write,
                     mapper,
                     options,
                     mode,
                     write_options,
-                ))
+                )
             }
 
             /// Tries to wait for a line that matches the given predicate within `timeout`.

@@ -97,6 +97,62 @@ where
     Ok(visitor.into_output())
 }
 
+pub(crate) struct WaitForLine<P> {
+    pub parser: LineParserState,
+    pub options: LineParsingOptions,
+    pub predicate: P,
+    pub matched: bool,
+}
+
+impl<P> Visitor for WaitForLine<P>
+where
+    P: Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
+{
+    type Output = bool;
+
+    fn on_chunk(&mut self, chunk: Chunk) -> Next {
+        let Self {
+            parser,
+            options,
+            predicate,
+            matched,
+        } = self;
+        parser.visit_chunk(chunk.as_ref(), *options, |line| {
+            if predicate(line) {
+                *matched = true;
+                Next::Break
+            } else {
+                Next::Continue
+            }
+        })
+    }
+
+    fn on_gap(&mut self) {
+        self.parser.on_gap();
+    }
+
+    fn on_eof(&mut self) {
+        let Self {
+            parser,
+            predicate,
+            matched,
+            ..
+        } = self;
+        let _ = parser.finish(|line| {
+            if predicate(line) {
+                *matched = true;
+                Next::Break
+            } else {
+                Next::Continue
+            }
+        });
+    }
+
+    fn into_output(self) -> Self::Output {
+        self.matched
+    }
+}
+
 pub(crate) struct InspectChunks<F> {
     pub f: F,
 }

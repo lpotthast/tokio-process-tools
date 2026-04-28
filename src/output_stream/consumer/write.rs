@@ -1,7 +1,8 @@
 use super::collect::{Collector, CollectorTaskError, Sink};
-use super::collect_owned_final_line;
+use super::visitor::{AsyncVisitor, drive_async};
+use crate::output_stream::Next;
 use crate::output_stream::Subscription;
-use crate::output_stream::event::{Chunk, StreamEvent};
+use crate::output_stream::event::Chunk;
 use crate::output_stream::line::{LineParserState, LineParsingOptions};
 use std::borrow::Cow;
 use std::io;
@@ -168,9 +169,237 @@ impl<H> WriteCollectionOptions<H> {
     }
 }
 
+pub(crate) struct WriteChunks<W, H> {
+    pub stream_name: &'static str,
+    pub writer: W,
+    pub error_handler: H,
+    pub error: Option<CollectorTaskError>,
+}
+
+impl<W, H> AsyncVisitor for WriteChunks<W, H>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+{
+    type Output = Result<W, CollectorTaskError>;
+
+    async fn on_chunk(&mut self, chunk: Chunk) -> Next {
+        let attempted_len = chunk.as_ref().len();
+        let result = self.writer.write_all(chunk.as_ref()).await;
+        match handle_write_result(
+            self.stream_name,
+            &mut self.error_handler,
+            SinkWriteOperation::Chunk,
+            attempted_len,
+            result,
+        ) {
+            Ok(_) => Next::Continue,
+            Err(err) => {
+                self.error = Some(err);
+                Next::Break
+            }
+        }
+    }
+
+    fn into_output(self) -> Self::Output {
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(self.writer),
+        }
+    }
+}
+
+pub(crate) struct WriteChunksMapped<W, H, F> {
+    pub stream_name: &'static str,
+    pub writer: W,
+    pub error_handler: H,
+    pub mapper: F,
+    pub error: Option<CollectorTaskError>,
+}
+
+impl<W, H, F, B> AsyncVisitor for WriteChunksMapped<W, H, F>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+    B: AsRef<[u8]> + Send + 'static,
+    F: Fn(Chunk) -> B + Send + Sync + 'static,
+{
+    type Output = Result<W, CollectorTaskError>;
+
+    async fn on_chunk(&mut self, chunk: Chunk) -> Next {
+        let mapped_output = (self.mapper)(chunk);
+        let bytes = mapped_output.as_ref();
+        let attempted_len = bytes.len();
+        let result = self.writer.write_all(bytes).await;
+        match handle_write_result(
+            self.stream_name,
+            &mut self.error_handler,
+            SinkWriteOperation::Chunk,
+            attempted_len,
+            result,
+        ) {
+            Ok(_) => Next::Continue,
+            Err(err) => {
+                self.error = Some(err);
+                Next::Break
+            }
+        }
+    }
+
+    fn into_output(self) -> Self::Output {
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(self.writer),
+        }
+    }
+}
+
+pub(crate) struct WriteLines<W, H> {
+    pub stream_name: &'static str,
+    pub writer: W,
+    pub error_handler: H,
+    pub parser: LineParserState,
+    pub options: LineParsingOptions,
+    pub mode: LineWriteMode,
+    pub error: Option<CollectorTaskError>,
+}
+
+impl<W, H> AsyncVisitor for WriteLines<W, H>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+{
+    type Output = Result<W, CollectorTaskError>;
+
+    async fn on_chunk(&mut self, chunk: Chunk) -> Next {
+        let Self {
+            stream_name,
+            writer,
+            error_handler,
+            parser,
+            options,
+            mode,
+            error,
+        } = self;
+        for line in parser.owned_lines(chunk.as_ref(), *options) {
+            if let Err(err) =
+                write_line(stream_name, writer, error_handler, line.as_bytes(), *mode).await
+            {
+                *error = Some(err);
+                return Next::Break;
+            }
+        }
+        Next::Continue
+    }
+
+    fn on_gap(&mut self) {
+        self.parser.on_gap();
+    }
+
+    async fn on_eof(&mut self) {
+        if let Some(line) = self.parser.finish_owned()
+            && let Err(err) = write_line(
+                self.stream_name,
+                &mut self.writer,
+                &mut self.error_handler,
+                line.as_bytes(),
+                self.mode,
+            )
+            .await
+        {
+            self.error = Some(err);
+        }
+    }
+
+    fn into_output(self) -> Self::Output {
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(self.writer),
+        }
+    }
+}
+
+pub(crate) struct WriteLinesMapped<W, H, F> {
+    pub stream_name: &'static str,
+    pub writer: W,
+    pub error_handler: H,
+    pub mapper: F,
+    pub parser: LineParserState,
+    pub options: LineParsingOptions,
+    pub mode: LineWriteMode,
+    pub error: Option<CollectorTaskError>,
+}
+
+impl<W, H, F, B> AsyncVisitor for WriteLinesMapped<W, H, F>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+    B: AsRef<[u8]> + Send + 'static,
+    F: Fn(Cow<'_, str>) -> B + Send + Sync + 'static,
+{
+    type Output = Result<W, CollectorTaskError>;
+
+    async fn on_chunk(&mut self, chunk: Chunk) -> Next {
+        let Self {
+            stream_name,
+            writer,
+            error_handler,
+            mapper,
+            parser,
+            options,
+            mode,
+            error,
+        } = self;
+        for line in parser.owned_lines(chunk.as_ref(), *options) {
+            let mapped_output = mapper(Cow::Owned(line));
+            if let Err(err) = write_line(
+                stream_name,
+                writer,
+                error_handler,
+                mapped_output.as_ref(),
+                *mode,
+            )
+            .await
+            {
+                *error = Some(err);
+                return Next::Break;
+            }
+        }
+        Next::Continue
+    }
+
+    fn on_gap(&mut self) {
+        self.parser.on_gap();
+    }
+
+    async fn on_eof(&mut self) {
+        if let Some(line) = self.parser.finish_owned() {
+            let mapped_output = (self.mapper)(Cow::Owned(line));
+            if let Err(err) = write_line(
+                self.stream_name,
+                &mut self.writer,
+                &mut self.error_handler,
+                mapped_output.as_ref(),
+                self.mode,
+            )
+            .await
+            {
+                self.error = Some(err);
+            }
+        }
+    }
+
+    fn into_output(self) -> Self::Output {
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(self.writer),
+        }
+    }
+}
+
 pub(crate) fn collect_chunks_into_write<S, W, H>(
     stream_name: &'static str,
-    mut subscription: S,
+    subscription: S,
     write: W,
     write_options: WriteCollectionOptions<H>,
 ) -> Collector<W>
@@ -179,34 +408,21 @@ where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
 {
-    let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let driver = drive_async(
+        subscription,
+        WriteChunks {
+            stream_name,
+            writer: write,
+            error_handler: write_options.into_error_handler(),
+            error: None,
+        },
+        term_sig_rx,
+    );
     Collector {
         stream_name,
         task: Some(tokio::spawn(async move {
-            let mut write = write;
-            let mut error_handler = write_options.into_error_handler();
-            loop {
-                tokio::select! {
-                    out = subscription.next_event() => {
-                        match out {
-                            Some(StreamEvent::Chunk(chunk)) => {
-                                handle_write_result(
-                                    stream_name,
-                                    &mut error_handler,
-                                    SinkWriteOperation::Chunk,
-                                    chunk.as_ref().len(),
-                                    write.write_all(chunk.as_ref()).await,
-                                )?;
-                            }
-                            Some(StreamEvent::Gap) => {}
-                            Some(StreamEvent::Eof) | None => break,
-                            Some(StreamEvent::ReadError(err)) => return Err(err.into()),
-                        }
-                    }
-                    _msg = &mut term_sig_rx => break,
-                }
-            }
-            Ok(write)
+            driver.await.map_err(CollectorTaskError::from)?
         })),
         task_termination_sender: Some(term_sig_tx),
     }
@@ -214,7 +430,7 @@ where
 
 pub(crate) fn collect_chunks_into_write_mapped<S, W, B, F, H>(
     stream_name: &'static str,
-    mut subscription: S,
+    subscription: S,
     write: W,
     mapper: F,
     write_options: WriteCollectionOptions<H>,
@@ -222,39 +438,26 @@ pub(crate) fn collect_chunks_into_write_mapped<S, W, B, F, H>(
 where
     S: Subscription,
     W: Sink + AsyncWriteExt + Unpin,
-    B: AsRef<[u8]> + Send,
+    B: AsRef<[u8]> + Send + 'static,
     F: Fn(Chunk) -> B + Send + Sync + Copy + 'static,
     H: SinkWriteErrorHandler,
 {
-    let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let driver = drive_async(
+        subscription,
+        WriteChunksMapped {
+            stream_name,
+            writer: write,
+            error_handler: write_options.into_error_handler(),
+            mapper,
+            error: None,
+        },
+        term_sig_rx,
+    );
     Collector {
         stream_name,
         task: Some(tokio::spawn(async move {
-            let mut write = write;
-            let mut error_handler = write_options.into_error_handler();
-            loop {
-                tokio::select! {
-                    out = subscription.next_event() => {
-                        match out {
-                            Some(StreamEvent::Chunk(chunk)) => {
-                                let mapped_output = mapper(chunk);
-                                handle_write_result(
-                                    stream_name,
-                                    &mut error_handler,
-                                    SinkWriteOperation::Chunk,
-                                    mapped_output.as_ref().len(),
-                                    write.write_all(mapped_output.as_ref()).await,
-                                )?;
-                            }
-                            Some(StreamEvent::Gap) => {}
-                            Some(StreamEvent::Eof) | None => break,
-                            Some(StreamEvent::ReadError(err)) => return Err(err.into()),
-                        }
-                    }
-                    _msg = &mut term_sig_rx => break,
-                }
-            }
-            Ok(write)
+            driver.await.map_err(CollectorTaskError::from)?
         })),
         task_termination_sender: Some(term_sig_tx),
     }
@@ -262,7 +465,7 @@ where
 
 pub(crate) fn collect_lines_into_write<S, W, H>(
     stream_name: &'static str,
-    mut subscription: S,
+    subscription: S,
     write: W,
     options: LineParsingOptions,
     mode: LineWriteMode,
@@ -273,50 +476,24 @@ where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
 {
-    let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let driver = drive_async(
+        subscription,
+        WriteLines {
+            stream_name,
+            writer: write,
+            error_handler: write_options.into_error_handler(),
+            parser: LineParserState::new(),
+            options,
+            mode,
+            error: None,
+        },
+        term_sig_rx,
+    );
     Collector {
         stream_name,
         task: Some(tokio::spawn(async move {
-            let mut parser = LineParserState::new();
-            let mut write = write;
-            let mut error_handler = write_options.into_error_handler();
-            loop {
-                tokio::select! {
-                    out = subscription.next_event() => {
-                        match out {
-                            Some(StreamEvent::Chunk(chunk)) => {
-                                for line in parser.owned_lines(chunk.as_ref(), options) {
-                                    write_line(
-                                        stream_name,
-                                        &mut write,
-                                        &mut error_handler,
-                                        line.as_bytes(),
-                                        mode,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            Some(StreamEvent::Gap) => parser.on_gap(),
-                            Some(StreamEvent::Eof) | None => {
-                                if let Some(line) = collect_owned_final_line(&parser) {
-                                    write_line(
-                                        stream_name,
-                                        &mut write,
-                                        &mut error_handler,
-                                        line.as_bytes(),
-                                        mode,
-                                    )
-                                    .await?;
-                                }
-                                break;
-                            }
-                            Some(StreamEvent::ReadError(err)) => return Err(err.into()),
-                        }
-                    }
-                    _msg = &mut term_sig_rx => break,
-                }
-            }
-            Ok(write)
+            driver.await.map_err(CollectorTaskError::from)?
         })),
         task_termination_sender: Some(term_sig_tx),
     }
@@ -324,7 +501,7 @@ where
 
 pub(crate) fn collect_lines_into_write_mapped<S, W, B, F, H>(
     stream_name: &'static str,
-    mut subscription: S,
+    subscription: S,
     write: W,
     mapper: F,
     options: LineParsingOptions,
@@ -334,56 +511,29 @@ pub(crate) fn collect_lines_into_write_mapped<S, W, B, F, H>(
 where
     S: Subscription,
     W: Sink + AsyncWriteExt + Unpin,
-    B: AsRef<[u8]> + Send,
+    B: AsRef<[u8]> + Send + 'static,
     F: Fn(Cow<'_, str>) -> B + Send + Sync + Copy + 'static,
     H: SinkWriteErrorHandler,
 {
-    let (term_sig_tx, mut term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
+    let driver = drive_async(
+        subscription,
+        WriteLinesMapped {
+            stream_name,
+            writer: write,
+            error_handler: write_options.into_error_handler(),
+            mapper,
+            parser: LineParserState::new(),
+            options,
+            mode,
+            error: None,
+        },
+        term_sig_rx,
+    );
     Collector {
         stream_name,
         task: Some(tokio::spawn(async move {
-            let mut parser = LineParserState::new();
-            let mut write = write;
-            let mut error_handler = write_options.into_error_handler();
-            loop {
-                tokio::select! {
-                    out = subscription.next_event() => {
-                        match out {
-                            Some(StreamEvent::Chunk(chunk)) => {
-                                for line in parser.owned_lines(chunk.as_ref(), options) {
-                                    let mapped_output = mapper(Cow::Owned(line));
-                                    write_line(
-                                        stream_name,
-                                        &mut write,
-                                        &mut error_handler,
-                                        mapped_output.as_ref(),
-                                        mode,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            Some(StreamEvent::Gap) => parser.on_gap(),
-                            Some(StreamEvent::Eof) | None => {
-                                if let Some(line) = collect_owned_final_line(&parser) {
-                                    let mapped_output = mapper(Cow::Owned(line));
-                                    write_line(
-                                        stream_name,
-                                        &mut write,
-                                        &mut error_handler,
-                                        mapped_output.as_ref(),
-                                        mode,
-                                    )
-                                    .await?;
-                                }
-                                break;
-                            }
-                            Some(StreamEvent::ReadError(err)) => return Err(err.into()),
-                        }
-                    }
-                    _msg = &mut term_sig_rx => break,
-                }
-            }
-            Ok(write)
+            driver.await.map_err(CollectorTaskError::from)?
         })),
         task_termination_sender: Some(term_sig_tx),
     }
@@ -452,6 +602,7 @@ mod tests {
     use super::super::test_support::event_receiver;
     use super::*;
     use crate::CollectorError;
+    use crate::output_stream::event::StreamEvent;
     use assertr::prelude::*;
     use bytes::Bytes;
     use std::cell::Cell;
