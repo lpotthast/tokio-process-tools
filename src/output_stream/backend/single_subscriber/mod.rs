@@ -1,11 +1,13 @@
+//! Single-active-consumer backend with optional replay.
+
 use crate::output_stream::config::StreamConfig;
 use crate::output_stream::event::StreamEvent;
-use crate::output_stream::policy::{Delivery, Replay, ReplayRetention};
-use crate::output_stream::{OutputStream, Subscribable, Subscription};
-use crate::{
-    CollectedBytes, CollectedLines, Collector, LineCollectionOptions, LineParsingOptions, NumBytes,
-    RawCollectionOptions,
+use crate::output_stream::policy::{
+    BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, Replay, ReplayEnabled,
+    ReplayRetention,
 };
+use crate::output_stream::{OutputStream, Subscription, TrySubscribable};
+use crate::{NumBytes, StreamConsumerError};
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -18,8 +20,7 @@ mod reader;
 mod state;
 mod subscription;
 
-use crate::output_stream::Collectable;
-use reader::read_chunked;
+use reader::{read_chunked_best_effort, read_chunked_reliable};
 use state::{ActiveSubscriber, ConfiguredShared};
 use subscription::SingleSubscriberSubscription;
 
@@ -31,59 +32,67 @@ impl Subscription for mpsc::Receiver<StreamEvent> {
 
 /// The output stream from a process. Either representing stdout or stderr.
 ///
-/// This is the single-subscriber variant, allowing for just one active consumer at a time.
-/// This has the upside of requiring as few memory allocations as possible.
-/// If multiple concurrent inspections are required, prefer using the
+/// This is the single-subscriber variant, allowing exactly one active consumer at a time. It is
+/// useful when one inspector, collector, or line waiter should own the stream and accidental
+/// concurrent fanout should be rejected early. It can reduce coordination overhead in some
+/// single-consumer paths, but it is not a categorical throughput replacement for broadcast.
+/// If multiple concurrent consumers are required, use the
 /// `output_stream::backend::broadcast::BroadcastOutputStream`.
-pub struct SingleSubscriberOutputStream {
+pub struct SingleSubscriberOutputStream<D = BestEffortDelivery, R = NoReplay>
+where
+    D: Delivery,
+    R: Replay,
+{
     /// The task that reads output from the underlying stream and routes it to the active
     /// subscriber, replay storage, or discard path.
     stream_reader: JoinHandle<()>,
 
-    /// The maximum size of every chunk read by the backing `stream_reader`.
-    read_chunk_size: NumBytes,
-
-    /// The maximum capacity of the channel caching the chunks before being processed.
-    max_buffered_chunks: usize,
+    /// Typed stream configuration selected by the process stream builder.
+    options: StreamConfig<D, R>,
 
     /// Shared replay state for typed single-subscriber configurations.
-    configured_shared: Option<Arc<ConfiguredShared>>,
-
-    /// Replay retention for typed single-subscriber configurations.
-    replay_retention: Option<ReplayRetention>,
-
-    /// Whether replay-specific APIs are enabled.
-    replay_enabled: bool,
+    configured_shared: Arc<ConfiguredShared>,
 
     /// Name of this stream.
     name: &'static str,
 }
 
-impl Drop for SingleSubscriberOutputStream {
+impl<D, R> Drop for SingleSubscriberOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
     fn drop(&mut self) {
         self.stream_reader.abort();
-        if let Some(shared) = &self.configured_shared {
-            shared.clear_active();
-        }
+        self.configured_shared.clear_active();
     }
 }
 
-impl Debug for SingleSubscriberOutputStream {
+impl<D, R> Debug for SingleSubscriberOutputStream<D, R>
+where
+    D: Delivery + Debug,
+    R: Replay + Debug,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SingleSubscriberOutputStream")
             .field("output_collector", &"non-debug < JoinHandle<()> >")
-            .field("configured", &self.configured_shared.is_some())
+            .field("options", &self.options)
+            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
 
-impl OutputStream for SingleSubscriberOutputStream {
+impl<D, R> OutputStream for SingleSubscriberOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
     fn read_chunk_size(&self) -> NumBytes {
-        self.read_chunk_size
+        self.options.read_chunk_size
     }
 
     fn max_buffered_chunks(&self) -> usize {
-        self.max_buffered_chunks
+        self.options.max_buffered_chunks
     }
 
     fn name(&self) -> &'static str {
@@ -91,35 +100,15 @@ impl OutputStream for SingleSubscriberOutputStream {
     }
 }
 
-impl Collectable for SingleSubscriberOutputStream {
-    fn collect_lines_into_vec(
-        &self,
-        parsing_options: LineParsingOptions,
-        collection_options: LineCollectionOptions,
-    ) -> Collector<CollectedLines> {
-        SingleSubscriberOutputStream::collect_lines_into_vec(
-            self,
-            parsing_options,
-            collection_options,
-        )
-    }
-
-    fn collect_chunks_into_vec(&self, options: RawCollectionOptions) -> Collector<CollectedBytes> {
-        SingleSubscriberOutputStream::collect_chunks_into_vec(self, options)
-    }
-}
-
-impl SingleSubscriberOutputStream {
+impl<D, R> SingleSubscriberOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
     /// Creates a new single-subscriber output stream from an async read stream and typed stream config.
-    pub fn from_stream<S, D, R>(
-        stream: S,
-        stream_name: &'static str,
-        options: StreamConfig<D, R>,
-    ) -> SingleSubscriberOutputStream
+    pub fn from_stream<S>(stream: S, stream_name: &'static str, options: StreamConfig<D, R>) -> Self
     where
         S: AsyncRead + Unpin + Send + 'static,
-        D: Delivery,
-        R: Replay,
     {
         options.assert_valid("options");
 
@@ -127,25 +116,30 @@ impl SingleSubscriberOutputStream {
         let active_rx = shared.subscribe_active();
         let delivery_guarantee = options.delivery_guarantee();
         let replay_retention = options.replay_retention();
-        let replay_enabled = options.replay_enabled();
 
-        let stream_reader = tokio::spawn(read_chunked(
-            stream,
-            Arc::clone(&shared),
-            active_rx,
-            options.read_chunk_size,
-            delivery_guarantee,
-            replay_retention,
-            stream_name,
-        ));
+        let stream_reader = match delivery_guarantee {
+            DeliveryGuarantee::BestEffort => tokio::spawn(read_chunked_best_effort(
+                stream,
+                Arc::clone(&shared),
+                active_rx,
+                options.read_chunk_size,
+                replay_retention,
+                stream_name,
+            )),
+            DeliveryGuarantee::ReliableForActiveSubscribers => tokio::spawn(read_chunked_reliable(
+                stream,
+                Arc::clone(&shared),
+                active_rx,
+                options.read_chunk_size,
+                replay_retention,
+                stream_name,
+            )),
+        };
 
-        SingleSubscriberOutputStream {
+        Self {
             stream_reader,
-            read_chunk_size: options.read_chunk_size,
-            max_buffered_chunks: options.max_buffered_chunks,
-            configured_shared: Some(shared),
-            replay_retention,
-            replay_enabled,
+            options,
+            configured_shared: shared,
             name: stream_name,
         }
     }
@@ -153,30 +147,19 @@ impl SingleSubscriberOutputStream {
     /// Returns whether replay-specific APIs are enabled for this stream.
     #[must_use]
     pub fn replay_enabled(&self) -> bool {
-        self.replay_enabled
+        self.options.replay_enabled()
     }
 
     /// Returns the configured replay retention.
     #[must_use]
     pub fn replay_retention(&self) -> Option<ReplayRetention> {
-        self.replay_retention
+        self.options.replay_retention()
     }
 
-    fn panic_on_multiple_consumers(&self) -> ! {
-        panic!(
-            "Cannot create multiple active consumers on SingleSubscriberOutputStream (stream: '{}'). \
-            Only one active inspector, collector, or line waiter can be active at a time. \
-            Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.",
-            self.name
-        )
-    }
+    fn take_subscription(&self) -> Result<SingleSubscriberSubscription, StreamConsumerError> {
+        let shared = &self.configured_shared;
 
-    fn take_subscription(&self) -> SingleSubscriberSubscription {
-        let Some(shared) = &self.configured_shared else {
-            panic!("configured single-subscriber subscription requested without shared state");
-        };
-
-        let (sender, receiver) = mpsc::channel(self.max_buffered_chunks);
+        let (sender, receiver) = mpsc::channel(self.options.max_buffered_chunks);
         let (id, replay, terminal_event) = {
             let mut state = shared
                 .state
@@ -184,11 +167,12 @@ impl SingleSubscriberOutputStream {
                 .expect("single-subscriber state poisoned");
 
             if state.active_id.is_some() {
-                drop(state);
-                self.panic_on_multiple_consumers();
+                return Err(StreamConsumerError::ActiveConsumer {
+                    stream_name: self.name,
+                });
             }
 
-            let replay = if state.replay_sealed || self.replay_retention.is_none() {
+            let replay = if state.replay_sealed || self.options.replay_retention().is_none() {
                 VecDeque::default()
             } else {
                 state.snapshot_events()
@@ -200,15 +184,20 @@ impl SingleSubscriberOutputStream {
             (id, replay, state.terminal_event.clone())
         };
 
-        SingleSubscriberSubscription {
+        Ok(SingleSubscriberSubscription {
             id,
             shared: Arc::clone(shared),
             replay,
             terminal_event,
             live_receiver: Some(receiver),
-        }
+        })
     }
+}
 
+impl<D> SingleSubscriberOutputStream<D, ReplayEnabled>
+where
+    D: Delivery,
+{
     /// Seals replay history for future subscribers.
     ///
     /// This is a one-way, idempotent operation.
@@ -217,15 +206,13 @@ impl SingleSubscriberOutputStream {
     ///
     /// Panics if the internal state mutex is poisoned.
     pub fn seal_replay(&self) {
-        let Some(shared) = &self.configured_shared else {
-            return;
-        };
-        let mut state = shared
+        let mut state = self
+            .configured_shared
             .state
             .lock()
             .expect("single-subscriber state poisoned");
         state.replay_sealed = true;
-        state.trim_replay_window(self.replay_retention);
+        state.trim_replay_window(self.options.replay_retention());
     }
 
     /// Returns `true` once replay history has been sealed.
@@ -235,10 +222,7 @@ impl SingleSubscriberOutputStream {
     /// Panics if the internal state mutex is poisoned.
     #[must_use]
     pub fn is_replay_sealed(&self) -> bool {
-        let Some(shared) = &self.configured_shared else {
-            return false;
-        };
-        shared
+        self.configured_shared
             .state
             .lock()
             .expect("single-subscriber state poisoned")
@@ -246,14 +230,21 @@ impl SingleSubscriberOutputStream {
     }
 }
 
-impl Subscribable for SingleSubscriberOutputStream {
-    fn subscribe(&self) -> impl Subscription {
+impl<D, R> TrySubscribable for SingleSubscriberOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
+    fn try_subscribe(&self) -> Result<impl Subscription, StreamConsumerError> {
         self.take_subscription()
     }
 }
 
-impl_output_stream_consumer_api! {
-    impl SingleSubscriberOutputStream
+impl_fallible_output_stream_consumer_api! {
+    impl<D, R> SingleSubscriberOutputStream<D, R>
+    where
+        D: Delivery,
+        R: Replay,
 }
 
 #[cfg(test)]

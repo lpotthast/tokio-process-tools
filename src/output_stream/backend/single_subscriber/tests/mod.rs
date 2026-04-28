@@ -9,6 +9,11 @@ mod collector_lifecycle;
 mod common;
 mod inspector_lifecycle;
 mod line_waiter;
+mod reader_backpressure;
+mod reader_chunking;
+mod reader_drain;
+mod reader_errors;
+mod reader_test_support;
 mod replay;
 mod writer_lifecycle;
 

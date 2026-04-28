@@ -1,4 +1,4 @@
-use crate::output_stream::options::NumBytes;
+use crate::output_stream::num_bytes::NumBytes;
 
 mod sealed {
     pub trait DeliverySealed {}
@@ -7,22 +7,6 @@ mod sealed {
 }
 
 /// Marker trait implemented by supported stream delivery marker types.
-///
-/// This trait is sealed. External crates cannot add new delivery marker types.
-///
-/// ```compile_fail
-/// use tokio_process_tools::{
-///     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, DeliveryGuarantee, NoReplay,
-///     StreamConfig,
-/// };
-///
-/// let _config: StreamConfig<DeliveryGuarantee, NoReplay> = StreamConfig {
-///     read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
-///     max_buffered_chunks: DEFAULT_MAX_BUFFERED_CHUNKS,
-///     delivery: DeliveryGuarantee::BestEffort,
-///     replay: NoReplay,
-/// };
-/// ```
 pub trait Delivery:
     sealed::DeliverySealed + Clone + Copy + std::fmt::Debug + PartialEq + Eq + Send + Sync + 'static
 {
@@ -31,6 +15,8 @@ pub trait Delivery:
 }
 
 /// Best-effort stream delivery marker.
+///
+/// Slow active consumers may observe gaps or dropped output when bounded buffers overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BestEffortDelivery;
 
@@ -43,6 +29,9 @@ impl Delivery for BestEffortDelivery {
 }
 
 /// Reliable active-subscriber stream delivery marker.
+///
+/// Active consumers apply backpressure when their buffers are full. Consumers that attach later
+/// still depend on replay settings for earlier output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReliableDelivery;
 
@@ -55,24 +44,6 @@ impl Delivery for ReliableDelivery {
 }
 
 /// Marker trait implemented by supported stream replay marker types.
-///
-/// This trait is sealed. External crates cannot add new replay marker types.
-///
-/// ```compile_fail
-/// use tokio_process_tools::{
-///     BestEffortDelivery, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, StreamConfig,
-/// };
-///
-/// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// struct CustomReplay;
-///
-/// let _config: StreamConfig<BestEffortDelivery, CustomReplay> = StreamConfig {
-///     read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
-///     max_buffered_chunks: DEFAULT_MAX_BUFFERED_CHUNKS,
-///     delivery: BestEffortDelivery,
-///     replay: CustomReplay,
-/// };
-/// ```
 pub trait Replay:
     sealed::ReplaySealed + Clone + Copy + std::fmt::Debug + PartialEq + Eq + Send + Sync + 'static
 {
@@ -84,27 +55,6 @@ pub trait Replay:
 }
 
 /// Marker for streams without replay support.
-///
-/// Replay-only methods are not callable for this mode:
-///
-/// ```compile_fail
-/// use tokio_process_tools::{
-///     broadcast::BroadcastOutputStream, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
-///     StreamConfig,
-/// };
-///
-/// let stream = BroadcastOutputStream::from_stream(
-///     tokio::io::empty(),
-///     "stdout",
-///     StreamConfig::builder()
-///         .best_effort_delivery()
-///         .no_replay()
-///         .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-///         .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-///         .build(),
-/// );
-/// stream.seal_replay();
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoReplay;
 
@@ -151,10 +101,11 @@ impl Replay for ReplayEnabled {
 /// Runtime delivery behavior used by typed stream modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryGuarantee {
-    /// Keep reading output and emit gaps to slow subscribers when bounded buffers overflow.
+    /// Keep reading output and emit gaps or drop output for slow consumers when bounded buffers
+    /// overflow.
     BestEffort,
 
-    /// Wait for active subscribers before reading more output when bounded buffers are full.
+    /// Wait for active consumers before reading more output when bounded buffers are full.
     ReliableForActiveSubscribers,
 }
 

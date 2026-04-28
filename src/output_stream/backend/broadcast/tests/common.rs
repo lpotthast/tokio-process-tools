@@ -1,6 +1,16 @@
+// `ChunkedReader`, `GatedChunkedReader`, `StartGate`, `CountingWrite`, and
+// `build_chunk_payload` below are intentionally duplicated in
+// `benches/support/mod.rs`. The bench versions need `pub` visibility and use
+// `Arc<[Bytes]>` for cheap clones across criterion iterations, while the
+// versions here are `pub(super)` and use `Vec<Bytes>`. See the corresponding
+// note in `benches/support/mod.rs` for why sharing isn't worth it. Keep the
+// two copies in sync.
+
+use super::super::BroadcastOutputStream;
+use crate::output_stream::policy::{Delivery, Replay};
 use crate::{
-    BestEffortDelivery, CollectionOverflowBehavior, LineCollectionOptions, NumBytes, NumBytesExt,
-    ReliableDelivery, ReplayEnabled, ReplayRetention, StreamConfig,
+    BestEffortDelivery, NumBytes, NumBytesExt, ReliableDelivery, ReplayEnabled, ReplayRetention,
+    StreamConfig,
 };
 use bytes::Bytes;
 use std::io;
@@ -10,13 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub(super) fn line_collection_options() -> LineCollectionOptions {
-    LineCollectionOptions::Bounded {
-        max_bytes: 1.megabytes(),
-        max_lines: 1024,
-        overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
-    }
-}
+pub(super) use crate::test_support::line_collection_options;
 
 pub(super) fn default_stream_sizing() -> (NumBytes, usize) {
     (8.bytes(), 2)
@@ -83,6 +87,14 @@ pub(super) fn best_effort_options(
     replay_retention: ReplayRetention,
 ) -> StreamConfig<BestEffortDelivery, ReplayEnabled> {
     let (read_chunk_size, max_buffered_chunks) = default_stream_sizing();
+    best_effort_options_with(replay_retention, read_chunk_size, max_buffered_chunks)
+}
+
+pub(super) fn best_effort_options_with(
+    replay_retention: ReplayRetention,
+    read_chunk_size: NumBytes,
+    max_buffered_chunks: usize,
+) -> StreamConfig<BestEffortDelivery, ReplayEnabled> {
     let builder = StreamConfig::builder().best_effort_delivery();
     match replay_retention {
         ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
@@ -225,6 +237,20 @@ impl AsyncWrite for CountingWrite {
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+}
+
+pub(super) async fn wait_for_bytes_ingested<D, R>(
+    stream: &BroadcastOutputStream<D, R>,
+    bytes: u64,
+) where
+    D: Delivery,
+    R: Replay,
+{
+    stream
+        .subscribe_bytes_ingested()
+        .wait_for(|observed| *observed >= bytes)
+        .await
+        .expect("bytes-ingested watch closed");
 }
 
 pub(super) fn build_chunk_payload(total_bytes: usize, read_chunk_size: usize) -> Vec<Bytes> {

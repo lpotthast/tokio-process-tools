@@ -14,6 +14,10 @@ pub(crate) async fn wait_for_line<S>(
 where
     S: Subscription,
 {
+    assert!(
+        options.max_line_length.bytes() > 0,
+        "LineParsingOptions::max_line_length must be greater than zero"
+    );
     let mut parser = LineParserState::new();
 
     loop {
@@ -49,23 +53,18 @@ where
     }
 }
 
-pub(crate) async fn wait_for_line_with_optional_timeout<S>(
+pub(crate) async fn wait_for_line_bounded<S>(
     subscription: S,
     predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
     options: LineParsingOptions,
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<WaitForLineResult, StreamReadError>
 where
     S: Subscription,
 {
-    match timeout {
-        None => wait_for_line(subscription, predicate, options).await,
-        Some(timeout) => {
-            tokio::time::timeout(timeout, wait_for_line(subscription, predicate, options))
-                .await
-                .unwrap_or(Ok(WaitForLineResult::Timeout))
-        }
-    }
+    tokio::time::timeout(timeout, wait_for_line(subscription, predicate, options))
+        .await
+        .unwrap_or(Ok(WaitForLineResult::Timeout))
 }
 
 #[cfg(test)]
@@ -160,6 +159,21 @@ mod tests {
         }
 
         #[tokio::test]
+        #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]
+        async fn panics_when_max_line_length_is_zero() {
+            let (_tx, rx) = mpsc::channel::<StreamEvent>(1);
+            let _ = wait_for_line(
+                rx,
+                |_line| true,
+                LineParsingOptions {
+                    max_line_length: 0.bytes(),
+                    overflow_behavior: LineOverflowBehavior::default(),
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test]
         async fn honors_line_parsing_options() {
             let (tx, rx) = mpsc::channel(2);
             tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(
@@ -186,17 +200,17 @@ mod tests {
         }
     }
 
-    mod wait_for_line_with_optional_timeout {
+    mod wait_for_line_bounded {
         use super::*;
 
         #[tokio::test]
         async fn times_out_with_timeout_error() {
             let (_tx, rx) = mpsc::channel(1);
-            let timeout = wait_for_line_with_optional_timeout(
+            let timeout = wait_for_line_bounded(
                 rx,
                 |line| line == "ready",
                 LineParsingOptions::default(),
-                Some(Duration::from_millis(25)),
+                Duration::from_millis(25),
             )
             .await;
             assert_that!(timeout).is_equal_to(Ok(WaitForLineResult::Timeout));

@@ -1,5 +1,7 @@
 use super::ProcessHandle;
-use crate::error::{WaitError, WaitOrTerminateError};
+use crate::error::{
+    WaitError, WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitOrTerminateError,
+};
 use crate::output_stream::OutputStream;
 use crate::process_handle::options::WaitForCompletionOrTerminateOptions;
 use std::io;
@@ -8,7 +10,7 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WaitOrTerminateOutcome {
-    pub(super) exit_status: ExitStatus,
+    pub(super) result: WaitForCompletionOrTerminateResult<ExitStatus>,
     pub(super) output_collection_timeout_budget: Duration,
 }
 
@@ -42,13 +44,13 @@ where
         }
     }
 
-    /// Wait for this process to run to completion. Within `timeout`, if set, or unbound otherwise.
+    /// Wait for this process to run to completion within `timeout`.
     ///
     /// Any still-open stdin handle is closed before waiting begins, matching
     /// [`tokio::process::Child::wait`] and helping avoid deadlocks where the child is waiting for
     /// input while the parent is waiting for exit.
     ///
-    /// If the timeout is reached before the process terminated, an error is returned and the
+    /// If the timeout is reached before the process terminated, a timeout outcome is returned and the
     /// process keeps running without being signalled or killed. Its stdin has still been closed
     /// before the wait started.
     /// Use [`ProcessHandle::wait_for_completion_or_terminate`] if you want immediate termination.
@@ -58,36 +60,81 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`WaitError`] if waiting for the process fails or the timeout elapses.
+    /// Returns [`WaitError`] if waiting for the process fails.
     pub async fn wait_for_completion(
         &mut self,
-        timeout: Option<Duration>,
-    ) -> Result<ExitStatus, WaitError> {
+        timeout: Duration,
+    ) -> Result<WaitForCompletionResult, WaitError> {
         self.wait_for_completion_inner(timeout).await
     }
 
     pub(super) async fn wait_for_completion_inner(
         &mut self,
-        timeout: Option<Duration>,
-    ) -> Result<ExitStatus, WaitError> {
-        match timeout {
-            None => self.wait().await.map_err(|source| WaitError::IoError {
+        timeout: Duration,
+    ) -> Result<WaitForCompletionResult, WaitError> {
+        match tokio::time::timeout(timeout, self.wait()).await {
+            Ok(Ok(exit_status)) => Ok(WaitForCompletionResult::Completed(exit_status)),
+            Ok(Err(source)) => Err(WaitError::IoError {
                 process_name: self.name.clone(),
                 source,
             }),
-            Some(timeout_duration) => {
-                match tokio::time::timeout(timeout_duration, self.wait()).await {
-                    Ok(Ok(exit_status)) => Ok(exit_status),
-                    Ok(Err(source)) => Err(WaitError::IoError {
-                        process_name: self.name.clone(),
-                        source,
-                    }),
-                    Err(_elapsed) => Err(WaitError::Timeout {
-                        process_name: self.name.clone(),
-                        timeout: timeout_duration,
-                    }),
-                }
-            }
+            Err(_elapsed) => Ok(WaitForCompletionResult::Timeout { timeout }),
+        }
+    }
+
+    pub(super) async fn wait_for_completion_unbounded_inner(
+        &mut self,
+    ) -> Result<ExitStatus, WaitError> {
+        self.wait().await.map_err(|source| WaitError::IoError {
+            process_name: self.name.clone(),
+            source,
+        })
+    }
+
+    pub(super) async fn wait_for_exit_after_signal(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<ExitStatus>, WaitError> {
+        match self.wait_for_completion_inner(timeout).await? {
+            WaitForCompletionResult::Completed(exit_status) => Ok(Some(exit_status)),
+            WaitForCompletionResult::Timeout { .. } => Ok(None),
+        }
+    }
+
+    fn wait_timeout_error(timeout: Duration) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("process did not complete within {timeout:?}"),
+        )
+    }
+
+    pub(super) fn wait_timeout_diagnostic(timeout: Duration) -> io::Error {
+        Self::wait_timeout_error(timeout)
+    }
+
+    fn terminated_after_timeout_result(
+        exit_status: ExitStatus,
+        timeout: Duration,
+        output_collection_timeout_budget: Duration,
+    ) -> WaitOrTerminateOutcome {
+        WaitOrTerminateOutcome {
+            result: WaitForCompletionOrTerminateResult::TerminatedAfterTimeout {
+                result: exit_status,
+                timeout,
+            },
+            output_collection_timeout_budget,
+        }
+    }
+
+    pub(super) fn exit_status_from_wait_or_terminate_result(
+        result: WaitForCompletionOrTerminateResult<ExitStatus>,
+    ) -> ExitStatus {
+        match result {
+            WaitForCompletionOrTerminateResult::Completed(exit_status)
+            | WaitForCompletionOrTerminateResult::TerminatedAfterTimeout {
+                result: exit_status,
+                ..
+            } => exit_status,
         }
     }
 
@@ -96,24 +143,23 @@ where
     /// Any still-open stdin handle is closed before the initial wait begins, matching
     /// [`tokio::process::Child::wait`].
     ///
-    /// If waiting fails for any reason, including the timeout being reached before the process
-    /// terminated normally, external termination of the process is forced through
-    /// [`ProcessHandle::terminate`].
+    /// If the timeout is reached before the process terminated normally, external termination is
+    /// forced through [`ProcessHandle::terminate`] and a
+    /// [`WaitForCompletionOrTerminateResult::TerminatedAfterTimeout`] outcome is returned when
+    /// cleanup succeeds. If waiting fails for a non-timeout reason, cleanup termination is still
+    /// attempted and the original wait failure is preserved in the returned error.
     /// Total wall-clock time can exceed
     /// `wait_timeout + interrupt_timeout + terminate_timeout` by one additional fixed 3-second
     /// wait when force-kill fallback is required.
     ///
-    /// Note that this function may return `Ok` even though the timeout was reached, carrying the
-    /// exit status received after sending a termination signal!
-    ///
     /// # Errors
     ///
-    /// Returns [`WaitOrTerminateError`] if waiting fails or if termination is required and then
-    /// fails.
+    /// Returns [`WaitOrTerminateError`] if waiting fails or if timeout-triggered termination is
+    /// required and then fails.
     pub async fn wait_for_completion_or_terminate(
         &mut self,
         options: WaitForCompletionOrTerminateOptions,
-    ) -> Result<ExitStatus, WaitOrTerminateError> {
+    ) -> Result<WaitForCompletionOrTerminateResult, WaitOrTerminateError> {
         self.wait_for_completion_or_terminate_inner(
             options.wait_timeout,
             options.interrupt_timeout,
@@ -131,11 +177,19 @@ where
         let output_collection_timeout_budget =
             wait_or_terminate_base_budget(wait_timeout, interrupt_timeout, terminate_timeout);
 
-        match self.wait_for_completion_inner(Some(wait_timeout)).await {
-            Ok(exit_status) => Ok(WaitOrTerminateOutcome {
-                exit_status,
+        match self.wait_for_completion_inner(wait_timeout).await {
+            Ok(WaitForCompletionResult::Completed(exit_status)) => Ok(WaitOrTerminateOutcome {
+                result: WaitForCompletionOrTerminateResult::Completed(exit_status),
                 output_collection_timeout_budget,
             }),
+            Ok(WaitForCompletionResult::Timeout { timeout }) => {
+                self.terminate_after_wait_timeout_detailed(
+                    timeout,
+                    interrupt_timeout,
+                    terminate_timeout,
+                )
+                .await
+            }
             Err(wait_error) => {
                 self.terminate_after_wait_error_detailed(
                     wait_error,
@@ -153,19 +207,18 @@ where
         wait_timeout: Duration,
         interrupt_timeout: Duration,
         terminate_timeout: Duration,
-    ) -> Result<ExitStatus, WaitOrTerminateError> {
+    ) -> Result<WaitForCompletionOrTerminateResult, WaitOrTerminateError> {
         self.wait_for_completion_or_terminate_inner_detailed(
             wait_timeout,
             interrupt_timeout,
             terminate_timeout,
         )
         .await
-        .map(|outcome| outcome.exit_status)
+        .map(|outcome| outcome.result)
     }
 
-    pub(super) async fn terminate_after_wait_error_detailed(
+    pub(super) async fn terminate_after_wait_timeout_detailed(
         &mut self,
-        wait_error: WaitError,
         wait_timeout: Duration,
         interrupt_timeout: Duration,
         terminate_timeout: Duration,
@@ -173,28 +226,42 @@ where
         let process_name = self.name.clone();
         let output_collection_timeout_budget =
             wait_or_terminate_base_budget(wait_timeout, interrupt_timeout, terminate_timeout);
+        match self
+            .terminate_detailed(interrupt_timeout, terminate_timeout)
+            .await
+        {
+            Ok(termination_outcome) => Ok(Self::terminated_after_timeout_result(
+                termination_outcome.exit_status,
+                wait_timeout,
+                output_collection_timeout_budget
+                    .saturating_add(termination_outcome.output_collection_timeout_extension),
+            )),
+            Err(termination_error) => Err(WaitOrTerminateError::TerminationAfterTimeoutFailed {
+                process_name,
+                timeout: wait_timeout,
+                termination_error,
+            }),
+        }
+    }
+
+    pub(super) async fn terminate_after_wait_error_detailed(
+        &mut self,
+        wait_error: WaitError,
+        _wait_timeout: Duration,
+        interrupt_timeout: Duration,
+        terminate_timeout: Duration,
+    ) -> Result<WaitOrTerminateOutcome, WaitOrTerminateError> {
+        let process_name = self.name.clone();
 
         match self
             .terminate_detailed(interrupt_timeout, terminate_timeout)
             .await
         {
-            Ok(termination_outcome) => {
-                if matches!(wait_error, WaitError::Timeout { .. }) {
-                    Ok(WaitOrTerminateOutcome {
-                        exit_status: termination_outcome.exit_status,
-                        output_collection_timeout_budget: output_collection_timeout_budget
-                            .saturating_add(
-                                termination_outcome.output_collection_timeout_extension,
-                            ),
-                    })
-                } else {
-                    Err(WaitOrTerminateError::WaitFailed {
-                        process_name,
-                        wait_error: Box::new(wait_error),
-                        termination_status: termination_outcome.exit_status,
-                    })
-                }
-            }
+            Ok(termination_outcome) => Err(WaitOrTerminateError::WaitFailed {
+                process_name,
+                wait_error: Box::new(wait_error),
+                termination_status: termination_outcome.exit_status,
+            }),
             Err(termination_error) => Err(WaitOrTerminateError::TerminationFailed {
                 process_name,
                 wait_error: Box::new(wait_error),
@@ -217,18 +284,17 @@ where
             terminate_timeout,
         )
         .await
-        .map(|outcome| outcome.exit_status)
+        .map(|outcome| Self::exit_status_from_wait_or_terminate_result(outcome.result))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::long_running_command;
-    use crate::{
-        CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
-        LineCollectionOptions, LineOverflowBehavior, LineParsingOptions, NumBytesExt,
+    use crate::test_support::{
+        line_collection_options, line_parsing_options, long_running_command,
     };
+    use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytesExt};
     use assertr::prelude::*;
     use tokio::io::AsyncWriteExt;
 
@@ -240,16 +306,8 @@ mod tests {
         }
     }
 
-    fn line_collection_options() -> LineCollectionOptions {
-        LineCollectionOptions::Bounded {
-            max_bytes: 1.megabytes(),
-            max_lines: 1024,
-            overflow_behavior: CollectionOverflowBehavior::default(),
-        }
-    }
-
     #[tokio::test]
-    async fn test_wait_for_completion_disarms_cleanup_and_panic_guards() {
+    async fn wait_for_completion_disarms_cleanup_and_panic_guards() {
         let mut process = crate::Process::new(long_running_command(Duration::from_millis(100)))
             .name("long-running")
             .stdout_and_stderr(|stream| {
@@ -264,9 +322,10 @@ mod tests {
             .unwrap();
 
         process
-            .wait_for_completion(Some(Duration::from_secs(2)))
+            .wait_for_completion(Duration::from_secs(2))
             .await
-            .unwrap();
+            .unwrap()
+            .expect_completed("process should complete");
 
         assert_that!(process.cleanup_on_drop).is_false();
         assert_that!(&process.panic_on_drop).is_none();
@@ -288,13 +347,9 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let collector = process.stdout().collect_lines_into_vec(
-            LineParsingOptions::builder()
-                .max_line_length(16.kilobytes())
-                .overflow_behavior(LineOverflowBehavior::default())
-                .build(),
-            line_collection_options(),
-        );
+        let collector = process
+            .stdout()
+            .collect_lines_into_vec(line_parsing_options(), line_collection_options());
 
         let Some(stdin) = process.stdin().as_mut() else {
             assert_that!(process.stdin().is_open()).fail("stdin should start open");
@@ -304,9 +359,10 @@ mod tests {
         stdin.flush().await.unwrap();
 
         let status = process
-            .wait_for_completion(Some(Duration::from_secs(2)))
+            .wait_for_completion(Duration::from_secs(2))
             .await
-            .unwrap();
+            .unwrap()
+            .expect_completed("process should complete");
 
         assert_that!(status.success()).is_true();
         assert_that!(process.stdin().is_open()).is_false();
@@ -359,15 +415,7 @@ mod tests {
 
         assert_that!(termination_status.code()).is_none();
 
-        let source = match *wait_error {
-            WaitError::IoError { source, .. } => source,
-            timeout @ WaitError::Timeout { .. } => {
-                assert_that!(&timeout).fail(format_args!(
-                    "expected original IO wait error, got {timeout:?}"
-                ));
-                return;
-            }
-        };
+        let WaitError::IoError { source, .. } = *wait_error;
         assert_that!(source.to_string().as_str()).is_equal_to("synthetic wait failure");
     }
 
@@ -386,10 +434,22 @@ mod tests {
             .spawn()
             .unwrap();
 
-        let status = process
+        let result = process
             .wait_for_completion_or_terminate(wait_or_terminate_options(Duration::from_millis(10)))
             .await
             .unwrap();
+        let status = match result {
+            WaitForCompletionOrTerminateResult::TerminatedAfterTimeout { result, timeout } => {
+                assert_that!(timeout).is_equal_to(Duration::from_millis(10));
+                result
+            }
+            other @ WaitForCompletionOrTerminateResult::Completed(_) => {
+                assert_that!(&other).fail(format_args!(
+                    "expected timeout-driven termination, got {other:?}"
+                ));
+                return;
+            }
+        };
 
         assert_that!(status.success()).is_false();
         assert_that!(process.cleanup_on_drop).is_false();

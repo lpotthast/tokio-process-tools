@@ -153,18 +153,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::test_support::chunk;
     use super::super::state::{SubscriberSender, append_event};
     use super::*;
     use crate::StreamReadError;
-    use crate::output_stream::event::Chunk;
     use crate::{NumBytesExt, ReliableDelivery, ReplayEnabled, ReplayRetention, StreamConfig};
     use assertr::prelude::*;
-    use bytes::Bytes;
     use std::io;
-
-    fn chunk(bytes: &'static [u8]) -> StreamEvent {
-        StreamEvent::Chunk(Chunk(Bytes::from_static(bytes)))
-    }
 
     fn best_effort_options(
         retention: ReplayRetention,

@@ -10,7 +10,11 @@ async fn dropping_fast_stream_closes_waiting_subscribers() {
     let stream =
         BroadcastOutputStream::from_stream(read_half, "custom", best_effort_no_replay_options());
 
-    let waiter = stream.wait_for_line(|line| line == "never", LineParsingOptions::default());
+    let waiter = stream.wait_for_line(
+        Duration::from_secs(1),
+        |line| line == "never",
+        LineParsingOptions::default(),
+    );
     drop(stream);
 
     let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;
@@ -28,7 +32,11 @@ async fn dropping_fanout_replay_stream_closes_waiting_subscribers() {
         reliable_options(ReplayRetention::All),
     );
 
-    let waiter = stream.wait_for_line(|line| line == "never", LineParsingOptions::default());
+    let waiter = stream.wait_for_line(
+        Duration::from_secs(1),
+        |line| line == "never",
+        LineParsingOptions::default(),
+    );
     drop(stream);
 
     let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;

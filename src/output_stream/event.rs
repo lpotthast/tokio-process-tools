@@ -27,7 +27,7 @@ impl AsRef<[u8]> for Chunk {
 /// Stream backends send these events to communicate raw process output, deliberate loss of output
 /// when a bounded buffer cannot keep up, and the terminal end-of-stream marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StreamEvent {
+pub enum StreamEvent {
     /// Bytes read from the underlying stdout or stderr stream.
     Chunk(Chunk),
 

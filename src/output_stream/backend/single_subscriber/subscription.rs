@@ -45,16 +45,11 @@ impl Drop for SingleSubscriberSubscription {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::test_support::chunk;
     use super::*;
     use crate::StreamReadError;
-    use crate::output_stream::event::Chunk;
     use assertr::prelude::*;
-    use bytes::Bytes;
     use std::io;
-
-    fn chunk(bytes: &'static [u8]) -> StreamEvent {
-        StreamEvent::Chunk(Chunk(Bytes::from_static(bytes)))
-    }
 
     fn attach_active(shared: &Arc<ConfiguredShared>) -> SubscriberId {
         let mut state = shared

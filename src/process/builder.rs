@@ -60,23 +60,6 @@ pub struct Process<
 
 impl Process {
     /// Creates a new process builder from a tokio command.
-    ///
-    /// A following naming call is required before configuring stdout and stderr. Use
-    /// [`Process::name`] with [`crate::AutoName::program_only`] to opt into the default safe
-    /// auto-derived name.
-    ///
-    /// ```compile_fail
-    /// use tokio::process::Command;
-    /// use tokio_process_tools::Process;
-    ///
-    /// let _process = Process::new(Command::new("ls"))
-    ///     .stdout_and_stderr(|stream| {
-    ///         stream
-    ///             .broadcast()
-    ///             .best_effort_delivery()
-    ///             .no_replay()
-    ///     });
-    /// ```
     #[must_use]
     pub fn new(cmd: tokio::process::Command) -> Self {
         Self {
@@ -245,48 +228,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_stream::Collectable;
-    use crate::test_support::ScriptedOutput;
+    use crate::output_stream::TrySubscribable;
+    use crate::test_support::{ScriptedOutput, line_output_options};
     use crate::{
-        AutoName, AutoNameSettings, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS,
-        DEFAULT_READ_CHUNK_SIZE, LineCollectionOptions, LineOutputOptions, LineOverflowBehavior,
-        LineParsingOptions, NumBytesExt, ProcessHandle, ProcessOutput,
+        AutoName, AutoNameSettings, BestEffortDelivery, DEFAULT_MAX_BUFFERED_CHUNKS,
+        DEFAULT_READ_CHUNK_SIZE, NoReplay, NumBytesExt, ProcessHandle, ProcessOutput,
+        ReliableDelivery, ReplayEnabled, SingleSubscriberOutputStream,
     };
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::process::Command;
 
-    fn line_output_options() -> LineOutputOptions {
-        let line_collection_options = LineCollectionOptions::Bounded {
-            max_bytes: 1.megabytes(),
-            max_lines: 1024,
-            overflow_behavior: CollectionOverflowBehavior::default(),
-        };
-
-        LineOutputOptions {
-            line_parsing_options: LineParsingOptions::builder()
-                .max_line_length(16.kilobytes())
-                .overflow_behavior(LineOverflowBehavior::default())
-                .build(),
-            stdout_collection_options: line_collection_options,
-            stderr_collection_options: line_collection_options,
-        }
-    }
-
     async fn assert_successful_completion<Stdout, Stderr>(
         mut process: ProcessHandle<Stdout, Stderr>,
     ) where
-        Stdout: Collectable,
-        Stderr: Collectable,
+        Stdout: TrySubscribable,
+        Stderr: TrySubscribable,
     {
         let ProcessOutput {
             status,
             stdout,
             stderr,
         } = process
-            .wait_for_completion_with_output(None, line_output_options())
+            .wait_for_completion_with_output(Duration::from_secs(2), line_output_options())
             .await
-            .unwrap();
+            .unwrap()
+            .expect_completed("process should complete");
 
         assert_that!(status.success()).is_true();
         assert_that!(stdout.lines().is_empty()).is_false();
@@ -296,13 +263,14 @@ mod tests {
     async fn assert_out_and_err_completion<Stdout, Stderr>(
         mut process: ProcessHandle<Stdout, Stderr>,
     ) where
-        Stdout: Collectable,
-        Stderr: Collectable,
+        Stdout: TrySubscribable,
+        Stderr: TrySubscribable,
     {
         let output = process
-            .wait_for_completion_with_output(Some(Duration::from_secs(2)), line_output_options())
+            .wait_for_completion_with_output(Duration::from_secs(2), line_output_options())
             .await
-            .unwrap();
+            .unwrap()
+            .expect_completed("process should complete");
 
         assert_that!(output.status.success()).is_true();
         assert_that!(output.stdout.lines().iter().map(String::as_str)).contains_exactly(["out"]);
@@ -424,6 +392,19 @@ mod tests {
     mod single_subscriber_delivery_and_replay {
         use super::*;
 
+        fn assert_single_subscriber_stream_types<StdoutD, StdoutR, StderrD, StderrR>(
+            _process: &ProcessHandle<
+                SingleSubscriberOutputStream<StdoutD, StdoutR>,
+                SingleSubscriberOutputStream<StderrD, StderrR>,
+            >,
+        ) where
+            StdoutD: crate::Delivery,
+            StdoutR: crate::Replay,
+            StderrD: crate::Delivery,
+            StderrR: crate::Replay,
+        {
+        }
+
         #[tokio::test]
         async fn split_delivery_modes_can_wait_for_completion() {
             let mut process = Process::new(Command::new("ls"))
@@ -447,7 +428,54 @@ mod tests {
                 .spawn()
                 .expect("Failed to spawn");
 
-            let _ = process.wait_for_completion(None).await.unwrap();
+            assert_single_subscriber_stream_types::<
+                ReliableDelivery,
+                NoReplay,
+                BestEffortDelivery,
+                NoReplay,
+            >(&process);
+
+            let _ = process
+                .wait_for_completion(Duration::from_secs(2))
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn split_replay_modes_preserve_stream_types() {
+            let mut process = Process::new(Command::new("ls"))
+                .name(AutoName::program_only())
+                .stdout(|stdout| {
+                    stdout
+                        .single_subscriber()
+                        .best_effort_delivery()
+                        .no_replay()
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .stderr(|stderr| {
+                    stderr
+                        .single_subscriber()
+                        .reliable_for_active_subscribers()
+                        .replay_last_chunks(1)
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+                .expect("Failed to spawn");
+
+            assert_single_subscriber_stream_types::<
+                BestEffortDelivery,
+                NoReplay,
+                ReliableDelivery,
+                ReplayEnabled,
+            >(&process);
+
+            process.seal_stderr_replay();
+            let _ = process
+                .wait_for_completion(Duration::from_secs(2))
+                .await
+                .unwrap();
         }
 
         #[tokio::test]
@@ -468,7 +496,10 @@ mod tests {
             assert_that!(process.stdout().replay_enabled()).is_false();
             assert_that!(process.stderr().replay_enabled()).is_false();
 
-            let _ = process.wait_for_completion(None).await.unwrap();
+            let _ = process
+                .wait_for_completion(Duration::from_secs(2))
+                .await
+                .unwrap();
         }
 
         #[tokio::test]
@@ -501,7 +532,10 @@ mod tests {
             assert_that!(process.stdout().is_replay_sealed()).is_true();
             assert_that!(process.stderr().is_replay_sealed()).is_true();
 
-            let _ = process.wait_for_completion(None).await.unwrap();
+            let _ = process
+                .wait_for_completion(Duration::from_secs(2))
+                .await
+                .unwrap();
         }
     }
 
@@ -666,7 +700,7 @@ mod tests {
                 .spawn()
             {
                 Ok(mut process) => {
-                    let _ = process.wait_for_completion(None).await;
+                    let _ = process.wait_for_completion(Duration::from_secs(2)).await;
                     assert_that!(()).fail("command should fail to spawn");
                     return;
                 }
@@ -700,7 +734,7 @@ mod tests {
 
             assert_that!(&process.name).is_equal_to("worker-42");
 
-            let _ = process.wait_for_completion(None).await;
+            let _ = process.wait_for_completion(Duration::from_secs(2)).await;
         }
 
         #[tokio::test]
@@ -730,7 +764,7 @@ mod tests {
 
             assert_that!(&process.name).is_equal_to("./ % ls \"-la\"");
 
-            let _ = process.wait_for_completion(None).await;
+            let _ = process.wait_for_completion(Duration::from_secs(2)).await;
         }
     }
 }

@@ -1,5 +1,5 @@
 use crate::output_stream::Next;
-use crate::output_stream::options::{NumBytes, NumBytesExt};
+use crate::output_stream::num_bytes::{NumBytes, NumBytesExt};
 use bytes::BytesMut;
 use memchr::memchr;
 use std::borrow::Cow;
@@ -27,16 +27,6 @@ pub enum LineOverflowBehavior {
 }
 
 /// Configuration options for parsing lines from a stream.
-///
-/// The builder requires both fields:
-///
-/// ```compile_fail
-/// use tokio_process_tools::{LineParsingOptions, NumBytesExt};
-///
-/// let _ = LineParsingOptions::builder()
-///     .max_line_length(16.kilobytes())
-///     .build();
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 pub struct LineParsingOptions {
     /// Maximum length of a single line in bytes.

@@ -1,35 +1,27 @@
 use super::super::BroadcastOutputStream;
-use super::common::{line_collection_options, reliable_options};
+use super::common::{
+    best_effort_options_with, line_collection_options, reliable_options, wait_for_bytes_ingested,
+};
+use crate::output_stream::backend::test_support::assert_chunk;
 use crate::output_stream::event::StreamEvent;
 use crate::{
-    LineParsingOptions, Next, NumBytesExt, ReplayRetention, StreamConfig, WaitForLineResult,
+    BestEffortDelivery, LineParsingOptions, Next, NumBytesExt, ReplayEnabled, ReplayRetention,
+    StreamConfig, WaitForLineResult,
 };
 use assertr::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::time::sleep;
 
 fn best_effort_replay_options(
     max_buffered_chunks: usize,
-) -> StreamConfig<crate::BestEffortDelivery, crate::ReplayEnabled> {
-    StreamConfig::builder()
-        .best_effort_delivery()
-        .replay_all()
-        .read_chunk_size(1.bytes())
-        .max_buffered_chunks(max_buffered_chunks)
-        .build()
+) -> StreamConfig<BestEffortDelivery, ReplayEnabled> {
+    best_effort_options_with(ReplayRetention::All, 1.bytes(), max_buffered_chunks)
 }
 
-fn assert_chunk(event: Option<StreamEvent>, expected: &'static [u8]) {
-    match event {
-        Some(StreamEvent::Chunk(chunk)) => {
-            assert_that!(chunk.as_ref()).is_equal_to(expected);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected chunk, got {other:?}"));
-        }
-    }
+fn assert_recv_chunk(event: Option<StreamEvent>, expected: &[u8]) {
+    let event = event.expect("expected chunk event, got stream end");
+    assert_chunk(&event, expected);
 }
 
 #[tokio::test]
@@ -43,13 +35,13 @@ async fn late_subscriber_receives_startup_line_with_replay_all() {
 
     write_half.write_all(b"ready\n").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    wait_for_bytes_ingested(&stream, 6).await;
 
     let result = stream
-        .wait_for_line_with_timeout(
+        .wait_for_line(
+            Duration::from_secs(1),
             |line| line == "ready",
             LineParsingOptions::default(),
-            Duration::from_secs(1),
         )
         .await;
 
@@ -67,13 +59,13 @@ async fn seal_replay_drops_old_history_for_future_subscribers() {
 
     write_half.write_all(b"old\n").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    wait_for_bytes_ingested(&stream, 4).await;
     stream.seal_replay();
 
-    let waiter = stream.wait_for_line_with_timeout(
+    let waiter = stream.wait_for_line(
+        Duration::from_millis(50),
         |line| line == "old",
         LineParsingOptions::default(),
-        Duration::from_millis(50),
     );
 
     assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Timeout));
@@ -90,13 +82,13 @@ async fn subscriber_created_after_seal_starts_live_by_default() {
 
     write_half.write_all(b"old\n").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    wait_for_bytes_ingested(&stream, 4).await;
     stream.seal_replay();
 
-    let waiter = stream.wait_for_line_with_timeout(
+    let waiter = stream.wait_for_line(
+        Duration::from_secs(1),
         |line| line == "live",
         LineParsingOptions::default(),
-        Duration::from_secs(1),
     );
     write_half.write_all(b"live\n").await.unwrap();
     write_half.flush().await.unwrap();
@@ -116,13 +108,13 @@ async fn explicit_replay_after_seal_ignores_history_retained_for_active_subscrib
 
     write_half.write_all(b"old\n").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    wait_for_bytes_ingested(&stream, 4).await;
     stream.seal_replay();
 
-    let waiter = stream.wait_for_line_with_timeout(
+    let waiter = stream.wait_for_line(
+        Duration::from_millis(50),
         |line| line == "old",
         LineParsingOptions::default(),
-        Duration::from_millis(50),
     );
 
     assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Timeout));
@@ -141,7 +133,7 @@ async fn active_subscribers_still_receive_unread_tail_data_after_seal() {
 
     write_half.write_all(b"tail\n").await.unwrap();
     drop(write_half);
-    sleep(Duration::from_millis(20)).await;
+    wait_for_bytes_ingested(&stream, 5).await;
     stream.seal_replay();
 
     let collected = collector.wait().await.unwrap();
@@ -168,12 +160,12 @@ async fn waiter_created_before_seal_can_match_replayed_startup_line() {
 
     write_half.write_all(b"ready\n").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    wait_for_bytes_ingested(&stream, 6).await;
 
-    let ready = stream.wait_for_line_with_timeout(
+    let ready = stream.wait_for_line(
+        Duration::from_secs(1),
         |line| line == "ready",
         LineParsingOptions::default(),
-        Duration::from_secs(1),
     );
     stream.seal_replay();
 
@@ -190,13 +182,13 @@ async fn slow_best_effort_replay_subscriber_observes_gap_then_newer_live_data() 
 
     write_half.write_all(b"abcde").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    wait_for_bytes_ingested(&stream, 5).await;
     drop(write_half);
 
     assert_that!(subscriber.recv().await)
         .is_some()
         .is_equal_to(StreamEvent::Gap);
-    assert_chunk(subscriber.recv().await, b"e");
+    assert_recv_chunk(subscriber.recv().await, b"e");
     assert_that!(subscriber.recv().await)
         .is_some()
         .is_equal_to(StreamEvent::Eof);
@@ -211,7 +203,7 @@ async fn best_effort_replay_delivers_terminal_after_pending_gap() {
 
     write_half.write_all(b"ab").await.unwrap();
     drop(write_half);
-    sleep(Duration::from_millis(20)).await;
+    wait_for_bytes_ingested(&stream, 2).await;
 
     assert_that!(subscriber.recv().await)
         .is_some()
@@ -230,10 +222,10 @@ async fn late_best_effort_replay_subscriber_receives_retained_history_after_acti
 
     write_half.write_all(b"abc").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    wait_for_bytes_ingested(&stream, 3).await;
 
     let mut late_subscriber = stream.subscribe();
-    assert_chunk(late_subscriber.recv().await, b"a");
-    assert_chunk(late_subscriber.recv().await, b"b");
-    assert_chunk(late_subscriber.recv().await, b"c");
+    assert_recv_chunk(late_subscriber.recv().await, b"a");
+    assert_recv_chunk(late_subscriber.recv().await, b"b");
+    assert_recv_chunk(late_subscriber.recv().await, b"c");
 }

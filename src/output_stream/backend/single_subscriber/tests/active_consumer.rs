@@ -1,11 +1,10 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::{
-    ACTIVE_CONSUMER_PANIC, best_effort_no_replay_options, best_effort_no_replay_options_with,
-    reliable_replay_options,
+    best_effort_no_replay_options, best_effort_no_replay_options_with, reliable_replay_options,
 };
 use crate::{
     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, LineParsingOptions, Next,
-    RawCollectionOptions, ReplayRetention,
+    RawCollectionOptions, ReplayRetention, StreamConsumerError,
 };
 use assertr::prelude::*;
 use std::time::Duration;
@@ -13,7 +12,7 @@ use tokio::io::AsyncWriteExt;
 use tracing_test::traced_test;
 
 #[tokio::test]
-async fn configured_second_subscriber_panic_does_not_poison_state_or_stop_reader() {
+async fn configured_second_subscriber_error_does_not_poison_state_or_stop_reader() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream = SingleSubscriberOutputStream::from_stream(
         read_half,
@@ -21,17 +20,21 @@ async fn configured_second_subscriber_panic_does_not_poison_state_or_stop_reader
         reliable_replay_options(ReplayRetention::All),
     );
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
 
-    assert_that_panic_by(|| {
-        let _waiter = stream.wait_for_line_with_timeout(
+    let err = stream
+        .wait_for_line(
+            Duration::from_millis(25),
             |_line| false,
             LineParsingOptions::default(),
-            Duration::from_millis(25),
-        );
-    })
-    .has_type::<String>()
-    .is_equal_to(ACTIVE_CONSUMER_PANIC);
+        )
+        .err()
+        .expect("second consumer should be rejected");
+    assert_that!(err).is_equal_to(StreamConsumerError::ActiveConsumer {
+        stream_name: "custom",
+    });
 
     assert_that!(stream.is_replay_sealed()).is_false();
 
@@ -52,13 +55,25 @@ async fn wait_for_line_claims_receiver_before_polling() {
         best_effort_no_replay_options(),
     );
 
-    let _waiter = stream.wait_for_line(|_line| false, LineParsingOptions::default());
+    let _waiter = stream
+        .wait_for_line(
+            Duration::from_secs(1),
+            |_line| false,
+            LineParsingOptions::default(),
+        )
+        .unwrap();
 
-    assert_that_panic_by(|| {
-        let _second_waiter = stream.wait_for_line(|_line| false, LineParsingOptions::default());
-    })
-    .has_type::<String>()
-    .is_equal_to(ACTIVE_CONSUMER_PANIC);
+    let err = stream
+        .wait_for_line(
+            Duration::from_secs(1),
+            |_line| false,
+            LineParsingOptions::default(),
+        )
+        .err()
+        .expect("second consumer should be rejected");
+    assert_that!(err).is_equal_to(StreamConsumerError::ActiveConsumer {
+        stream_name: "custom",
+    });
 }
 
 #[tokio::test]
@@ -71,11 +86,15 @@ async fn multiple_subscribers_are_not_possible() {
         best_effort_no_replay_options_with(DEFAULT_READ_CHUNK_SIZE, DEFAULT_MAX_BUFFERED_CHUNKS),
     );
 
-    let _inspector = os.inspect_lines(|_line| Next::Continue, LineParsingOptions::default());
+    let _inspector = os
+        .inspect_lines(|_line| Next::Continue, LineParsingOptions::default())
+        .unwrap();
 
-    assert_that_panic_by(move || {
-        os.inspect_lines(|_line| Next::Continue, LineParsingOptions::default())
-    })
-    .has_type::<String>()
-    .is_equal_to(ACTIVE_CONSUMER_PANIC);
+    let err = os
+        .inspect_lines(|_line| Next::Continue, LineParsingOptions::default())
+        .err()
+        .expect("second consumer should be rejected");
+    assert_that!(err).is_equal_to(StreamConsumerError::ActiveConsumer {
+        stream_name: "custom",
+    });
 }

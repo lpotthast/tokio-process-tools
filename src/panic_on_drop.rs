@@ -62,9 +62,57 @@ mod tests {
     use super::*;
     use assertr::assert_that_type;
     use assertr::prelude::*;
+    use std::panic;
+    use std::sync::Mutex;
 
     #[test]
     fn needs_drop() {
         assert_that_type::<PanicOnDrop>().needs_drop();
+    }
+
+    /// Serialize panic-hook manipulation so concurrent tests don't see each other's silenced hook.
+    static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+    fn run_silently(f: impl FnOnce() + std::panic::UnwindSafe) -> std::thread::Result<()> {
+        let _guard = PANIC_HOOK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev_hook = panic::take_hook();
+        panic::set_hook(Box::new(|_info| {}));
+        let result = panic::catch_unwind(f);
+        panic::set_hook(prev_hook);
+        result
+    }
+
+    #[test]
+    fn armed_drop_panics_with_expected_message() {
+        let result = run_silently(|| {
+            let _guard = PanicOnDrop::new("ResourceX", "must be defused", "call defuse()");
+        });
+
+        let payload = result.expect_err("dropping an armed PanicOnDrop must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&'static str>().copied())
+            .expect("panic payload should be a string");
+
+        assert_that!(message).contains("ResourceX");
+        assert_that!(message).contains("must be defused");
+        assert_that!(message).contains("call defuse()");
+    }
+
+    #[test]
+    fn defused_drop_does_not_panic() {
+        let mut guard = PanicOnDrop::new("ResourceX", "err", "help");
+        guard.defuse();
+        assert_that!(guard.is_armed()).is_false();
+        // Drop happens at end of scope; the test passes by not panicking.
+    }
+
+    #[test]
+    fn defuse_is_idempotent() {
+        let mut guard = PanicOnDrop::new("ResourceX", "err", "help");
+        guard.defuse();
+        guard.defuse();
+        assert_that!(guard.is_armed()).is_false();
     }
 }

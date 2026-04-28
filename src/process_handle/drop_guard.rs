@@ -108,10 +108,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broadcast::BroadcastOutputStream;
     use crate::test_support::long_running_command;
     use crate::{
-        BestEffortDelivery, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NoReplay,
+        BestEffortDelivery, BroadcastOutputStream, DEFAULT_MAX_BUFFERED_CHUNKS,
+        DEFAULT_READ_CHUNK_SIZE, NoReplay,
     };
     use assertr::prelude::*;
 
@@ -132,7 +132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_must_be_terminated_is_idempotent_for_fresh_handle() {
+    async fn must_be_terminated_is_idempotent_when_already_armed() {
         let mut process = spawn_long_running_process();
 
         process.must_be_terminated();
@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_must_be_terminated_rearms_after_must_not_be_terminated() {
+    async fn must_be_terminated_re_arms_safeguards_after_opt_out() {
         let mut process = spawn_long_running_process();
 
         process.must_not_be_terminated();
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_defusing_drop_panic_keeps_cleanup_guard_armed() {
+    async fn defuse_drop_panic_disarms_panic_but_keeps_cleanup() {
         let mut process = spawn_long_running_process();
 
         assert_that!(process.cleanup_on_drop).is_true();
@@ -191,12 +191,15 @@ mod tests {
         assert_that!(&process.panic_on_drop).is_none();
 
         process.kill().await.unwrap();
-        process.wait_for_completion(None).await.unwrap();
+        process
+            .wait_for_completion(Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_must_not_be_terminated_allows_process_to_survive_handle_drop() {
+    async fn must_not_be_terminated_lets_child_outlive_dropped_handle() {
         use nix::errno::Errno;
         use nix::sys::signal::{self, Signal};
         use nix::sys::wait::waitpid;
@@ -224,7 +227,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_must_not_be_terminated_still_closes_stdin_on_drop() {
+    async fn must_not_be_terminated_still_closes_stdin_on_drop() {
         use nix::errno::Errno;
         use nix::sys::wait::waitpid;
         use nix::unistd::Pid;
@@ -276,7 +279,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_must_not_be_terminated_does_not_keep_stdout_pipe_alive() {
+    async fn must_not_be_terminated_still_closes_stdout_pipe_on_drop() {
         use nix::errno::Errno;
         use nix::sys::wait::waitpid;
         use nix::unistd::Pid;

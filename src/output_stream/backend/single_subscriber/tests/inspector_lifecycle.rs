@@ -15,11 +15,13 @@ async fn drop_allows_later_collector() {
         best_effort_no_replay_options(),
     );
 
-    let inspector = stream.inspect_chunks(|_chunk| Next::Continue);
+    let inspector = stream.inspect_chunks(|_chunk| Next::Continue).unwrap();
     drop(inspector);
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
 
@@ -38,15 +40,17 @@ async fn wait_cancellation_releases_single_subscriber_claim() {
 
     let (entered_tx, entered_rx) = oneshot::channel();
     let mut entered_tx = Some(entered_tx);
-    let inspector = stream.inspect_lines_async(
-        move |_line| {
-            if let Some(entered_tx) = entered_tx.take() {
-                entered_tx.send(()).unwrap();
-            }
-            async move { std::future::pending::<Next>().await }
-        },
-        LineParsingOptions::default(),
-    );
+    let inspector = stream
+        .inspect_lines_async(
+            move |_line| {
+                if let Some(entered_tx) = entered_tx.take() {
+                    entered_tx.send(()).unwrap();
+                }
+                async move { std::future::pending::<Next>().await }
+            },
+            LineParsingOptions::default(),
+        )
+        .unwrap();
 
     write_half.write_all(b"ready\n").await.unwrap();
     entered_rx.await.unwrap();
@@ -55,7 +59,9 @@ async fn wait_cancellation_releases_single_subscriber_claim() {
     assert_that!(result.is_err()).is_true();
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     write_half.write_all(b"later\n").await.unwrap();
     drop(write_half);
 
@@ -74,12 +80,14 @@ async fn cancel_waits_for_hanging_async_callback() {
 
     let (entered_tx, entered_rx) = oneshot::channel();
     let mut entered_tx = Some(entered_tx);
-    let inspector = stream.inspect_chunks_async(move |_chunk| {
-        if let Some(entered_tx) = entered_tx.take() {
-            entered_tx.send(()).unwrap();
-        }
-        async move { std::future::pending::<Next>().await }
-    });
+    let inspector = stream
+        .inspect_chunks_async(move |_chunk| {
+            if let Some(entered_tx) = entered_tx.take() {
+                entered_tx.send(()).unwrap();
+            }
+            async move { std::future::pending::<Next>().await }
+        })
+        .unwrap();
 
     write_half.write_all(b"ready").await.unwrap();
     entered_rx.await.unwrap();
@@ -88,7 +96,9 @@ async fn cancel_waits_for_hanging_async_callback() {
     assert_that!(result.is_err()).is_true();
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
 
@@ -107,12 +117,14 @@ async fn abort_releases_single_subscriber_claim() {
 
     let (entered_tx, entered_rx) = oneshot::channel();
     let mut entered_tx = Some(entered_tx);
-    let inspector = stream.inspect_chunks_async(move |_chunk| {
-        if let Some(entered_tx) = entered_tx.take() {
-            entered_tx.send(()).unwrap();
-        }
-        async move { std::future::pending::<Next>().await }
-    });
+    let inspector = stream
+        .inspect_chunks_async(move |_chunk| {
+            if let Some(entered_tx) = entered_tx.take() {
+                entered_tx.send(()).unwrap();
+            }
+            async move { std::future::pending::<Next>().await }
+        })
+        .unwrap();
 
     write_half.write_all(b"ready").await.unwrap();
     entered_rx.await.unwrap();
@@ -120,7 +132,9 @@ async fn abort_releases_single_subscriber_claim() {
     inspector.abort().await;
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
 
@@ -139,12 +153,14 @@ async fn cancel_or_abort_after_aborts_hanging_callback() {
 
     let (entered_tx, entered_rx) = oneshot::channel();
     let mut entered_tx = Some(entered_tx);
-    let inspector = stream.inspect_chunks_async(move |_chunk| {
-        if let Some(entered_tx) = entered_tx.take() {
-            entered_tx.send(()).unwrap();
-        }
-        async move { std::future::pending::<Next>().await }
-    });
+    let inspector = stream
+        .inspect_chunks_async(move |_chunk| {
+            if let Some(entered_tx) = entered_tx.take() {
+                entered_tx.send(()).unwrap();
+            }
+            async move { std::future::pending::<Next>().await }
+        })
+        .unwrap();
 
     write_half.write_all(b"ready").await.unwrap();
     entered_rx.await.unwrap();
@@ -157,7 +173,9 @@ async fn cancel_or_abort_after_aborts_hanging_callback() {
     assert_that!(outcome).is_equal_to(InspectorCancelOutcome::Aborted);
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
 

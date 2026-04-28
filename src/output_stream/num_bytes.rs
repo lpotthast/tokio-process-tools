@@ -1,13 +1,3 @@
-/// Default chunk size read from the source stream. 16 kilobytes.
-pub const DEFAULT_READ_CHUNK_SIZE: NumBytes = NumBytes(16 * 1024); // 16 kb
-
-/// Default maximum buffered chunks for stdout and stderr streams. 128 slots.
-pub const DEFAULT_MAX_BUFFERED_CHUNKS: usize = 128;
-
-pub(crate) fn assert_max_buffered_chunks_non_zero(chunks: usize, parameter_name: &str) {
-    assert!(chunks > 0, "{parameter_name} must be greater than zero");
-}
-
 /// A wrapper type representing a number of bytes.
 ///
 /// Use the [`NumBytesExt`] trait to conveniently create instances:
@@ -40,7 +30,21 @@ impl NumBytes {
     }
 }
 
-/// Extension trait providing convenience-functions for creation of [`NumBytes`] of certain sizes.
+/// Extension trait providing convenience constructors for [`NumBytes`].
+///
+/// Implemented for `usize`, so integer literals can be used directly:
+///
+/// ```
+/// use tokio_process_tools::{NumBytes, NumBytesExt};
+///
+/// let small: NumBytes = 512.bytes();
+/// let medium: NumBytes = 16.kilobytes();
+/// let large: NumBytes = 2.megabytes();
+///
+/// assert_eq!(small.bytes(), 512);
+/// assert_eq!(medium.bytes(), 16 * 1024);
+/// assert_eq!(large.bytes(), 2 * 1024 * 1024);
+/// ```
 pub trait NumBytesExt {
     /// Interprets the value as literal bytes.
     fn bytes(self) -> NumBytes;

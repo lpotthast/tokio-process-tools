@@ -51,6 +51,49 @@ struct LineBenchCase {
     purpose: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LineBenchResult {
+    bytes: usize,
+    lines: usize,
+    checksum: Option<u64>,
+}
+
+impl LineBenchResult {
+    fn from_stats(stats: &support::LineStats) -> Self {
+        Self {
+            bytes: stats.bytes,
+            lines: stats.lines,
+            checksum: Some(stats.checksum),
+        }
+    }
+
+    fn from_lines(lines: &CollectedLines) -> Self {
+        Self {
+            bytes: lines.iter().map(String::len).sum(),
+            lines: lines.len(),
+            checksum: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpectedLineResult {
+    bytes: usize,
+    lines: usize,
+    checksum: u64,
+}
+
+impl ExpectedLineResult {
+    fn from_payload(payload: &support::Payload) -> Self {
+        let stats = support::line_stats(payload);
+        Self {
+            bytes: stats.bytes,
+            lines: stats.lines,
+            checksum: stats.checksum,
+        }
+    }
+}
+
 const LINE_COUNT_ONLY_PAYLOADS: [LinePayloadCase; 3] = [
     LinePayloadCase {
         label: "short_ascii_256B",
@@ -74,6 +117,25 @@ const LINE_COUNT_ONLY_PAYLOADS: [LinePayloadCase; 3] = [
         line_len: support::UTF8_SHORT_LINE_LEN,
         line_count: support::UTF8_SHORT_LINE_COUNT,
         read_chunk_size: support::UTF8_SHORT_LINE_SMALL_READ_CHUNK_SIZE,
+        purpose: "checks non-ASCII decoding cost without storing emitted lines",
+    },
+];
+
+const LINE_COUNT_ONLY_BEST_EFFORT_PAYLOADS: [LinePayloadCase; 2] = [
+    LinePayloadCase {
+        label: "short_ascii_16KiB",
+        payload_kind: LinePayloadKind::Ascii,
+        line_len: support::SHORT_LINE_LEN,
+        line_count: support::SHORT_LINE_COUNT,
+        read_chunk_size: support::SHORT_LINE_LARGE_READ_CHUNK_SIZE,
+        purpose: "keeps a larger-chunk parser baseline with minimal retained allocation",
+    },
+    LinePayloadCase {
+        label: "short_utf8_16KiB",
+        payload_kind: LinePayloadKind::Utf8,
+        line_len: support::UTF8_SHORT_LINE_LEN,
+        line_count: support::UTF8_SHORT_LINE_COUNT,
+        read_chunk_size: support::UTF8_SHORT_LINE_LARGE_READ_CHUNK_SIZE,
         purpose: "checks non-ASCII decoding cost without storing emitted lines",
     },
 ];
@@ -162,7 +224,11 @@ trait LineBenchStream {
     fn collect_line_buffer(&self, options: LineParsingOptions) -> Collector<CollectedLines>;
 }
 
-impl LineBenchStream for SingleSubscriberOutputStream {
+impl<D, R> LineBenchStream for SingleSubscriberOutputStream<D, R>
+where
+    D: tokio_process_tools::Delivery,
+    R: tokio_process_tools::Replay,
+{
     fn collect_line_stats(&self, options: LineParsingOptions) -> Collector<support::LineStats> {
         self.collect_lines(
             support::LineStats::default(),
@@ -172,10 +238,12 @@ impl LineBenchStream for SingleSubscriberOutputStream {
             },
             options,
         )
+        .expect("single-subscriber benchmark consumer should start")
     }
 
     fn collect_line_buffer(&self, options: LineParsingOptions) -> Collector<CollectedLines> {
         self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
+            .expect("single-subscriber benchmark consumer should start")
     }
 }
 
@@ -260,35 +328,27 @@ async fn run_line_case(
     payload: &support::Payload,
     read_chunk_size: usize,
     options: LineParsingOptions,
-) -> (usize, usize, u64) {
+) -> LineBenchResult {
     match (case.backend, case.delivery) {
         (BackendKind::Single, DeliveryKind::BestEffort) => {
-            let stream = support::single_stream_best_effort(
-                support::ChunkedReader::new(payload),
-                read_chunk_size,
-            );
-            run_line_consumer(&stream, case.consumer, options).await
+            let (reader, gate) = support::GatedChunkedReader::new(payload);
+            let stream = support::single_stream_best_effort(reader, read_chunk_size);
+            run_line_consumer(&stream, case.consumer, options, gate).await
         }
         (BackendKind::Single, DeliveryKind::Reliable) => {
-            let stream = support::single_stream_reliable(
-                support::ChunkedReader::new(payload),
-                read_chunk_size,
-            );
-            run_line_consumer(&stream, case.consumer, options).await
+            let (reader, gate) = support::GatedChunkedReader::new(payload);
+            let stream = support::single_stream_reliable(reader, read_chunk_size);
+            run_line_consumer(&stream, case.consumer, options, gate).await
         }
         (BackendKind::Broadcast, DeliveryKind::BestEffort) => {
-            let stream = support::broadcast_stream_best_effort(
-                support::ChunkedReader::new(payload),
-                read_chunk_size,
-            );
-            run_line_consumer(&stream, case.consumer, options).await
+            let (reader, gate) = support::GatedChunkedReader::new(payload);
+            let stream = support::broadcast_stream_best_effort(reader, read_chunk_size);
+            run_line_consumer(&stream, case.consumer, options, gate).await
         }
         (BackendKind::Broadcast, DeliveryKind::Reliable) => {
-            let stream = support::broadcast_stream_reliable(
-                support::ChunkedReader::new(payload),
-                read_chunk_size,
-            );
-            run_line_consumer(&stream, case.consumer, options).await
+            let (reader, gate) = support::GatedChunkedReader::new(payload);
+            let stream = support::broadcast_stream_reliable(reader, read_chunk_size);
+            run_line_consumer(&stream, case.consumer, options, gate).await
         }
     }
 }
@@ -297,20 +357,70 @@ async fn run_line_consumer<S>(
     stream: &S,
     consumer: LineConsumerKind,
     options: LineParsingOptions,
-) -> (usize, usize, u64)
+    gate: support::StartGate,
+) -> LineBenchResult
 where
     S: LineBenchStream,
 {
     match consumer {
         LineConsumerKind::CountOnly => {
-            let stats = stream.collect_line_stats(options).wait().await.unwrap();
-            (stats.bytes, stats.lines, stats.checksum)
+            let collector = stream.collect_line_stats(options);
+            open_gate_after_subscriber_is_polling(gate).await;
+            let stats = collector.wait().await.unwrap();
+            LineBenchResult::from_stats(&stats)
         }
         LineConsumerKind::CollectVec => {
-            let collected = stream.collect_line_buffer(options).wait().await.unwrap();
-            (collected.iter().map(String::len).sum(), collected.len(), 0)
+            let collector = stream.collect_line_buffer(options);
+            open_gate_after_subscriber_is_polling(gate).await;
+            let collected = collector.wait().await.unwrap();
+            LineBenchResult::from_lines(&collected)
         }
     }
+}
+
+async fn open_gate_after_subscriber_is_polling(gate: support::StartGate) {
+    tokio::task::yield_now().await;
+    gate.open();
+}
+
+fn assert_line_result(case: LineBenchCase, expected: ExpectedLineResult, result: LineBenchResult) {
+    assert_eq!(
+        result.bytes,
+        expected.bytes,
+        "{} dropped or duplicated line bytes",
+        case_id(case),
+    );
+    assert_eq!(
+        result.lines,
+        expected.lines,
+        "{} delivered an unexpected line count",
+        case_id(case),
+    );
+
+    black_box((expected.checksum, result.checksum));
+}
+
+fn assert_best_effort_slow_subscriber_result(
+    expected: ExpectedLineResult,
+    result: LineBenchResult,
+) {
+    assert!(
+        result.bytes <= expected.bytes,
+        "best-effort slow-subscriber case delivered more bytes than the source payload"
+    );
+    assert!(
+        result.lines <= expected.lines,
+        "best-effort slow-subscriber case delivered more lines than the source payload"
+    );
+
+    black_box((
+        expected.bytes,
+        expected.lines,
+        expected.checksum,
+        result.bytes,
+        result.lines,
+        result.checksum,
+    ));
 }
 
 fn build_payload(case: LinePayloadCase) -> support::Payload {
@@ -324,10 +434,13 @@ fn build_payload(case: LinePayloadCase) -> support::Payload {
     }
 }
 
-fn payloads_for(consumer: LineConsumerKind) -> &'static [LinePayloadCase] {
-    match consumer {
-        LineConsumerKind::CountOnly => &LINE_COUNT_ONLY_PAYLOADS,
-        LineConsumerKind::CollectVec => &LINE_COLLECT_PAYLOADS,
+fn payloads_for(case: LineBenchCase) -> &'static [LinePayloadCase] {
+    match (case.consumer, case.delivery) {
+        (LineConsumerKind::CountOnly, DeliveryKind::BestEffort) => {
+            &LINE_COUNT_ONLY_BEST_EFFORT_PAYLOADS
+        }
+        (LineConsumerKind::CountOnly, DeliveryKind::Reliable) => &LINE_COUNT_ONLY_PAYLOADS,
+        (LineConsumerKind::CollectVec, _) => &LINE_COLLECT_PAYLOADS,
     }
 }
 
@@ -348,8 +461,9 @@ fn bench_line_delivery(c: &mut Criterion) {
     let options = LineParsingOptions::default();
 
     for case in LINE_BENCH_CASES {
-        for payload_case in payloads_for(case.consumer) {
+        for payload_case in payloads_for(case) {
             let payload = build_payload(*payload_case);
+            let expected = ExpectedLineResult::from_payload(&payload);
             group.throughput(Throughput::Bytes(support::total_bytes(&payload) as u64));
 
             group.bench_with_input(
@@ -359,10 +473,11 @@ fn bench_line_delivery(c: &mut Criterion) {
                     b.to_async(&rt).iter(|| async {
                         black_box(case.purpose);
                         black_box(payload_case.purpose);
-                        black_box(
+                        let result =
                             run_line_case(case, payload, payload_case.read_chunk_size, options)
-                                .await,
-                        )
+                                .await;
+                        assert_line_result(case, expected, result);
+                        black_box(result)
                     });
                 },
             );
@@ -376,27 +491,25 @@ async fn run_reliable_replay_line_case(
     payload: &support::Payload,
     read_chunk_size: usize,
     options: LineParsingOptions,
-) -> (usize, usize, u64) {
-    let stream = support::broadcast_stream_reliable_replay(
-        support::ChunkedReader::new(payload),
-        read_chunk_size,
-    );
-    run_line_consumer(&stream, LineConsumerKind::CountOnly, options).await
+) -> LineBenchResult {
+    let (reader, gate) = support::GatedChunkedReader::new(payload);
+    let stream = support::broadcast_stream_reliable_replay(reader, read_chunk_size);
+    run_line_consumer(&stream, LineConsumerKind::CountOnly, options, gate).await
 }
 
 async fn run_best_effort_replay_slow_subscriber_case(
     payload: &support::Payload,
     read_chunk_size: usize,
     options: LineParsingOptions,
-) -> (usize, usize, u64) {
+) -> LineBenchResult {
     let (reader, gate) = support::GatedChunkedReader::new(payload);
     let stream = support::broadcast_stream_best_effort_replay(reader, read_chunk_size);
     let _slow_subscriber = stream.collect_chunks_async((), HangingChunkCollector);
     let collector = stream.collect_line_stats(options);
 
-    gate.open();
+    open_gate_after_subscriber_is_polling(gate).await;
     let stats = collector.wait().await.unwrap();
-    (stats.bytes, stats.lines, stats.checksum)
+    LineBenchResult::from_stats(&stats)
 }
 
 fn bench_line_delivery_replay(c: &mut Criterion) {
@@ -415,6 +528,7 @@ fn bench_line_delivery_replay(c: &mut Criterion) {
             support::UTF8_SHORT_LINE_COUNT,
             read_chunk_size,
         );
+        let expected = ExpectedLineResult::from_payload(&payload);
         group.throughput(Throughput::Bytes(support::total_bytes(&payload) as u64));
         group.bench_with_input(
             BenchmarkId::new(
@@ -424,9 +538,19 @@ fn bench_line_delivery_replay(c: &mut Criterion) {
             &payload,
             |b, payload| {
                 b.to_async(&rt).iter(|| async {
-                    black_box(
-                        run_reliable_replay_line_case(payload, read_chunk_size, options).await,
-                    )
+                    let result =
+                        run_reliable_replay_line_case(payload, read_chunk_size, options).await;
+                    assert_line_result(
+                        LineBenchCase {
+                            consumer: LineConsumerKind::CountOnly,
+                            backend: BackendKind::Broadcast,
+                            delivery: DeliveryKind::Reliable,
+                            purpose: "checks reliable replay count-only line delivery",
+                        },
+                        expected,
+                        result,
+                    );
+                    black_box(result)
                 });
             },
         );
@@ -437,6 +561,7 @@ fn bench_line_delivery_replay(c: &mut Criterion) {
         support::SHORT_LINE_COUNT,
         support::SHORT_LINE_SMALL_READ_CHUNK_SIZE,
     );
+    let expected = ExpectedLineResult::from_payload(&payload);
     group.throughput(Throughput::Bytes(support::total_bytes(&payload) as u64));
     group.bench_with_input(
         BenchmarkId::new(
@@ -446,14 +571,14 @@ fn bench_line_delivery_replay(c: &mut Criterion) {
         &payload,
         |b, payload| {
             b.to_async(&rt).iter(|| async {
-                black_box(
-                    run_best_effort_replay_slow_subscriber_case(
-                        payload,
-                        support::SHORT_LINE_SMALL_READ_CHUNK_SIZE,
-                        options,
-                    )
-                    .await,
+                let result = run_best_effort_replay_slow_subscriber_case(
+                    payload,
+                    support::SHORT_LINE_SMALL_READ_CHUNK_SIZE,
+                    options,
                 )
+                .await;
+                assert_best_effort_slow_subscriber_result(expected, result);
+                black_box(result)
             });
         },
     );

@@ -128,19 +128,43 @@ impl ReplayState {
 pub(super) struct ConfiguredShared {
     pub(super) state: Mutex<ReplayState>,
     pub(super) active_tx: watch::Sender<Option<Arc<ActiveSubscriber>>>,
+    pub(super) bytes_ingested_tx: watch::Sender<u64>,
+    pub(super) terminal_tx: watch::Sender<Option<StreamEvent>>,
 }
 
 impl ConfiguredShared {
     pub(super) fn new() -> Self {
-        let (active_tx, _active_rx) = watch::channel(None);
+        let (active_tx, _) = watch::channel(None);
+        let (bytes_ingested_tx, _) = watch::channel(0);
+        let (terminal_tx, _) = watch::channel(None);
         Self {
             state: Mutex::new(ReplayState::new()),
             active_tx,
+            bytes_ingested_tx,
+            terminal_tx,
         }
     }
 
     pub(super) fn subscribe_active(&self) -> watch::Receiver<Option<Arc<ActiveSubscriber>>> {
         self.active_tx.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(super) fn subscribe_bytes_ingested(&self) -> watch::Receiver<u64> {
+        self.bytes_ingested_tx.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(super) fn subscribe_terminal(&self) -> watch::Receiver<Option<StreamEvent>> {
+        self.terminal_tx.subscribe()
+    }
+
+    pub(super) fn record_bytes_ingested(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.bytes_ingested_tx
+            .send_modify(|n| *n = n.saturating_add(bytes as u64));
     }
 
     pub(super) fn clear_active_if_current(&self, id: SubscriberId) {
@@ -162,16 +186,11 @@ impl ConfiguredShared {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::test_support::chunk;
     use super::*;
-    use crate::output_stream::event::Chunk;
     use crate::{NumBytesExt, StreamReadError};
     use assertr::prelude::*;
-    use bytes::Bytes;
     use std::io;
-
-    fn chunk(bytes: &'static [u8]) -> StreamEvent {
-        StreamEvent::Chunk(Chunk(Bytes::from_static(bytes)))
-    }
 
     fn retained_bytes(state: &ReplayState) -> Vec<u8> {
         state

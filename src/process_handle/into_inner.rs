@@ -38,25 +38,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::long_running_command;
-    use crate::{
-        CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
-        LineCollectionOptions, LineParsingOptions, NumBytesExt,
-    };
+    use crate::test_support::{line_collection_options, long_running_command};
+    use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, LineParsingOptions};
     use assertr::prelude::*;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
-    fn line_collection_options() -> LineCollectionOptions {
-        LineCollectionOptions::Bounded {
-            max_bytes: 1.megabytes(),
-            max_lines: 1024,
-            overflow_behavior: CollectionOverflowBehavior::default(),
-        }
-    }
-
     #[tokio::test]
-    async fn test_into_inner_returns_stdin_without_closing_pipe() {
+    async fn into_inner_returns_stdin_with_pipe_still_open() {
         let cmd = tokio::process::Command::new("cat");
         let process = crate::Process::new(cmd)
             .name("cat")
@@ -104,7 +93,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_into_inner_defuses_panic_guard() {
+    async fn into_inner_defuses_panic_guard() {
         let process = crate::Process::new(long_running_command(Duration::from_secs(5)))
             .name("long-running")
             .stdout_and_stderr(|stream| {
@@ -124,7 +113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_into_inner_with_owned_name_drops_owned_string() {
+    async fn into_inner_supports_handles_built_with_owned_name() {
         let process = crate::Process::new(long_running_command(Duration::from_secs(5)))
             .name(format!("sleeper-{}", 7))
             .stdout_and_stderr(|stream| {

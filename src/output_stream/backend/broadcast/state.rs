@@ -3,7 +3,7 @@ use crate::output_stream::event::StreamEvent;
 use crate::output_stream::policy::{Delivery, DeliveryGuarantee, Replay, ReplayRetention};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 
 pub(super) type SubscriberId = u64;
 
@@ -284,13 +284,29 @@ impl BroadcastState {
 #[derive(Debug)]
 pub(super) struct Shared {
     pub(super) state: Mutex<BroadcastState>,
+    pub(super) bytes_ingested_tx: watch::Sender<u64>,
 }
 
 impl Shared {
     pub(super) fn new() -> Self {
+        let (bytes_ingested_tx, _) = watch::channel(0);
         Self {
             state: Mutex::new(BroadcastState::new()),
+            bytes_ingested_tx,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn subscribe_bytes_ingested(&self) -> watch::Receiver<u64> {
+        self.bytes_ingested_tx.subscribe()
+    }
+
+    pub(super) fn record_bytes_ingested(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.bytes_ingested_tx
+            .send_modify(|n| *n = n.saturating_add(bytes as u64));
     }
 }
 
@@ -363,15 +379,10 @@ pub(super) async fn append_event<D, R>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::test_support::chunk;
     use super::*;
-    use crate::output_stream::event::Chunk;
     use crate::{NumBytesExt, ReplayEnabled};
     use assertr::prelude::*;
-    use bytes::Bytes;
-
-    fn chunk(bytes: &'static [u8]) -> StreamEvent {
-        StreamEvent::Chunk(Chunk(Bytes::from_static(bytes)))
-    }
 
     fn best_effort_options(
         retention: ReplayRetention,

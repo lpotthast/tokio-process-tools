@@ -10,23 +10,19 @@ pub mod backend;
 pub mod config;
 
 pub(crate) mod event;
-pub(crate) mod line_waiter;
 
 /// Line parsing types and options.
 pub mod line;
 
-/// Stream sizing and paired stdout/stderr option types.
-pub mod options;
+/// `NumBytes` newtype and convenience constructors used throughout the public API.
+pub mod num_bytes;
 
 /// Delivery and replay policy types shared by output stream backends.
 pub mod policy;
 
-use crate::{
-    CollectedBytes, CollectedLines, Collector, LineCollectionOptions, RawCollectionOptions,
-};
+use crate::StreamConsumerError;
 use event::StreamEvent;
-use line::LineParsingOptions;
-use options::NumBytes;
+use num_bytes::NumBytes;
 
 /// We support the following implementations:
 ///
@@ -44,30 +40,22 @@ pub trait OutputStream {
     fn name(&self) -> &'static str;
 }
 
-/// Capability trait for stream backends that can attach built-in collectors.
-///
-/// [`OutputStream`] intentionally only describes stream metadata. Generic process-handle
-/// collection methods need an additional bound for the concrete collector constructors they call,
-/// so this trait marks backends that support collecting output into the crate's standard in-memory
-/// buffers.
-pub trait Collectable: OutputStream {
-    /// Starts a collector that parses stream output into lines and stores them in memory.
-    fn collect_lines_into_vec(
-        &self,
-        parsing_options: LineParsingOptions,
-        collection_options: LineCollectionOptions,
-    ) -> Collector<CollectedLines>;
-
-    /// Starts a collector that stores raw output chunks in memory.
-    fn collect_chunks_into_vec(&self, options: RawCollectionOptions) -> Collector<CollectedBytes>;
-}
-
-pub(crate) trait Subscription: Send + 'static {
+/// Stream event subscription used by built-in consumers.
+pub trait Subscription: Send + 'static {
+    /// Returns the next stream event, or `None` once the subscription is closed.
     fn next_event(&mut self) -> impl Future<Output = Option<StreamEvent>> + Send + '_;
 }
 
-pub(crate) trait Subscribable: OutputStream {
+/// Output stream backend that can create consumer subscriptions.
+pub trait Subscribable: OutputStream {
+    /// Creates a new subscription for a consumer.
     fn subscribe(&self) -> impl Subscription;
+}
+
+/// Output stream backend that can reject consumer subscriptions.
+pub trait TrySubscribable: OutputStream {
+    /// Creates a new subscription for a consumer, or returns why the consumer cannot be started.
+    fn try_subscribe(&self) -> Result<impl Subscription, StreamConsumerError>;
 }
 
 /// Control flag to indicate whether processing should continue or break.

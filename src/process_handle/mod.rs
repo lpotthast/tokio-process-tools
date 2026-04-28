@@ -1,3 +1,5 @@
+//! Spawned-process handle, stdin lifecycle, and process state queries.
+
 mod drop_guard;
 mod into_inner;
 pub(crate) mod options;

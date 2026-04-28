@@ -1,19 +1,15 @@
 use super::super::SingleSubscriberOutputStream;
+use super::super::state::ConfiguredShared;
 use crate::AsyncChunkCollector;
-use crate::output_stream::event::Chunk;
+use crate::output_stream::event::{Chunk, StreamEvent};
+use crate::output_stream::policy::{Delivery, Replay};
 use crate::{Next, NumBytes};
 use crate::{NumBytesExt, ReplayRetention, StreamConfig};
-use assertr::prelude::*;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 use tokio::io::AsyncWrite;
 use tokio::sync::oneshot;
-use tokio::time::sleep;
-
-pub(super) const ACTIVE_CONSUMER_PANIC: &str = "Cannot create multiple active consumers on SingleSubscriberOutputStream (stream: 'custom'). Only one active inspector, collector, or line waiter can be active at a time. Use .stdout_and_stderr(|stream| stream.broadcast().best_effort_delivery().no_replay().read_chunk_size(DEFAULT_READ_CHUNK_SIZE).max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)).spawn() to support multiple consumers.";
 
 pub(super) fn best_effort_no_replay_options() -> StreamConfig {
     best_effort_no_replay_options_with(4.bytes(), 4)
@@ -45,22 +41,55 @@ pub(super) fn reliable_replay_options(
     .build()
 }
 
-pub(super) async fn wait_for_no_active_consumer(stream: &SingleSubscriberOutputStream) {
-    let shared = Arc::clone(stream.configured_shared.as_ref().unwrap());
-    for _ in 0..50 {
-        {
-            let state = shared
-                .state
-                .lock()
-                .expect("single-subscriber state poisoned");
-            if state.active_id.is_none() {
-                return;
-            }
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
+pub(super) async fn wait_for_no_active_consumer<D, R>(stream: &SingleSubscriberOutputStream<D, R>)
+where
+    D: Delivery,
+    R: Replay,
+{
+    stream
+        .configured_shared
+        .subscribe_active()
+        .wait_for(Option::is_none)
+        .await
+        .expect("active subscriber watch closed");
+}
 
-    assert_that!(()).fail("active consumer did not detach");
+pub(super) async fn wait_for_bytes_ingested<D, R>(
+    stream: &SingleSubscriberOutputStream<D, R>,
+    bytes: u64,
+) where
+    D: Delivery,
+    R: Replay,
+{
+    wait_for_bytes_ingested_shared(&stream.configured_shared, bytes).await;
+}
+
+pub(super) async fn wait_for_bytes_ingested_shared(shared: &ConfiguredShared, bytes: u64) {
+    shared
+        .subscribe_bytes_ingested()
+        .wait_for(|observed| *observed >= bytes)
+        .await
+        .expect("bytes-ingested watch closed");
+}
+
+pub(super) async fn wait_for_terminal<D, R>(
+    stream: &SingleSubscriberOutputStream<D, R>,
+) -> StreamEvent
+where
+    D: Delivery,
+    R: Replay,
+{
+    wait_for_terminal_shared(&stream.configured_shared).await
+}
+
+pub(super) async fn wait_for_terminal_shared(shared: &ConfiguredShared) -> StreamEvent {
+    shared
+        .subscribe_terminal()
+        .wait_for(Option::is_some)
+        .await
+        .expect("terminal watch closed")
+        .clone()
+        .expect("terminal watch settled with None after wait_for is_some")
 }
 
 pub(super) struct HangingChunkCollector {

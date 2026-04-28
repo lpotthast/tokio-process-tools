@@ -1,7 +1,9 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::{
-    best_effort_no_replay_options, reliable_replay_options, wait_for_no_active_consumer,
+    best_effort_no_replay_options, reliable_replay_options, wait_for_bytes_ingested,
+    wait_for_no_active_consumer, wait_for_terminal,
 };
+use crate::output_stream::event::StreamEvent;
 use crate::test_support::ReadErrorAfterBytes;
 use crate::{
     CollectorError, LineParsingOptions, NumBytesExt, RawCollectionOptions, ReplayRetention,
@@ -12,7 +14,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::time::sleep;
 
 #[tokio::test]
 async fn typed_no_replay_starts_consumer_at_live_output() {
@@ -25,9 +26,11 @@ async fn typed_no_replay_starts_consumer_at_live_output() {
 
     write_half.write_all(b"old").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(25)).await;
+    wait_for_bytes_ingested(&stream, 3).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     write_half.write_all(b"live").await.unwrap();
     write_half.flush().await.unwrap();
     drop(write_half);
@@ -47,9 +50,11 @@ async fn typed_replay_all_delivers_pre_consumer_output_before_live_output() {
 
     write_half.write_all(b"old").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(25)).await;
+    wait_for_bytes_ingested(&stream, 3).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     write_half.write_all(b"live").await.unwrap();
     write_half.flush().await.unwrap();
     drop(write_half);
@@ -66,11 +71,11 @@ async fn configured_subscription_snapshots_replay_buffer_from_shared_state() {
         "custom",
         reliable_replay_options(ReplayRetention::All),
     );
-    let shared = Arc::clone(stream.configured_shared.as_ref().unwrap());
+    let shared = Arc::clone(&stream.configured_shared);
 
     write_half.write_all(b"old").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(25)).await;
+    wait_for_bytes_ingested(&stream, 3).await;
 
     {
         let state = shared
@@ -80,7 +85,9 @@ async fn configured_subscription_snapshots_replay_buffer_from_shared_state() {
         assert_that!(state.events.len()).is_equal_to(1);
     }
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
 
     {
         let state = shared
@@ -107,15 +114,19 @@ async fn no_replay_discards_output_between_consumers() {
         best_effort_no_replay_options(),
     );
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
     wait_for_no_active_consumer(&stream).await;
 
     write_half.write_all(b"idle").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(25)).await;
+    wait_for_bytes_ingested(&stream, 4).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
@@ -131,15 +142,19 @@ async fn replay_retains_output_between_consumers() {
         reliable_replay_options(ReplayRetention::All),
     );
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
     wait_for_no_active_consumer(&stream).await;
 
     write_half.write_all(b"idle").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(25)).await;
+    wait_for_bytes_ingested(&stream, 4).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
@@ -155,15 +170,19 @@ async fn replay_retention_limits_later_consumer() {
         reliable_replay_options(ReplayRetention::LastChunks(1)),
     );
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
     wait_for_no_active_consumer(&stream).await;
 
     write_half.write_all(b"aabbcc").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(25)).await;
+    wait_for_bytes_ingested(&stream, 6).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
@@ -180,10 +199,11 @@ async fn later_consumer_observes_eof() {
     );
 
     drop(write_half);
-    sleep(Duration::from_millis(25)).await;
+    assert_that!(wait_for_terminal(&stream).await).is_equal_to(StreamEvent::Eof);
 
     let bytes = stream
         .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap()
         .wait()
         .await
         .unwrap();
@@ -198,14 +218,15 @@ async fn later_consumer_observes_read_error() {
         best_effort_no_replay_options(),
     );
 
-    sleep(Duration::from_millis(25)).await;
+    let _ = wait_for_terminal(&stream).await;
 
     match stream
         .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap()
         .wait()
         .await
     {
-        Err(CollectorError::StreamRead { source, .. }) => {
+        Err(CollectorError::StreamRead { source }) => {
             assert_that!(source.stream_name()).is_equal_to("custom");
             assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
         }
@@ -223,11 +244,11 @@ async fn configured_subscription_after_seal_starts_live_with_empty_shared_replay
         "custom",
         reliable_replay_options(ReplayRetention::All),
     );
-    let shared = Arc::clone(stream.configured_shared.as_ref().unwrap());
+    let shared = Arc::clone(&stream.configured_shared);
 
     write_half.write_all(b"old").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(25)).await;
+    wait_for_bytes_ingested(&stream, 3).await;
 
     {
         let state = shared
@@ -238,7 +259,9 @@ async fn configured_subscription_after_seal_starts_live_with_empty_shared_replay
     }
 
     stream.seal_replay();
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
 
     {
         let state = shared
@@ -269,14 +292,16 @@ async fn typed_wait_after_seal_starts_live() {
 
     write_half.write_all(b"ready\n").await.unwrap();
     write_half.flush().await.unwrap();
-    sleep(Duration::from_millis(25)).await;
+    wait_for_bytes_ingested(&stream, 6).await;
     stream.seal_replay();
 
-    let waiter = stream.wait_for_line_with_timeout(
-        |line| line == "live",
-        LineParsingOptions::default(),
-        Duration::from_secs(1),
-    );
+    let waiter = stream
+        .wait_for_line(
+            Duration::from_secs(1),
+            |line| line == "live",
+            LineParsingOptions::default(),
+        )
+        .unwrap();
 
     write_half.write_all(b"live\n").await.unwrap();
     drop(write_half);

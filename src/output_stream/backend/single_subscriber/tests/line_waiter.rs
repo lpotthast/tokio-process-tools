@@ -15,16 +15,19 @@ async fn timeout_allows_later_collector() {
     );
 
     let result = stream
-        .wait_for_line_with_timeout(
+        .wait_for_line(
+            Duration::from_millis(25),
             |line| line == "ready",
             LineParsingOptions::default(),
-            Duration::from_millis(25),
         )
+        .unwrap()
         .await;
     assert_that!(result).is_equal_to(Ok(WaitForLineResult::Timeout));
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     write_half.write_all(b"ready\n").await.unwrap();
     drop(write_half);
 
@@ -41,7 +44,13 @@ async fn stream_drop_closes_waiting_line_waiters() {
         best_effort_no_replay_options(),
     );
 
-    let waiter = stream.wait_for_line(|line| line == "never", LineParsingOptions::default());
+    let waiter = stream
+        .wait_for_line(
+            Duration::from_secs(1),
+            |line| line == "never",
+            LineParsingOptions::default(),
+        )
+        .unwrap();
     drop(stream);
 
     let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;

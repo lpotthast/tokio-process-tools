@@ -9,70 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added `StreamConfig` and a required type-state `StreamConfig::builder()` API for direct stream
-  construction. The builder requires selecting delivery, replay, read chunk size, and maximum
-  buffered chunks.
-- Added sealed typed delivery and replay policy markers: `BestEffortDelivery`, `ReliableDelivery`,
+- Added `StreamConfig<D, R>` plus a typestate `StreamConfig::builder()` for selecting delivery,
+  replay, read chunk size, and maximum buffered chunks.
+- Added typed delivery and replay policy APIs: `BestEffortDelivery`, `ReliableDelivery`,
   `NoReplay`, `ReplayEnabled`, `Delivery`, `Replay`, `DeliveryGuarantee`, and
   `ReplayRetention`.
-- Added typed process spawning with `.stdout_and_stderr(...)`, `.stdout(...)`, and `.stderr(...)`
-  stream configuration stages. Stdout and stderr may now use different backends and, for broadcast
-  streams, different delivery and replay mode types.
-- Added broadcast stream delivery and replay configuration via `stream.broadcast()`, including
+- Added staged process stream configuration with `.stdout_and_stderr(...)`, `.stdout(...)`, and
+  `.stderr(...)`. Stdout and stderr can now use different backends and delivery/replay policies.
+- Added `stream.broadcast()` and `stream.single_subscriber()` backend builders with
   `.best_effort_delivery()`, `.reliable_for_active_subscribers()`, `.no_replay()`,
   `.replay_last_chunks(...)`, `.replay_last_bytes(...)`, and `.replay_all()`.
-- Added single-subscriber stream delivery and replay configuration via
-  `stream.single_subscriber()` while keeping the lower-overhead single-consumer backend and
-  second-consumer rejection behavior.
-- Added replay-enabled stream APIs for retained output and replay sealing: `seal_replay` and
-  `is_replay_sealed`. Replay-retention metadata uses `Option<ReplayRetention>` to represent
-  disabled replay.
-- Added handle-level replay sealing helpers. Broadcast handles expose `seal_stdout_replay` and
-  `seal_stderr_replay` only when the relevant typed stream has replay enabled, and
-  `seal_output_replay` only when both broadcast streams have replay enabled. Single-subscriber
-  handles expose matching helpers for the single-subscriber backend.
-- Added `BroadcastProcessHandle` as a readable alias for broadcast process handles with typed
-  stdout and stderr streams.
+- Added replay sealing APIs on replay-enabled streams and matching process handles:
+  `seal_replay`, `is_replay_sealed`, `seal_stdout_replay`, `seal_stderr_replay`, and
+  `seal_output_replay`.
 - Added `inspect_chunks_async` for asynchronously inspecting raw output chunks without storing
   them.
 - Added `Collector::abort()`, `Inspector::abort()`,
-  `Collector::cancel_or_abort_after(...)`, and `Inspector::cancel_or_abort_after(...)` for
-  explicit forceful cleanup when cooperative background-consumer cancellation cannot complete.
+  `Collector::cancel_or_abort_after(...)`, `Inspector::cancel_or_abort_after(...)`,
+  `CollectorCancelOutcome`, and `InspectorCancelOutcome` for forceful cleanup when cooperative
+  background-consumer cancellation cannot complete.
+- Added `Collector::is_finished()` and `Inspector::is_finished()` for non-blocking task-state
+  checks.
 - Added in-memory output collection types and options: `RawCollectionOptions`,
   `LineCollectionOptions`, `CollectedBytes`, `CollectedLines`, and
   `CollectionOverflowBehavior`. Collection options distinguish bounded untrusted output from
   trusted-unbounded output, and collected output exposes truncation metadata.
-- Added required-field builders for `LineParsingOptions`.
+- Added `LineOutputOptions`, `RawOutputOptions`, and
+  `WaitForCompletionOrTerminateOptions` for explicit wait and output-collection configuration.
+- Added a required-field builder for `LineParsingOptions` and a builder for `AutoNameSettings`.
 - Added `WriteCollectionOptions` and public sink write error handler types for configuring whether
   writer collectors stop or continue after individual sink write failures. The options type remains
   generic so custom handlers are statically dispatched and allocation-free.
 - Added `StreamReadError` so stream read failures can be surfaced by line waiters, collectors, and
   inspectors.
+- Added `StreamConsumerError` so single-subscriber streams can reject concurrent consumers with a
+  typed error.
+- Added dedicated wait, output-collection, and termination diagnostics:
+  `WaitOrTerminateError`, `WaitWithOutputError`, `TerminationAttemptError`,
+  `TerminationAttemptPhase`, and `TerminationAttemptOperation`. `WaitWithOutputError` covers both
+  `wait_for_completion_with_output*` and `wait_for_completion_with_output*_or_terminate` APIs;
+  it carries a `WaitFailed(WaitError)` variant for the no-terminate family and a
+  `WaitOrTerminateFailed(WaitOrTerminateError)` variant for the terminate-on-timeout family.
 - Added `AutoName::program_only()`, `AutoName::program_with_args()`,
   `AutoName::program_with_env_and_args()`, and `AutoName::full()` as convenience constructors
   mirroring the built-in `AutoNameSettings` presets.
-- Added `AutoNameSettings::builder()` and direct `.name(AutoNameSettings)` support for process
-  names so callers can opt into combinations beyond the built-in naming presets.
+- Added direct `.name(AutoNameSettings)` support for process names so callers can opt into
+  combinations beyond the built-in naming presets.
 
 ### Changed
 
-- Consolidated public re-exports in `lib.rs`; internal modules now import deeply nested types
-  directly instead of re-exporting them through module-local hubs.
-- Reworked chunk and line benchmarks into documented, curated cases that compare best-effort and
-  reliable delivery with allocation-light count-only consumers and practical collection consumers.
+- Migrated termination diagnostic display formatting to `thiserror` derives without changing the
+  emitted messages.
 - **Breaking:** Changed `Process` into a staged builder: name the process with `.name(...)`,
   configure stdout and stderr with `.broadcast()` or `.single_subscriber()` stream builders, then
   call `.spawn()`.
-- **Breaking:** Collapsed process builder stage structs into the generic `Process` typestate
-  builder and removed the public `NamedProcess`, `ProcessBuilderWithStdout`,
-  `ProcessBuilderWithStderr`, and `ConfiguredProcessBuilder` stage types.
-- **Breaking:** Removed `Process::with_name(...)` and `Process::with_auto_name(...)`. Use
-  `.name(...)` for explicit or automatic naming, including `.name(AutoName::program_only())` for
-  the safe program-only default.
 - **Breaking:** Changed direct `BroadcastOutputStream::from_stream` and
   `SingleSubscriberOutputStream::from_stream` construction to accept `StreamConfig<D, R>`.
-  Single-subscriber delivery is now selected through delivery markers and `DeliveryGuarantee`
-  instead of `BackpressureControl`.
+- **Breaking:** Changed `BroadcastOutputStream` and `SingleSubscriberOutputStream` to preserve
+  typed delivery and replay markers as `BroadcastOutputStream<D, R>` and
+  `SingleSubscriberOutputStream<D, R>`.
 - **Breaking:** Changed `ProcessHandle<O>` to `ProcessHandle<Stdout, Stderr = Stdout>`, with
   `stdout()` and `stderr()` returning their independently typed streams.
 - **Breaking:** Changed `TerminateOnDrop<O>` to mirror the
@@ -84,26 +79,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Replaced `Output` and `RawOutput` with
   `ProcessOutput<Stdout, Stderr = Stdout>`. Output-collecting wait helpers now return
   `ProcessOutput<CollectedLines>` or `ProcessOutput<CollectedBytes>`.
-- **Breaking:** Changed process wait helpers to take direct timeout parameters and direct option
-  structs instead of combinatorial `TypedBuilder` wait/output option structs.
-- **Breaking:** Changed `wait_for_line` and `wait_for_line_with_timeout` to return a `LineWaiter`
-  future whose output is `Result<WaitForLineResult, StreamReadError>`. The stream subscription or
-  single-subscriber receiver claim is created before the returned future is first polled.
+- **Breaking:** Changed process wait and output-collection helpers to require explicit timeouts
+  and return `WaitForCompletionResult` or `WaitForCompletionOrTerminateResult` so timeout expiry
+  is a typed outcome instead of a wait error or ambiguous success.
+- **Breaking:** Removed unbounded public line waits and renamed the timed line wait API to
+  `wait_for_line(timeout, predicate, options)`, returning a `LineWaiter` future whose output is
+  `Result<WaitForLineResult, StreamReadError>`. The stream subscription or single-subscriber
+  receiver claim is created before the returned future is first polled.
+- **Breaking:** Changed single-subscriber consumer methods to return
+  `Result<_, StreamConsumerError>` when creating inspectors, collectors, and line waiters.
+  Broadcast consumer methods remain infallible.
 - **Breaking:** Changed normal stream consumers to subscribe from the earliest output currently
   available. Replay-enabled unsealed streams may provide retained past output; no-replay or sealed
   streams start future consumers at live output.
 - **Breaking:** Changed replay-capable broadcast streams to use per-subscriber live queues backed
   by a separate retained replay log. Slow active subscribers on `best_effort/replay` streams are
-  now bounded by their own live queue and receive a gap marker on overflow instead of pinning the
+  bounded by their own live queue and receive a gap marker on overflow instead of pinning the
   shared replay buffer.
-- **Breaking:** Changed `wait_for_completion_or_terminate` to return the dedicated
-  `WaitOrTerminateError` type, and changed output-collecting wait helpers to return dedicated
-  compound error types instead of overloading `WaitError`.
+- **Breaking:** Changed `wait_for_completion_or_terminate` to distinguish natural completion from
+  timeout-triggered cleanup with `WaitForCompletionOrTerminateResult`, and changed
+  output-collecting wait helpers to return dedicated compound error types instead of overloading
+  `WaitError`.
 - **Breaking:** Changed `send_interrupt_signal()`, `send_terminate_signal()`, and `kill()` to
   return typed `TerminationError` diagnostics instead of raw `io::Error`.
 - **Breaking:** Replaced per-phase `TerminationError::TerminationFailed` diagnostic fields with
   chronological `TerminationAttemptError` entries that preserve all recorded source errors as
   `Send + Sync` values.
+- **Breaking:** Marked public error enums as non-exhaustive so future diagnostics can be added
+  without another source-breaking enum expansion.
 - **Breaking:** Changed `collect_chunks_into_vec`, `collect_lines_into_vec`,
   `wait_for_completion_with_output`, and `wait_for_completion_with_raw_output` to require explicit
   collection options. Removed trusted-output-only variants; use `TrustedUnbounded` collection
@@ -124,27 +127,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logging of command arguments that may contain secrets.
 - Single-subscriber streams now allow one active consumer at a time instead of one consumer for the
   entire stream lifetime. After a collector, inspector, or line waiter completes, is canceled, is
-  dropped, or times out, another consumer can attach. Concurrent consumers still panic.
+  dropped, or times out, another consumer can attach. Concurrent consumers are rejected with
+  `StreamConsumerError::ActiveConsumer`.
 - Clarified that `Collector::cancel()` and `Inspector::cancel()` are cooperative, wait for
   in-flight async callbacks or writer calls, and can hang if that work hangs. Collector
   cancellation continues to return the sink only after normal task completion.
 - Replay-enabled single-subscriber streams retain configured replay history across sequential
   consumers, including output produced while no consumer is active. `.no_replay()` continues to
   discard output drained while no consumer is active.
+- Reduced single-subscriber reader overhead by keeping best-effort and reliable delivery loops
+  separate and avoiding replay bookkeeping for no-replay chunk and gap delivery.
 - Improved line-delivery throughput for ASCII output by fast-pathing line text conversion while
   preserving lossy handling for non-ASCII and invalid UTF-8 bytes.
 - Simplified the Criterion benchmark suite to focused chunk-delivery and line-delivery targets for
   the single-subscriber and broadcast backends, added targeted replay-aware line-delivery cases,
-  added dedicated `just bench-smoke`, `just bench-chunks`, and `just bench-lines` commands, and
-  made compile-only benchmark smoke the default workflow.
+  added dedicated `just bench-smoke`, `just bench-chunks`, and `just bench-lines` commands, made
+  compile-only benchmark smoke the default workflow, and moved best-effort small-chunk overflow
+  stress out of the normal throughput matrix.
+- Extended `just verify` to run build and documentation checks in addition to format, clippy, and
+  tests.
+- Clarified README and backend documentation around backend selection, delivery policy, replay,
+  and process naming.
 
 ### Fixed
 
+- **Breaking:** Fixed collector and inspector stream-read errors to rely on `StreamReadError` as
+  the single source of stream context, removing duplicate `stream_name` fields from
+  `CollectorError::StreamRead` and `InspectorError::StreamRead` and avoiding repeated Display
+  output.
 - Fixed `ProcessHandle::must_be_terminated()` so calling it on an already-armed handle is
   idempotent instead of dropping the existing panic-on-drop guard and panicking immediately.
-- Fixed README process-naming docs to state that the staged builder requires an explicit naming
-  call before stream configuration and to use `.name(AutoName::program_only())` for the safe
-  program-only automatic naming case.
 - **Breaking:** Fixed `terminate()` so failed or canceled termination attempts no longer disarm the
   drop cleanup and panic guards before the process has successfully terminated.
 - Fixed `send_interrupt_signal()` and `send_terminate_signal()` to reap children that exited
@@ -173,18 +185,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output pipes held open by descendants and the fixed 3-second post-kill confirmation wait when
   force-kill fallback is required. This adds `OutputCollectionTimeout` variants to the output wait
   error types, surfaces real collector failures promptly even when the sibling stream remains
-  open, and keeps timed-out single-subscriber collectors from blocking later consumers.
+  open, includes process names in `OutputCollectionFailed` errors, and keeps timed-out
+  single-subscriber collectors from blocking later consumers.
 - Fixed `Inspector::wait()` so dropping an in-flight wait future aborts the inspector task instead
   of detaching it, releasing single-subscriber claims held by stuck async inspectors.
 - Fixed dropped single-subscriber streams so active line waiters, collectors, and inspectors are
   unblocked instead of waiting forever.
+- Fixed best-effort single-subscriber streams to record EOF and read-error terminal events even
+  when an active consumer queue is full.
 
 ### Removed
 
 - **Breaking:** Removed `Process::spawn_broadcast()` and `Process::spawn_single_subscriber()` in
   favor of the staged `.broadcast()`/`.single_subscriber()` stream builders.
-- **Breaking:** Removed `Process::auto_name()`. Use `.name(AutoName::program_only())` for the
-  safe program-only automatic naming preset.
+- **Breaking:** Removed `Process::with_name(...)` and `Process::with_auto_name(...)`. Use
+  `.name(...)` for explicit or automatic naming, including `.name(AutoName::program_only())` for
+  the safe program-only automatic naming preset.
 - **Breaking:** Removed the old `Process` stream-sizing and single-subscriber backpressure setter
   methods. Read chunk size, maximum buffered chunks, delivery, and replay are now configured on the
   per-stream builder.
@@ -193,9 +209,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Removed `BackpressureControl` and
   `SingleSubscriberOutputStream::backpressure_control()`. Single-subscriber buffering behavior is
   now represented directly by `DeliveryGuarantee`.
-- **Breaking:** Removed `SealedReplayBehavior`, `ReplaySubscribeError`, and the explicit
-  replay-from-start line wait APIs. Replay retention and sealing now control what output is
-  available to the normal consumer APIs.
 - Removed the atomic-take dependency.
 
 ## [0.8.1] - 2026-04-11

@@ -1,51 +1,41 @@
+//! Multi-consumer broadcast backend with optional replay.
+//!
+//! Two implementations live side by side and are selected by
+//! [`BroadcastOutputStream::from_stream`]:
+//!
+//! - [`fast`] — a thin wrapper around `tokio::sync::broadcast` used only when the config
+//!   is exactly `BestEffortDelivery + NoReplay`. It avoids the shared-state mutex and the
+//!   replay buffer entirely, at the cost of dropping output for slow or late subscribers.
+//! - [`fanout`] — the generic `<D: Delivery, R: Replay>` path used for every other
+//!   combination. It owns an `Arc<Shared>` that tracks the subscriber registry and replay
+//!   history, and routes per-event dispatch through [`state::append_event`] to honor the
+//!   configured delivery guarantee.
+//!
+//! The dispatch lives in [`BroadcastOutputStream::from_stream`] below; see each
+//! submodule's `//!` block for the rationale of that path.
+
 use crate::output_stream::config::StreamConfig;
 use crate::output_stream::event::StreamEvent;
 use crate::output_stream::policy::{
     BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, Replay, ReplayEnabled,
 };
-use crate::output_stream::{OutputStream, Subscribable};
-use crate::{
-    CollectedBytes, CollectedLines, Collector, LineCollectionOptions, LineParsingOptions, NumBytes,
-    RawCollectionOptions, StreamReadError,
-};
+use crate::output_stream::{OutputStream, Subscribable, TrySubscribable};
+use crate::{NumBytes, StreamConsumerError};
 use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::AsyncRead;
-use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
+#[cfg(test)]
+use tokio::sync::watch;
 
-mod reader;
+mod fanout;
+mod fast;
 mod state;
 mod subscription;
 
-use crate::output_stream::Collectable;
-use reader::{read_chunked_fast, read_chunked_shared};
-use state::{BestEffortLiveQueue, Shared, SubscriberSender};
+use fanout::{FanoutReplayBackend, new_fanout_backend};
+use fast::{FastBackend, new_fast_backend};
+use state::{BestEffortLiveQueue, SubscriberSender};
 use subscription::{BroadcastSubscription, FastSubscription, LiveReceiver, SharedSubscription};
-
-struct FastClosureState {
-    closed: bool,
-    read_error: Option<StreamReadError>,
-}
-
-struct FastBackend {
-    stream_reader: JoinHandle<()>,
-    sender: broadcast::Sender<StreamEvent>,
-    closure_state: Arc<Mutex<FastClosureState>>,
-    options: StreamConfig<BestEffortDelivery, NoReplay>,
-    name: &'static str,
-}
-
-struct FanoutReplayBackend<D, R>
-where
-    D: Delivery,
-    R: Replay,
-{
-    stream_reader: JoinHandle<()>,
-    shared: Arc<Shared>,
-    options: StreamConfig<D, R>,
-    name: &'static str,
-}
 
 enum Backend<D, R>
 where
@@ -59,7 +49,10 @@ where
 /// The output stream from a process using a multi-consumer broadcast backend.
 ///
 /// Broadcast streams support multiple consumers and can optionally retain replay history for
-/// consumers that attach after output has already arrived.
+/// consumers that attach after output has already arrived. Use this backend when the same stream
+/// needs concurrent fanout, such as logging plus readiness checks or logging plus collection.
+/// Delivery policy still determines whether slow active consumers observe gaps or apply
+/// backpressure.
 pub struct BroadcastOutputStream<D = BestEffortDelivery, R = NoReplay>
 where
     D: Delivery,
@@ -144,24 +137,6 @@ where
     }
 }
 
-impl<D, R> Collectable for BroadcastOutputStream<D, R>
-where
-    D: Delivery,
-    R: Replay,
-{
-    fn collect_lines_into_vec(
-        &self,
-        parsing_options: LineParsingOptions,
-        collection_options: LineCollectionOptions,
-    ) -> Collector<CollectedLines> {
-        BroadcastOutputStream::collect_lines_into_vec(self, parsing_options, collection_options)
-    }
-
-    fn collect_chunks_into_vec(&self, options: RawCollectionOptions) -> Collector<CollectedBytes> {
-        BroadcastOutputStream::collect_chunks_into_vec(self, options)
-    }
-}
-
 impl<D, R> BroadcastOutputStream<D, R>
 where
     D: Delivery,
@@ -175,55 +150,21 @@ where
     ) -> Self {
         options.assert_valid("options");
 
-        let shared = Arc::new(Shared::new());
         if options.delivery_guarantee() == DeliveryGuarantee::BestEffort
             && !options.replay_enabled()
         {
-            let fast_options = StreamConfig {
-                read_chunk_size: options.read_chunk_size,
-                max_buffered_chunks: options.max_buffered_chunks,
-                delivery: BestEffortDelivery,
-                replay: NoReplay,
-            };
-            let (sender, receiver) = broadcast::channel::<StreamEvent>(options.max_buffered_chunks);
-            drop(receiver);
-            let closure_state = Arc::new(Mutex::new(FastClosureState {
-                closed: false,
-                read_error: None,
-            }));
-            let stream_reader = tokio::spawn(read_chunked_fast(
-                stream,
-                options.read_chunk_size,
-                sender.clone(),
-                Arc::clone(&closure_state),
-                stream_name,
-            ));
-
             return Self {
-                backend: Backend::Fast(FastBackend {
-                    stream_reader,
-                    sender,
-                    closure_state,
-                    options: fast_options,
-                    name: stream_name,
-                }),
+                backend: Backend::Fast(new_fast_backend(
+                    stream,
+                    stream_name,
+                    options.read_chunk_size,
+                    options.max_buffered_chunks,
+                )),
             };
         }
 
-        let stream_reader = tokio::spawn(read_chunked_shared(
-            stream,
-            Arc::clone(&shared),
-            options,
-            stream_name,
-        ));
-
         Self {
-            backend: Backend::FanoutReplay(FanoutReplayBackend {
-                stream_reader,
-                shared,
-                options,
-                name: stream_name,
-            }),
+            backend: Backend::FanoutReplay(new_fanout_backend(stream, stream_name, options)),
         }
     }
 }
@@ -270,6 +211,20 @@ where
             .lock()
             .expect("broadcast state poisoned")
             .replay_sealed
+    }
+}
+
+#[cfg(test)]
+impl<D, R> BroadcastOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
+    pub(super) fn subscribe_bytes_ingested(&self) -> watch::Receiver<u64> {
+        match &self.backend {
+            Backend::Fast(backend) => backend.bytes_ingested_tx.subscribe(),
+            Backend::FanoutReplay(backend) => backend.shared.subscribe_bytes_ingested(),
+        }
     }
 }
 
@@ -363,6 +318,18 @@ where
 {
     fn subscribe(&self) -> impl crate::output_stream::Subscription {
         self.subscribe_normal()
+    }
+}
+
+impl<D, R> TrySubscribable for BroadcastOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
+    fn try_subscribe(
+        &self,
+    ) -> Result<impl crate::output_stream::Subscription, StreamConsumerError> {
+        Ok(self.subscribe_normal())
     }
 }
 

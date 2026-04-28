@@ -1,11 +1,24 @@
 use crate::NumBytes;
-use crate::output_stream::options::assert_max_buffered_chunks_non_zero;
 use crate::output_stream::policy::{
     BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, ReliableDelivery, Replay,
     ReplayEnabled, ReplayRetention,
 };
 
+/// Default chunk size read from the source stream. 16 kilobytes.
+pub const DEFAULT_READ_CHUNK_SIZE: NumBytes = NumBytes(16 * 1024); // 16 kb
+
+/// Default maximum buffered chunks for stdout and stderr streams. 128 slots.
+pub const DEFAULT_MAX_BUFFERED_CHUNKS: usize = 128;
+
+pub(crate) fn assert_max_buffered_chunks_non_zero(chunks: usize, parameter_name: &str) {
+    assert!(chunks > 0, "{parameter_name} must be greater than zero");
+}
+
 /// Shared output stream configuration for all stream backends.
+///
+/// Backend selection controls whether a stream has one active owner or can fan out to multiple
+/// consumers. This configuration controls delivery, replay, and buffering for whichever backend is
+/// selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamConfig<D = BestEffortDelivery, R = NoReplay>
 where
@@ -33,28 +46,6 @@ where
 
 impl StreamConfig<BestEffortDelivery, NoReplay> {
     /// Starts building an output stream configuration.
-    ///
-    /// The builder requires explicit delivery, replay, read chunk size, and maximum buffered chunk
-    /// count before a [`StreamConfig`] can be built.
-    ///
-    /// ```compile_fail
-    /// use tokio_process_tools::StreamConfig;
-    ///
-    /// let _config = StreamConfig::builder()
-    ///     .best_effort_delivery()
-    ///     .no_replay()
-    ///     .build();
-    /// ```
-    ///
-    /// ```compile_fail
-    /// use tokio_process_tools::{DEFAULT_READ_CHUNK_SIZE, StreamConfig};
-    ///
-    /// let _config = StreamConfig::builder()
-    ///     .best_effort_delivery()
-    ///     .replay_last_chunks(1)
-    ///     .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-    ///     .build();
-    /// ```
     #[must_use]
     pub fn builder() -> StreamConfigBuilder {
         StreamConfigBuilder
@@ -66,8 +57,11 @@ impl StreamConfig<BestEffortDelivery, NoReplay> {
 pub struct StreamConfigBuilder;
 
 impl StreamConfigBuilder {
-    /// Delivery that lets slow subscribers lag behind, not providing them with all possibly
-    /// observable data.
+    /// Delivery that keeps reading while slow consumers lag behind.
+    ///
+    /// Bounded buffers may overflow, so active consumers can observe gaps or dropped output. This
+    /// policy avoids applying backpressure for slow consumers, but it is not a blanket throughput
+    /// guarantee; backend implementation and workload shape still matter.
     #[must_use]
     pub fn best_effort_delivery(self) -> StreamConfigReplayBuilder<BestEffortDelivery> {
         StreamConfigReplayBuilder {
@@ -75,11 +69,11 @@ impl StreamConfigBuilder {
         }
     }
 
-    /// Delivery that waits for active subscribers when they lag behind.
+    /// Delivery that waits for active subscribers when their buffers are full.
     ///
-    /// This does not guarantee full reliability in the terms of "definitely receiving all events".
-    /// That is controlled by the upcoming "replay" settings. This setting here only guarantees
-    /// that registered and listening consumers will see all events.
+    /// This applies backpressure to process-output reading so active consumers see all chunks
+    /// delivered inside the library. It does not retain output for consumers that attach later;
+    /// that is controlled by replay settings.
     #[must_use]
     pub fn reliable_for_active_subscribers(self) -> StreamConfigReplayBuilder<ReliableDelivery> {
         StreamConfigReplayBuilder {
@@ -300,7 +294,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_stream::options::NumBytesExt;
+    use crate::output_stream::num_bytes::NumBytesExt;
     use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE};
     use assertr::prelude::*;
 

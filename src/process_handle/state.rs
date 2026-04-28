@@ -75,7 +75,10 @@ mod tests {
             }
         }
 
-        process.wait_for_completion(None).await.unwrap();
+        process
+            .wait_for_completion(Duration::from_secs(2))
+            .await
+            .unwrap();
 
         match process.is_running() {
             RunningState::Running => {

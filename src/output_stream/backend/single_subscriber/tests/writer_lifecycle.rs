@@ -16,10 +16,12 @@ async fn pending_writer_abort_releases_single_subscriber_claim() {
     );
 
     let (entered_tx, entered_rx) = oneshot::channel();
-    let collector = stream.collect_chunks_into_write(
-        PendingWrite::new(entered_tx),
-        WriteCollectionOptions::fail_fast(),
-    );
+    let collector = stream
+        .collect_chunks_into_write(
+            PendingWrite::new(entered_tx),
+            WriteCollectionOptions::fail_fast(),
+        )
+        .unwrap();
 
     write_half.write_all(b"ready").await.unwrap();
     entered_rx.await.unwrap();
@@ -32,7 +34,9 @@ async fn pending_writer_abort_releases_single_subscriber_claim() {
     assert_that!(matches!(outcome, CollectorCancelOutcome::Aborted)).is_true();
     wait_for_no_active_consumer(&stream).await;
 
-    let collector = stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded);
+    let collector = stream
+        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
 

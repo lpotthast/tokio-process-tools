@@ -56,13 +56,17 @@ where
     }
 }
 
-impl<D, R> process_stream_config::Sealed<SingleSubscriberOutputStream>
+impl<D, R> process_stream_config::Sealed<SingleSubscriberOutputStream<D, R>>
     for ProcessStreamConfigStage<SingleSubscriberBackend, StreamConfigReadyBuilder<D, R>>
 where
     D: Delivery,
     R: Replay,
 {
-    fn into_stream<S>(self, stream: S, stream_name: &'static str) -> SingleSubscriberOutputStream
+    fn into_stream<S>(
+        self,
+        stream: S,
+        stream_name: &'static str,
+    ) -> SingleSubscriberOutputStream<D, R>
     where
         S: AsyncRead + Unpin + Send + 'static,
     {
@@ -71,6 +75,9 @@ where
 }
 
 /// Builder for selecting the output stream backend for one process stream.
+///
+/// Backend choice controls stream ownership and fanout. Delivery policy and replay policy are
+/// selected in later builder stages and are independent decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessStreamBuilder;
 
@@ -99,7 +106,7 @@ impl<Backend, Stage> ProcessStreamConfigStage<Backend, Stage> {
 }
 
 impl<Backend> ProcessStreamConfigStage<Backend, StreamConfigBuilder> {
-    /// Selects best-effort delivery.
+    /// Selects bounded live delivery where slow consumers may observe gaps or dropped output.
     #[must_use]
     pub fn best_effort_delivery(
         self,
@@ -107,7 +114,7 @@ impl<Backend> ProcessStreamConfigStage<Backend, StreamConfigBuilder> {
         ProcessStreamConfigStage::new(self.stage.best_effort_delivery())
     }
 
-    /// Selects delivery that waits for active subscribers when they lag behind.
+    /// Selects delivery that waits for active consumers when their buffers are full.
     #[must_use]
     pub fn reliable_for_active_subscribers(
         self,
@@ -188,12 +195,19 @@ where
 
 impl ProcessStreamBuilder {
     /// Selects the broadcast backend for this stream.
+    ///
+    /// Use this when the same stdout or stderr stream must be consumed concurrently, such as
+    /// logging plus readiness checks or logging plus collection.
     #[must_use]
     pub fn broadcast(self) -> ProcessStreamConfigStage<BroadcastBackend, StreamConfigBuilder> {
         ProcessStreamConfigStage::new(StreamConfig::builder())
     }
 
     /// Selects the single-subscriber backend for this stream.
+    ///
+    /// Use this when exactly one active consumer should own the stream and accidental concurrent
+    /// fanout should be rejected early. This backend can reduce coordination overhead in some
+    /// single-consumer paths, but delivery policy still determines lag behavior.
     #[must_use]
     pub fn single_subscriber(
         self,

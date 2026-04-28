@@ -1,5 +1,5 @@
+use super::collect::{Collector, CollectorTaskError, Sink};
 use super::collect_owned_final_line;
-use crate::collector::{Collector, CollectorTaskError, Sink};
 use crate::output_stream::Subscription;
 use crate::output_stream::event::{Chunk, StreamEvent};
 use crate::output_stream::line::{LineParserState, LineParsingOptions};
@@ -114,60 +114,39 @@ where
     }
 }
 
-/// Default sink write error handler that stops collection on the first write failure.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FailOnSinkWriteError;
-
-impl SinkWriteErrorHandler for FailOnSinkWriteError {
-    fn handle(&mut self, _error: &SinkWriteError) -> SinkWriteErrorAction {
-        SinkWriteErrorAction::Stop
-    }
-}
-
-/// Sink write error handler that logs every failure and keeps collecting.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LogAndContinueSinkWriteErrors;
-
-impl SinkWriteErrorHandler for LogAndContinueSinkWriteErrors {
-    fn handle(&mut self, error: &SinkWriteError) -> SinkWriteErrorAction {
-        tracing::warn!(
-            stream = error.stream_name(),
-            operation = ?error.operation(),
-            attempted_len = error.attempted_len(),
-            source = %error.source(),
-            "Could not write collected output to write sink; continuing"
-        );
-        SinkWriteErrorAction::Continue
-    }
-}
-
 /// Options for forwarding collected stream output into an async writer.
 ///
 /// Use [`WriteCollectionOptions::fail_fast`] to stop on the first sink write failure,
 /// [`WriteCollectionOptions::log_and_continue`] to preserve best-effort logging behavior, or
 /// [`WriteCollectionOptions::with_error_handler`] to make a custom per-error decision.
-///
-/// The handler type is part of this options type so custom handlers remain statically dispatched
-/// and allocation-free.
 #[derive(Debug, Clone, Copy)]
-pub struct WriteCollectionOptions<H = FailOnSinkWriteError> {
+pub struct WriteCollectionOptions<H = fn(&SinkWriteError) -> SinkWriteErrorAction> {
     error_handler: H,
 }
 
-impl WriteCollectionOptions<FailOnSinkWriteError> {
+impl WriteCollectionOptions {
     /// Creates writer collection options that fail on the first sink write error.
     #[must_use]
     pub fn fail_fast() -> Self {
         Self {
-            error_handler: FailOnSinkWriteError,
+            error_handler: |_| SinkWriteErrorAction::Stop,
         }
     }
 
     /// Creates writer collection options that log sink write errors and keep collecting.
     #[must_use]
-    pub fn log_and_continue() -> WriteCollectionOptions<LogAndContinueSinkWriteErrors> {
-        WriteCollectionOptions {
-            error_handler: LogAndContinueSinkWriteErrors,
+    pub fn log_and_continue() -> Self {
+        Self {
+            error_handler: |error| {
+                tracing::warn!(
+                    stream = error.stream_name(),
+                    operation = ?error.operation(),
+                    attempted_len = error.attempted_len(),
+                    source = %error.source(),
+                    "Could not write collected output to write sink; continuing"
+                );
+                SinkWriteErrorAction::Continue
+            },
         }
     }
 
@@ -470,6 +449,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::event_receiver;
     use super::*;
     use crate::CollectorError;
     use assertr::prelude::*;
@@ -480,7 +460,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::io::AsyncWrite;
-    use tokio::sync::mpsc;
 
     #[derive(Debug)]
     struct FailingWrite {
@@ -552,15 +531,6 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-    }
-
-    async fn event_receiver(events: Vec<StreamEvent>) -> mpsc::Receiver<StreamEvent> {
-        let (tx, rx) = mpsc::channel(events.len().max(1));
-        for event in events {
-            tx.send(event).await.unwrap();
-        }
-        drop(tx);
-        rx
     }
 
     #[tokio::test]

@@ -26,24 +26,9 @@ where
     }
 }
 
-impl<StdoutD, StderrD>
-    ProcessHandle<
-        BroadcastOutputStream<StdoutD, ReplayEnabled>,
-        BroadcastOutputStream<StderrD, ReplayEnabled>,
-    >
+impl<StdoutD, Stderr> ProcessHandle<SingleSubscriberOutputStream<StdoutD, ReplayEnabled>, Stderr>
 where
     StdoutD: Delivery,
-    StderrD: Delivery,
-{
-    /// Seals stdout and stderr replay history for future broadcast replay subscribers.
-    pub fn seal_output_replay(&self) {
-        self.seal_stdout_replay();
-        self.seal_stderr_replay();
-    }
-}
-
-impl<Stderr> ProcessHandle<SingleSubscriberOutputStream, Stderr>
-where
     Stderr: OutputStream,
 {
     /// Seals stdout replay history for a replay-enabled single-subscriber stream.
@@ -52,9 +37,10 @@ where
     }
 }
 
-impl<Stdout> ProcessHandle<Stdout, SingleSubscriberOutputStream>
+impl<Stdout, StderrD> ProcessHandle<Stdout, SingleSubscriberOutputStream<StderrD, ReplayEnabled>>
 where
     Stdout: OutputStream,
+    StderrD: Delivery,
 {
     /// Seals stderr replay history for a replay-enabled single-subscriber stream.
     pub fn seal_stderr_replay(&self) {
@@ -62,13 +48,27 @@ where
     }
 }
 
-impl ProcessHandle<SingleSubscriberOutputStream> {
-    /// Seals stdout and stderr replay history for replay-enabled single-subscriber streams.
-    pub fn seal_output_replay(&self) {
-        self.seal_stdout_replay();
-        self.seal_stderr_replay();
-    }
+macro_rules! impl_seal_output_replay {
+    ($stdout:ident, $stderr:ident) => {
+        impl<StdoutD, StderrD>
+            ProcessHandle<$stdout<StdoutD, ReplayEnabled>, $stderr<StderrD, ReplayEnabled>>
+        where
+            StdoutD: Delivery,
+            StderrD: Delivery,
+        {
+            /// Seals stdout and stderr replay history for replay-enabled streams.
+            pub fn seal_output_replay(&self) {
+                self.seal_stdout_replay();
+                self.seal_stderr_replay();
+            }
+        }
+    };
 }
+
+impl_seal_output_replay!(BroadcastOutputStream, BroadcastOutputStream);
+impl_seal_output_replay!(BroadcastOutputStream, SingleSubscriberOutputStream);
+impl_seal_output_replay!(SingleSubscriberOutputStream, BroadcastOutputStream);
+impl_seal_output_replay!(SingleSubscriberOutputStream, SingleSubscriberOutputStream);
 
 #[cfg(test)]
 mod tests {
@@ -103,6 +103,85 @@ mod tests {
         assert_that!(process.stderr().is_replay_sealed()).is_true();
 
         let mut process = process;
-        let _ = process.wait_for_completion(None).await.unwrap();
+        let _ = process
+            .wait_for_completion(Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn seal_output_replay_seals_broadcast_stdout_and_single_subscriber_stderr() {
+        let process = Process::new(long_running_command(Duration::from_millis(100)))
+            .name(AutoName::program_only())
+            .stdout(|stdout| {
+                stdout
+                    .broadcast()
+                    .reliable_for_active_subscribers()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .stderr(|stderr| {
+                stderr
+                    .single_subscriber()
+                    .reliable_for_active_subscribers()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .expect("Failed to spawn");
+
+        assert_that!(process.stdout().is_replay_sealed()).is_false();
+        assert_that!(process.stderr().is_replay_sealed()).is_false();
+
+        process.seal_output_replay();
+
+        assert_that!(process.stdout().is_replay_sealed()).is_true();
+        assert_that!(process.stderr().is_replay_sealed()).is_true();
+
+        let mut process = process;
+        let _ = process
+            .wait_for_completion(Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn seal_output_replay_seals_single_subscriber_stdout_and_broadcast_stderr() {
+        let process = Process::new(long_running_command(Duration::from_millis(100)))
+            .name(AutoName::program_only())
+            .stdout(|stdout| {
+                stdout
+                    .single_subscriber()
+                    .reliable_for_active_subscribers()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .stderr(|stderr| {
+                stderr
+                    .broadcast()
+                    .reliable_for_active_subscribers()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .expect("Failed to spawn");
+
+        assert_that!(process.stdout().is_replay_sealed()).is_false();
+        assert_that!(process.stderr().is_replay_sealed()).is_false();
+
+        process.seal_output_replay();
+
+        assert_that!(process.stdout().is_replay_sealed()).is_true();
+        assert_that!(process.stderr().is_replay_sealed()).is_true();
+
+        let mut process = process;
+        let _ = process
+            .wait_for_completion(Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 }
