@@ -2,8 +2,7 @@ use super::*;
 use crate::output_stream::backend::broadcast::BroadcastOutputStream;
 use crate::test_support::{ScriptedOutput, long_running_command};
 use crate::{
-    BestEffortDelivery, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NoReplay,
-    NumBytesExt,
+    BestEffortDelivery, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NoReplay, NumBytesExt,
 };
 use assertr::prelude::*;
 

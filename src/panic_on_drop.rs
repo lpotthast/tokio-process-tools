@@ -74,7 +74,9 @@ mod tests {
     static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
     fn run_silently(f: impl FnOnce() + std::panic::UnwindSafe) -> std::thread::Result<()> {
-        let _guard = PANIC_HOOK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = PANIC_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev_hook = panic::take_hook();
         panic::set_hook(Box::new(|_info| {}));
         let result = panic::catch_unwind(f);

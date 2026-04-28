@@ -8,10 +8,10 @@ mod output_stream;
 mod panic_on_drop;
 mod process;
 mod process_handle;
-mod signal;
-mod terminate_on_drop;
 #[cfg(test)]
 mod send_sync_proof;
+mod signal;
+mod terminate_on_drop;
 #[cfg(test)]
 mod test_support;
 
@@ -48,7 +48,7 @@ pub use output_stream::{Next, OutputStream};
 pub use process::builder::Process;
 pub use process::name::{AutoName, AutoNameSettings, ProcessName};
 pub use process::stream_config::{ProcessStreamBuilder, ProcessStreamConfig};
-pub use process_handle::options::WaitForCompletionOrTerminateOptions;
+pub use process_handle::WaitForCompletionOrTerminateOptions;
 pub use process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
 pub use process_handle::output_collection::output::ProcessOutput;
 pub use process_handle::{ProcessHandle, RunningState, Stdin};

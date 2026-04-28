@@ -40,8 +40,7 @@ async fn terminate_falls_back_to_kill_when_graceful_signal_sends_fail() {
 
     assert_that!(terminate_attempted.load(Ordering::SeqCst)).is_true();
     assert_that!(outcome.exit_status.success()).is_false();
-    assert_that!(outcome.output_collection_timeout_extension)
-        .is_equal_to(FORCE_KILL_WAIT_TIMEOUT);
+    assert_that!(outcome.output_collection_timeout_extension).is_equal_to(FORCE_KILL_WAIT_TIMEOUT);
     assert_that!(process.cleanup_on_drop).is_false();
     assert_that!(&process.panic_on_drop).is_none();
 }

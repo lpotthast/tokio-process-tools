@@ -1,9 +1,9 @@
 use super::ProcessHandle;
+use super::WaitForCompletionOrTerminateOptions;
 use crate::error::{
     WaitError, WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitOrTerminateError,
 };
 use crate::output_stream::OutputStream;
-use crate::process_handle::options::WaitForCompletionOrTerminateOptions;
 use std::io;
 use std::process::ExitStatus;
 use std::time::Duration;

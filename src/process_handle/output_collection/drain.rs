@@ -1,8 +1,8 @@
-use crate::output_stream::consumer::collect::{Collector, CollectorError, Sink};
 use crate::error::{
     WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitWithOutputError,
 };
 use crate::output_stream::OutputStream;
+use crate::output_stream::consumer::collect::{Collector, CollectorError, Sink};
 use crate::process_handle::ProcessHandle;
 use std::future::{Future, poll_fn};
 use std::process::ExitStatus;
