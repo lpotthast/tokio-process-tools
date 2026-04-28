@@ -26,14 +26,19 @@ pub use output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
 pub use output_stream::config::{
     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, StreamConfig, StreamConfigBuilder,
 };
-pub use output_stream::consumer::collect::{
-    AsyncChunkCollector, AsyncLineCollector, CollectedBytes, CollectedLines,
-    CollectionOverflowBehavior, Collector, CollectorCancelOutcome, CollectorError,
-    LineCollectionOptions, RawCollectionOptions, Sink,
+pub use output_stream::consumer::consumer::{
+    Consumer, ConsumerCancelOutcome, ConsumerError, Sink,
 };
-pub use output_stream::consumer::inspect::{Inspector, InspectorCancelOutcome, InspectorError};
 pub use output_stream::consumer::line_waiter::LineWaiter;
-pub use output_stream::consumer::write::{
+pub use output_stream::consumer::visitor::{AsyncStreamVisitor, StreamVisitor};
+pub use output_stream::consumer::visitors::collect::{
+    AsyncChunkCollector, AsyncLineCollector, CollectedBytes, CollectedLines,
+    CollectionOverflowBehavior, LineCollectionOptions, RawCollectionOptions,
+};
+pub use output_stream::consumer::visitors::inspect::{
+    Inspector, InspectorCancelOutcome, InspectorError,
+};
+pub use output_stream::consumer::visitors::write::{
     LineWriteMode, SinkWriteError, SinkWriteErrorAction, SinkWriteErrorHandler, SinkWriteOperation,
     WriteCollectionOptions,
 };

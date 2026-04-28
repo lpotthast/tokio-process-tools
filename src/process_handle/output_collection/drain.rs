@@ -2,7 +2,7 @@ use crate::error::{
     WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitWithOutputError,
 };
 use crate::output_stream::OutputStream;
-use crate::output_stream::consumer::collect::{Collector, CollectorError, Sink};
+use crate::output_stream::consumer::consumer::{Consumer, ConsumerError, Sink};
 use crate::process_handle::ProcessHandle;
 use std::future::{Future, poll_fn};
 use std::process::ExitStatus;
@@ -30,21 +30,21 @@ impl OperationDeadline {
 }
 
 #[derive(Debug)]
-pub(super) enum CollectorDrainError {
+pub(super) enum ConsumerDrainError {
     Timeout,
-    Collection(CollectorError),
+    Collection(ConsumerError),
 }
 
 enum TimedDrainAction<StdoutSink, StderrSink> {
-    Done(Result<(StdoutSink, StderrSink), CollectorDrainError>),
-    AbortStdout(CollectorDrainError),
-    AbortStderr(CollectorDrainError),
+    Done(Result<(StdoutSink, StderrSink), ConsumerDrainError>),
+    AbortStdout(ConsumerDrainError),
+    AbortStderr(ConsumerDrainError),
 }
 
-async fn drain_output_collectors<StdoutSink, StderrSink>(
-    stdout_collector: Collector<StdoutSink>,
-    stderr_collector: Collector<StderrSink>,
-) -> Result<(StdoutSink, StderrSink), CollectorError>
+async fn drain_output_consumers<StdoutSink, StderrSink>(
+    stdout_collector: Consumer<StdoutSink>,
+    stderr_collector: Consumer<StderrSink>,
+) -> Result<(StdoutSink, StderrSink), ConsumerError>
 where
     StdoutSink: Sink,
     StderrSink: Sink,
@@ -52,9 +52,9 @@ where
     tokio::try_join!(stdout_collector.wait(), stderr_collector.wait())
 }
 
-async fn abort_output_collectors<StdoutSink, StderrSink>(
-    stdout_collector: Collector<StdoutSink>,
-    stderr_collector: Collector<StderrSink>,
+async fn abort_output_consumers<StdoutSink, StderrSink>(
+    stdout_collector: Consumer<StdoutSink>,
+    stderr_collector: Consumer<StderrSink>,
 ) where
     StdoutSink: Sink,
     StderrSink: Sink,
@@ -62,19 +62,19 @@ async fn abort_output_collectors<StdoutSink, StderrSink>(
     let (_stdout, _stderr) = tokio::join!(stdout_collector.abort(), stderr_collector.abort());
 }
 
-pub(super) async fn wait_for_output_collectors<StdoutSink, StderrSink>(
-    stdout_collector: Collector<StdoutSink>,
-    stderr_collector: Collector<StderrSink>,
+pub(super) async fn wait_for_output_consumers<StdoutSink, StderrSink>(
+    stdout_collector: Consumer<StdoutSink>,
+    stderr_collector: Consumer<StderrSink>,
     deadline: Option<Instant>,
-) -> Result<(StdoutSink, StderrSink), CollectorDrainError>
+) -> Result<(StdoutSink, StderrSink), ConsumerDrainError>
 where
     StdoutSink: Sink,
     StderrSink: Sink,
 {
     match deadline {
-        None => drain_output_collectors(stdout_collector, stderr_collector)
+        None => drain_output_consumers(stdout_collector, stderr_collector)
             .await
-            .map_err(CollectorDrainError::Collection),
+            .map_err(ConsumerDrainError::Collection),
         Some(deadline) => {
             let mut stdout_wait = stdout_collector.into_wait();
             let mut stderr_wait = stderr_collector.into_wait();
@@ -89,12 +89,12 @@ where
                 tokio::select! {
                     stdout = &mut stdout_future => match stdout {
                         Ok(Some(stdout)) => TimedDrainAction::Done(
-                            drain_remaining_collector(stderr_future.as_mut())
+                            drain_remaining_consumer(stderr_future.as_mut())
                                 .await
                                 .map(|stderr| (stdout, stderr)),
                         ),
                         Err(err) => TimedDrainAction::AbortStderr(
-                            CollectorDrainError::Collection(err),
+                            ConsumerDrainError::Collection(err),
                         ),
                         Ok(None) => TimedDrainAction::AbortStderr(
                             peek_drain_error(stderr_future.as_mut()).await,
@@ -102,12 +102,12 @@ where
                     },
                     stderr = &mut stderr_future => match stderr {
                         Ok(Some(stderr)) => TimedDrainAction::Done(
-                            drain_remaining_collector(stdout_future.as_mut())
+                            drain_remaining_consumer(stdout_future.as_mut())
                                 .await
                                 .map(|stdout| (stdout, stderr)),
                         ),
                         Err(err) => TimedDrainAction::AbortStdout(
-                            CollectorDrainError::Collection(err),
+                            ConsumerDrainError::Collection(err),
                         ),
                         Ok(None) => TimedDrainAction::AbortStdout(
                             peek_drain_error(stdout_future.as_mut()).await,
@@ -131,44 +131,44 @@ where
     }
 }
 
-async fn drain_remaining_collector<S, F>(
+async fn drain_remaining_consumer<S, F>(
     mut remaining_wait: std::pin::Pin<&mut F>,
-) -> Result<S, CollectorDrainError>
+) -> Result<S, ConsumerDrainError>
 where
     S: Sink,
-    F: Future<Output = Result<Option<S>, CollectorError>>,
+    F: Future<Output = Result<Option<S>, ConsumerError>>,
 {
     match remaining_wait.as_mut().await {
         Ok(Some(sink)) => Ok(sink),
-        Err(err) => Err(CollectorDrainError::Collection(err)),
-        Ok(None) => Err(CollectorDrainError::Timeout),
+        Err(err) => Err(ConsumerDrainError::Collection(err)),
+        Ok(None) => Err(ConsumerDrainError::Timeout),
     }
 }
 
 fn peek_drain_error<S, F>(
     mut remaining_wait: std::pin::Pin<&mut F>,
-) -> impl Future<Output = CollectorDrainError> + '_
+) -> impl Future<Output = ConsumerDrainError> + '_
 where
     S: Sink,
-    F: Future<Output = Result<Option<S>, CollectorError>>,
+    F: Future<Output = Result<Option<S>, ConsumerError>>,
 {
     poll_fn(move |cx| match remaining_wait.as_mut().poll(cx) {
-        Poll::Ready(Err(err)) => Poll::Ready(CollectorDrainError::Collection(err)),
-        _ => Poll::Ready(CollectorDrainError::Timeout),
+        Poll::Ready(Err(err)) => Poll::Ready(ConsumerDrainError::Collection(err)),
+        _ => Poll::Ready(ConsumerDrainError::Timeout),
     })
 }
 
 fn map_output_collector_error(
-    err: CollectorDrainError,
+    err: ConsumerDrainError,
     process_name: std::borrow::Cow<'static, str>,
     deadline: OperationDeadline,
 ) -> WaitWithOutputError {
     match err {
-        CollectorDrainError::Collection(source) => WaitWithOutputError::OutputCollectionFailed {
+        ConsumerDrainError::Collection(source) => WaitWithOutputError::OutputCollectionFailed {
             process_name,
             source,
         },
-        CollectorDrainError::Timeout => WaitWithOutputError::OutputCollectionTimeout {
+        ConsumerDrainError::Timeout => WaitWithOutputError::OutputCollectionTimeout {
             process_name,
             timeout: deadline.timeout,
         },
@@ -178,8 +178,8 @@ fn map_output_collector_error(
 pub(super) async fn wait_for_completion_with_collectors<Stdout, Stderr, StdoutSink, StderrSink>(
     handle: &mut ProcessHandle<Stdout, Stderr>,
     timeout: Duration,
-    stdout_collector: Collector<StdoutSink>,
-    stderr_collector: Collector<StderrSink>,
+    stdout_collector: Consumer<StdoutSink>,
+    stderr_collector: Consumer<StderrSink>,
 ) -> Result<WaitForCompletionResult<(ExitStatus, StdoutSink, StderrSink)>, WaitWithOutputError>
 where
     Stdout: OutputStream,
@@ -191,12 +191,12 @@ where
     let status = match handle.wait_for_completion_inner(timeout).await? {
         WaitForCompletionResult::Completed(status) => status,
         WaitForCompletionResult::Timeout { timeout } => {
-            abort_output_collectors(stdout_collector, stderr_collector).await;
+            abort_output_consumers(stdout_collector, stderr_collector).await;
             return Ok(WaitForCompletionResult::Timeout { timeout });
         }
     };
     let (stdout, stderr) =
-        wait_for_output_collectors(stdout_collector, stderr_collector, Some(deadline.deadline))
+        wait_for_output_consumers(stdout_collector, stderr_collector, Some(deadline.deadline))
             .await
             .map_err(|err| map_output_collector_error(err, handle.name.clone(), deadline))?;
 
@@ -213,8 +213,8 @@ pub(super) async fn wait_for_completion_or_terminate_with_collectors<
     wait_timeout: Duration,
     interrupt_timeout: Duration,
     terminate_timeout: Duration,
-    stdout_collector: Collector<StdoutSink>,
-    stderr_collector: Collector<StderrSink>,
+    stdout_collector: Consumer<StdoutSink>,
+    stderr_collector: Consumer<StderrSink>,
 ) -> Result<
     WaitForCompletionOrTerminateResult<(ExitStatus, StdoutSink, StderrSink)>,
     WaitWithOutputError,
@@ -236,7 +236,7 @@ where
     let deadline =
         OperationDeadline::from_started_at(started_at, outcome.output_collection_timeout_budget);
     let (stdout, stderr) =
-        wait_for_output_collectors(stdout_collector, stderr_collector, Some(deadline.deadline))
+        wait_for_output_consumers(stdout_collector, stderr_collector, Some(deadline.deadline))
             .await
             .map_err(|err| map_output_collector_error(err, handle.name.clone(), deadline))?;
 
@@ -251,7 +251,7 @@ mod tests {
     use crate::output_stream::config::StreamConfig;
     use crate::test_support::ReadErrorAfterBytes;
     use crate::{
-        CollectorError, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, RawCollectionOptions,
+        ConsumerError, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, RawCollectionOptions,
     };
     use assertr::prelude::*;
     use std::io;
@@ -281,7 +281,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            wait_for_output_collectors(
+            wait_for_output_consumers(
                 stdout_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
                 stderr_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
                 Some(Instant::now() + Duration::from_secs(30)),
@@ -291,7 +291,7 @@ mod tests {
         .expect("collector error should be returned before the outer timeout");
 
         match result {
-            Err(CollectorDrainError::Collection(CollectorError::StreamRead { source })) => {
+            Err(ConsumerDrainError::Collection(ConsumerError::StreamRead { source })) => {
                 assert_that!(source.stream_name()).is_equal_to("stdout");
                 assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
             }
@@ -319,7 +319,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            wait_for_output_collectors(
+            wait_for_output_consumers(
                 stdout_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
                 stderr_stream
                     .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
@@ -331,7 +331,7 @@ mod tests {
         .expect("collector error should be returned before the outer timeout");
 
         match result {
-            Err(CollectorDrainError::Collection(CollectorError::StreamRead { source })) => {
+            Err(ConsumerDrainError::Collection(ConsumerError::StreamRead { source })) => {
                 assert_that!(source.stream_name()).is_equal_to("stdout");
                 assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
             }

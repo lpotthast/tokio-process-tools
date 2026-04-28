@@ -548,12 +548,12 @@ directly:
   whether parsed lines get the stripped trailing `\n` reattached. See
   [Stream output to a sink](#stream-output-to-a-sink) for an end-to-end example.
 
-Each of these returns a `Collector` or `Inspector` handle. Unlike the wait helpers,
+Each of these returns a `Consumer` or `Inspector` handle. Unlike the wait helpers,
 nothing else will end them for you — the next subsection is about how to do that.
 
 ### Background consumer lifecycle
 
-A `Collector` or `Inspector` exposes four ways to finish, and the choice between them
+A `Consumer` or `Inspector` exposes four ways to finish, and the choice between them
 is a trade-off between recovering the consumer's state (the writer, the collected
 output) and not getting stuck:
 
@@ -561,7 +561,7 @@ output) and not getting stuck:
   child exited and any retained replay has been read out) or the callback returned
   `Next::Stop`. Use this when there is a natural endpoint and you want whatever the
   consumer produced; this is the path that gives you the writer back from a
-  `collect_*_into_write` collector.
+  `collect_*_into_write` consumer.
 - `cancel()` — cooperative shutdown. The consumer task is signalled to stop at the
   next safe point, and sinks and writers are preserved and returned. Safe when the
   callback or writer respects cancellation; if it doesn't, this can hang.

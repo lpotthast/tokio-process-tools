@@ -1,6 +1,6 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::{PendingWrite, best_effort_no_replay_options, wait_for_no_active_consumer};
-use crate::{CollectorCancelOutcome, RawCollectionOptions, WriteCollectionOptions};
+use crate::{ConsumerCancelOutcome, RawCollectionOptions, WriteCollectionOptions};
 use assertr::prelude::*;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -31,7 +31,7 @@ async fn pending_writer_abort_releases_single_subscriber_claim() {
         .await
         .unwrap();
 
-    assert_that!(matches!(outcome, CollectorCancelOutcome::Aborted)).is_true();
+    assert_that!(matches!(outcome, ConsumerCancelOutcome::Aborted)).is_true();
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream

@@ -138,7 +138,7 @@ where
     /// ```no_run
     /// # use tokio::process::Command;
     /// # use tokio_process_tools::{
-    ///     AsyncChunkCollector, AsyncLineCollector, AutoName, Chunk, Collector,
+    ///     AsyncChunkCollector, AsyncLineCollector, AutoName, Chunk, Consumer,
     ///     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, DeliveryGuarantee, LineCollectionOptions,
     ///     LineOverflowBehavior, LineParsingOptions, LineWriteMode, Next, NumBytesExt, Process,
     ///     ProcessHandle, ProcessOutput, RawCollectionOptions, Sink,

@@ -6,7 +6,7 @@ use super::common::{
 use crate::output_stream::event::StreamEvent;
 use crate::test_support::ReadErrorAfterBytes;
 use crate::{
-    CollectorError, LineParsingOptions, NumBytesExt, RawCollectionOptions, ReplayRetention,
+    ConsumerError, LineParsingOptions, NumBytesExt, RawCollectionOptions, ReplayRetention,
     StreamConfig, WaitForLineResult,
 };
 use assertr::prelude::*;
@@ -226,7 +226,7 @@ async fn later_consumer_observes_read_error() {
         .wait()
         .await
     {
-        Err(CollectorError::StreamRead { source }) => {
+        Err(ConsumerError::StreamRead { source }) => {
             assert_that!(source.stream_name()).is_equal_to("custom");
             assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
         }

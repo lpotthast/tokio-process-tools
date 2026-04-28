@@ -1,9 +1,66 @@
-use super::visitor::{WaitForLine, drive_sync};
-use crate::output_stream::Subscription;
+use super::super::visitor::{StreamVisitor, consume_sync};
+use crate::output_stream::event::Chunk;
 use crate::output_stream::line::{LineParserState, LineParsingOptions};
+use crate::output_stream::{Next, Subscription};
 use crate::{StreamReadError, WaitForLineResult};
 use std::borrow::Cow;
 use std::time::Duration;
+
+pub(crate) struct WaitForLine<P> {
+    pub parser: LineParserState,
+    pub options: LineParsingOptions,
+    pub predicate: P,
+    pub matched: bool,
+}
+
+impl<P> StreamVisitor for WaitForLine<P>
+where
+    P: Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
+{
+    type Output = bool;
+
+    fn on_chunk(&mut self, chunk: Chunk) -> Next {
+        let Self {
+            parser,
+            options,
+            predicate,
+            matched,
+        } = self;
+        parser.visit_chunk(chunk.as_ref(), *options, |line| {
+            if predicate(line) {
+                *matched = true;
+                Next::Break
+            } else {
+                Next::Continue
+            }
+        })
+    }
+
+    fn on_gap(&mut self) {
+        self.parser.on_gap();
+    }
+
+    fn on_eof(&mut self) {
+        let Self {
+            parser,
+            predicate,
+            matched,
+            ..
+        } = self;
+        let _ = parser.finish(|line| {
+            if predicate(line) {
+                *matched = true;
+                Next::Break
+            } else {
+                Next::Continue
+            }
+        });
+    }
+
+    fn into_output(self) -> Self::Output {
+        self.matched
+    }
+}
 
 pub(crate) async fn wait_for_line<S>(
     subscription: S,
@@ -27,7 +84,7 @@ where
         predicate,
         matched: false,
     };
-    let matched = drive_sync(subscription, visitor, term_sig_rx).await?;
+    let matched = consume_sync(subscription, visitor, term_sig_rx).await?;
     if matched {
         Ok(WaitForLineResult::Matched)
     } else {

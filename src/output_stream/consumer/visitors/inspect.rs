@@ -1,7 +1,5 @@
-use super::collect::{Collector, CollectorCancelOutcome, CollectorError, CollectorTaskError};
-use super::visitor::{
-    InspectChunks, InspectChunksAsync, InspectLines, InspectLinesAsync, drive_async, drive_sync,
-};
+use super::super::consumer::{Consumer, ConsumerCancelOutcome, ConsumerError, ConsumerTaskError};
+use super::super::visitor::{AsyncStreamVisitor, StreamVisitor, consume_async, consume_sync};
 use crate::StreamReadError;
 use crate::output_stream::event::Chunk;
 use crate::output_stream::line::{LineParserState, LineParsingOptions};
@@ -11,17 +9,115 @@ use std::future::Future;
 use std::time::Duration;
 use thiserror::Error;
 
+pub(crate) struct InspectChunks<F> {
+    pub f: F,
+}
+
+impl<F> StreamVisitor for InspectChunks<F>
+where
+    F: FnMut(Chunk) -> Next + Send + 'static,
+{
+    type Output = ();
+
+    fn on_chunk(&mut self, chunk: Chunk) -> Next {
+        (self.f)(chunk)
+    }
+
+    fn into_output(self) -> Self::Output {}
+}
+
+pub(crate) struct InspectChunksAsync<F> {
+    pub f: F,
+}
+
+impl<F, Fut> AsyncStreamVisitor for InspectChunksAsync<F>
+where
+    F: FnMut(Chunk) -> Fut + Send + 'static,
+    Fut: Future<Output = Next> + Send + 'static,
+{
+    type Output = ();
+
+    fn on_chunk(&mut self, chunk: Chunk) -> impl Future<Output = Next> + Send + '_ {
+        (self.f)(chunk)
+    }
+
+    fn into_output(self) -> Self::Output {}
+}
+
+pub(crate) struct InspectLines<F> {
+    pub parser: LineParserState,
+    pub options: LineParsingOptions,
+    pub f: F,
+}
+
+impl<F> StreamVisitor for InspectLines<F>
+where
+    F: FnMut(Cow<'_, str>) -> Next + Send + 'static,
+{
+    type Output = ();
+
+    fn on_chunk(&mut self, chunk: Chunk) -> Next {
+        self.parser
+            .visit_chunk(chunk.as_ref(), self.options, &mut self.f)
+    }
+
+    fn on_gap(&mut self) {
+        self.parser.on_gap();
+    }
+
+    fn on_eof(&mut self) {
+        let _ = self.parser.finish(&mut self.f);
+    }
+
+    fn into_output(self) -> Self::Output {}
+}
+
+pub(crate) struct InspectLinesAsync<F> {
+    pub parser: LineParserState,
+    pub options: LineParsingOptions,
+    pub f: F,
+}
+
+impl<F, Fut> AsyncStreamVisitor for InspectLinesAsync<F>
+where
+    F: FnMut(Cow<'_, str>) -> Fut + Send + 'static,
+    Fut: Future<Output = Next> + Send + 'static,
+{
+    type Output = ();
+
+    async fn on_chunk(&mut self, chunk: Chunk) -> Next {
+        for line in self.parser.owned_lines(chunk.as_ref(), self.options) {
+            if (self.f)(Cow::Owned(line)).await == Next::Break {
+                return Next::Break;
+            }
+        }
+        Next::Continue
+    }
+
+    fn on_gap(&mut self) {
+        self.parser.on_gap();
+    }
+
+    async fn on_eof(&mut self) {
+        if let Some(line) = self.parser.finish_owned() {
+            let _ = (self.f)(Cow::Owned(line)).await;
+        }
+    }
+
+    fn into_output(self) -> Self::Output {}
+}
+
 pub(crate) fn inspect_chunks<S, F>(stream_name: &'static str, subscription: S, f: F) -> Inspector
 where
     S: Subscription,
     F: FnMut(Chunk) -> Next + Send + 'static,
 {
     let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = drive_sync(subscription, InspectChunks { f }, term_sig_rx);
-    Inspector(Collector {
+    let driver = consume_sync(subscription, InspectChunks { f }, term_sig_rx);
+    Inspector(Consumer {
         stream_name,
         task: Some(tokio::spawn(async move {
-            driver.await.map_err(CollectorTaskError::from)
+            driver.await.map_err(ConsumerTaskError::from)
         })),
         task_termination_sender: Some(term_sig_tx),
     })
@@ -38,11 +134,11 @@ where
     Fut: Future<Output = Next> + Send + 'static,
 {
     let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = drive_async(subscription, InspectChunksAsync { f }, term_sig_rx);
-    Inspector(Collector {
+    let driver = consume_async(subscription, InspectChunksAsync { f }, term_sig_rx);
+    Inspector(Consumer {
         stream_name,
         task: Some(tokio::spawn(async move {
-            driver.await.map_err(CollectorTaskError::from)
+            driver.await.map_err(ConsumerTaskError::from)
         })),
         task_termination_sender: Some(term_sig_tx),
     })
@@ -63,7 +159,7 @@ where
         "LineParsingOptions::max_line_length must be greater than zero"
     );
     let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = drive_sync(
+    let driver = consume_sync(
         subscription,
         InspectLines {
             parser: LineParserState::new(),
@@ -72,10 +168,10 @@ where
         },
         term_sig_rx,
     );
-    Inspector(Collector {
+    Inspector(Consumer {
         stream_name,
         task: Some(tokio::spawn(async move {
-            driver.await.map_err(CollectorTaskError::from)
+            driver.await.map_err(ConsumerTaskError::from)
         })),
         task_termination_sender: Some(term_sig_tx),
     })
@@ -97,7 +193,7 @@ where
         "LineParsingOptions::max_line_length must be greater than zero"
     );
     let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = drive_async(
+    let driver = consume_async(
         subscription,
         InspectLinesAsync {
             parser: LineParserState::new(),
@@ -106,10 +202,10 @@ where
         },
         term_sig_rx,
     );
-    Inspector(Collector {
+    Inspector(Consumer {
         stream_name,
         task: Some(tokio::spawn(async move {
-            driver.await.map_err(CollectorTaskError::from)
+            driver.await.map_err(ConsumerTaskError::from)
         })),
         task_termination_sender: Some(term_sig_tx),
     })
@@ -161,22 +257,22 @@ pub enum InspectorCancelOutcome {
 ///
 /// If not cleaned up, the termination signal will be sent when dropping this inspector,
 /// but the task will be aborted (forceful, not waiting for its regular completion).
-pub struct Inspector(pub(crate) Collector<()>);
+pub struct Inspector(pub(crate) Consumer<()>);
 
-fn into_inspector_error(err: CollectorError) -> InspectorError {
+fn into_inspector_error(err: ConsumerError) -> InspectorError {
     match err {
-        CollectorError::TaskJoin {
+        ConsumerError::TaskJoin {
             stream_name,
             source,
         } => InspectorError::TaskJoin {
             stream_name,
             source,
         },
-        CollectorError::StreamRead { source } => InspectorError::StreamRead { source },
-        // SinkWrite is unreachable: an Inspector wraps Collector<()>, whose task body never calls
-        // a writer sink. The variant exists on CollectorError because writer-backed collectors
+        ConsumerError::StreamRead { source } => InspectorError::StreamRead { source },
+        // SinkWrite is unreachable: an Inspector wraps Consumer<()>, whose task body never calls
+        // a writer sink. The variant exists on ConsumerError because writer-backed consumers
         // share the same type.
-        CollectorError::SinkWrite { .. } => {
+        ConsumerError::SinkWrite { .. } => {
             unreachable!("Inspector tasks never produce SinkWrite errors")
         }
     }
@@ -277,8 +373,8 @@ impl Inspector {
         timeout: Duration,
     ) -> Result<InspectorCancelOutcome, InspectorError> {
         match self.0.cancel_or_abort_after(timeout).await {
-            Ok(CollectorCancelOutcome::Cancelled(())) => Ok(InspectorCancelOutcome::Cancelled),
-            Ok(CollectorCancelOutcome::Aborted) => Ok(InspectorCancelOutcome::Aborted),
+            Ok(ConsumerCancelOutcome::Cancelled(())) => Ok(InspectorCancelOutcome::Cancelled),
+            Ok(ConsumerCancelOutcome::Aborted) => Ok(InspectorCancelOutcome::Aborted),
             Err(err) => Err(into_inspector_error(err)),
         }
     }
@@ -286,7 +382,7 @@ impl Inspector {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::event_receiver;
+    use super::super::super::test_support::event_receiver;
     use super::*;
     use crate::InspectorError;
     use crate::output_stream::event::StreamEvent;
@@ -308,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_or_abort_after_returns_cancelled_when_cooperative() {
         let (task_termination_sender, task_termination_receiver) = oneshot::channel();
-        let inspector = Inspector(Collector {
+        let inspector = Inspector(Consumer {
             stream_name: "custom",
             task: Some(tokio::spawn(async move {
                 let _res = task_termination_receiver.await;

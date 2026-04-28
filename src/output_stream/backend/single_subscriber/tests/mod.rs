@@ -5,7 +5,7 @@ use crate::{
 };
 
 mod active_consumer;
-mod collector_lifecycle;
+mod consumer_lifecycle;
 mod common;
 mod inspector_lifecycle;
 mod line_waiter;

@@ -26,6 +26,48 @@ macro_rules! impl_output_stream_consumer_api {
     (impl $($impl_header:tt)*) => {
         #[allow(dead_code)]
         impl $($impl_header)* {
+            /// Drives the provided synchronous [`StreamVisitor`](crate::StreamVisitor) over this
+            /// stream and returns a [`Consumer`](crate::Consumer) that owns the spawned task.
+            ///
+            /// All built-in `inspect_*`, `collect_*`, and `wait_for_line` factories construct a
+            /// built-in visitor and call this method internally; reach for `consume_with` when
+            /// the closure-shaped factories don't fit and you need direct access to the
+            /// chunk/gap/EOF lifecycle. The returned [`Consumer`](crate::Consumer)'s
+            /// [`wait`](crate::Consumer::wait) yields whatever the visitor produces from
+            /// [`StreamVisitor::into_output`](crate::StreamVisitor::into_output).
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your visitor is never invoked and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
+            pub fn consume_with<V>(&self, visitor: V) -> $crate::Consumer<V::Output>
+            where
+                V: $crate::StreamVisitor,
+            {
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::consumer::consume_with,
+                    visitor,
+                )
+            }
+
+            /// Drives the provided asynchronous [`AsyncStreamVisitor`](crate::AsyncStreamVisitor)
+            /// over this stream and returns a [`Consumer`](crate::Consumer) that owns the spawned
+            /// task.
+            ///
+            /// Use this when observing a chunk requires `.await` (for example, forwarding chunks
+            /// to an async writer or channel). See [`consume_with`](Self::consume_with) for the
+            /// synchronous variant.
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your visitor is never invoked and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
+            pub fn consume_with_async<V>(&self, visitor: V) -> $crate::Consumer<V::Output>
+            where
+                V: $crate::AsyncStreamVisitor,
+            {
+                __consumer_call!(
+                    Direct,
+                    self,
+                    $crate::output_stream::consumer::consumer::consume_with_async,
+                    visitor,
+                )
+            }
+
             /// Inspects chunks of output from the stream without storing them.
             ///
             /// The provided closure is called for each chunk of data. Return
@@ -38,7 +80,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::inspect::inspect_chunks,
+                    $crate::output_stream::consumer::visitors::inspect::inspect_chunks,
                     f,
                 )
             }
@@ -58,7 +100,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::inspect::inspect_chunks_async,
+                    $crate::output_stream::consumer::visitors::inspect::inspect_chunks_async,
                     f,
                 )
             }
@@ -80,7 +122,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::inspect::inspect_lines,
+                    $crate::output_stream::consumer::visitors::inspect::inspect_lines,
                     f,
                     options,
                 )
@@ -106,7 +148,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::inspect::inspect_lines_async,
+                    $crate::output_stream::consumer::visitors::inspect::inspect_lines_async,
                     f,
                     options,
                 )
@@ -115,16 +157,16 @@ macro_rules! impl_output_stream_consumer_api {
             /// Collects chunks from the stream into a sink.
             ///
             /// The provided closure is called for each chunk, with mutable access to the sink.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_chunks<S: $crate::Sink>(
                 &self,
                 into: S,
                 collect: impl FnMut($crate::Chunk, &mut S) + Send + 'static,
-            ) -> $crate::Collector<S> {
+            ) -> $crate::Consumer<S> {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::collect::collect_chunks,
+                    $crate::output_stream::consumer::visitors::collect::collect_chunks,
                     into,
                     collect,
                 )
@@ -133,8 +175,8 @@ macro_rules! impl_output_stream_consumer_api {
             /// Collects chunks from the stream into a sink using an async collector.
             ///
             /// The provided async collector is called for each chunk, with mutable access to the sink.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
-            pub fn collect_chunks_async<S, C>(&self, into: S, collect: C) -> $crate::Collector<S>
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
+            pub fn collect_chunks_async<S, C>(&self, into: S, collect: C) -> $crate::Consumer<S>
             where
                 S: $crate::Sink,
                 C: $crate::AsyncChunkCollector<S>,
@@ -142,7 +184,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::collect::collect_chunks_async,
+                    $crate::output_stream::consumer::visitors::collect::collect_chunks_async,
                     into,
                     collect,
                 )
@@ -156,7 +198,7 @@ macro_rules! impl_output_stream_consumer_api {
             /// # Panics
             ///
             /// Panics if `options.max_line_length` is zero.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_lines<S: $crate::Sink>(
                 &self,
                 into: S,
@@ -164,7 +206,7 @@ macro_rules! impl_output_stream_consumer_api {
                     + Send
                     + 'static,
                 options: $crate::LineParsingOptions,
-            ) -> $crate::Collector<S> {
+            ) -> $crate::Consumer<S> {
                 assert!(
                     options.max_line_length.bytes() > 0,
                     "LineParsingOptions::max_line_length must be greater than zero"
@@ -172,7 +214,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::collect::collect_lines,
+                    $crate::output_stream::consumer::visitors::collect::collect_lines,
                     into,
                     collect,
                     options,
@@ -184,13 +226,13 @@ macro_rules! impl_output_stream_consumer_api {
             /// The provided async collector is called for each line, with mutable access to the
             /// sink. Return [`crate::Next::Continue`] to keep processing or
             /// [`crate::Next::Break`] to stop.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_lines_async<S, C>(
                 &self,
                 into: S,
                 collect: C,
                 options: $crate::LineParsingOptions,
-            ) -> $crate::Collector<S>
+            ) -> $crate::Consumer<S>
             where
                 S: $crate::Sink,
                 C: $crate::AsyncLineCollector<S>,
@@ -198,7 +240,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::collect::collect_lines_async,
+                    $crate::output_stream::consumer::visitors::collect::collect_lines_async,
                     into,
                     collect,
                     options,
@@ -206,15 +248,15 @@ macro_rules! impl_output_stream_consumer_api {
             }
 
             /// Convenience method to collect chunks into a bounded byte vector.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_chunks_into_vec(
                 &self,
                 options: $crate::RawCollectionOptions,
-            ) -> $crate::Collector<$crate::CollectedBytes> {
+            ) -> $crate::Consumer<$crate::CollectedBytes> {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::collect::collect_chunks_into_vec,
+                    $crate::output_stream::consumer::visitors::collect::collect_chunks_into_vec,
                     options,
                 )
             }
@@ -227,16 +269,16 @@ macro_rules! impl_output_stream_consumer_api {
             /// # Panics
             ///
             /// Panics if `parsing_options.max_line_length` is zero and bounded collection is used.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_lines_into_vec(
                 &self,
                 parsing_options: $crate::LineParsingOptions,
                 collection_options: $crate::LineCollectionOptions,
-            ) -> $crate::Collector<$crate::CollectedLines> {
+            ) -> $crate::Consumer<$crate::CollectedLines> {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::collect::collect_lines_into_vec,
+                    $crate::output_stream::consumer::visitors::collect::collect_lines_into_vec,
                     parsing_options,
                     collection_options,
                 )
@@ -246,17 +288,17 @@ macro_rules! impl_output_stream_consumer_api {
             ///
             /// Sink write failures are handled according to `write_options`. Use
             /// [`crate::WriteCollectionOptions::fail_fast`] to stop collection and return
-            /// [`crate::CollectorError::SinkWrite`] from [`crate::Collector::wait`] or
-            /// [`crate::Collector::cancel`], [`crate::WriteCollectionOptions::log_and_continue`]
+            /// [`crate::ConsumerError::SinkWrite`] from [`crate::Consumer::wait`] or
+            /// [`crate::Consumer::cancel`], [`crate::WriteCollectionOptions::log_and_continue`]
             /// to log each failure and keep collecting, or
             /// [`crate::WriteCollectionOptions::with_error_handler`] to make a per-error
             /// continue-or-stop decision.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_chunks_into_write<W, H>(
                 &self,
                 write: W,
                 write_options: $crate::WriteCollectionOptions<H>,
-            ) -> $crate::Collector<W>
+            ) -> $crate::Consumer<W>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 H: $crate::SinkWriteErrorHandler,
@@ -264,7 +306,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::write::collect_chunks_into_write,
+                    $crate::output_stream::consumer::visitors::write::collect_chunks_into_write,
                     write,
                     write_options,
                 )
@@ -277,19 +319,19 @@ macro_rules! impl_output_stream_consumer_api {
             ///
             /// Sink write failures are handled according to `write_options`. Use
             /// [`crate::WriteCollectionOptions::fail_fast`] to stop collection and return
-            /// [`crate::CollectorError::SinkWrite`] from [`crate::Collector::wait`] or
-            /// [`crate::Collector::cancel`], [`crate::WriteCollectionOptions::log_and_continue`]
+            /// [`crate::ConsumerError::SinkWrite`] from [`crate::Consumer::wait`] or
+            /// [`crate::Consumer::cancel`], [`crate::WriteCollectionOptions::log_and_continue`]
             /// to log each failure and keep collecting, or
             /// [`crate::WriteCollectionOptions::with_error_handler`] to make a per-error
             /// continue-or-stop decision.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_lines_into_write<W, H>(
                 &self,
                 write: W,
                 options: $crate::LineParsingOptions,
                 mode: $crate::LineWriteMode,
                 write_options: $crate::WriteCollectionOptions<H>,
-            ) -> $crate::Collector<W>
+            ) -> $crate::Consumer<W>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 H: $crate::SinkWriteErrorHandler,
@@ -297,7 +339,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::write::collect_lines_into_write,
+                    $crate::output_stream::consumer::visitors::write::collect_lines_into_write,
                     write,
                     options,
                     mode,
@@ -309,18 +351,18 @@ macro_rules! impl_output_stream_consumer_api {
             ///
             /// Sink write failures are handled according to `write_options`. Use
             /// [`crate::WriteCollectionOptions::fail_fast`] to stop collection and return
-            /// [`crate::CollectorError::SinkWrite`] from [`crate::Collector::wait`] or
-            /// [`crate::Collector::cancel`], [`crate::WriteCollectionOptions::log_and_continue`]
+            /// [`crate::ConsumerError::SinkWrite`] from [`crate::Consumer::wait`] or
+            /// [`crate::Consumer::cancel`], [`crate::WriteCollectionOptions::log_and_continue`]
             /// to log each failure and keep collecting, or
             /// [`crate::WriteCollectionOptions::with_error_handler`] to make a per-error
             /// continue-or-stop decision.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_chunks_into_write_mapped<W, B, H>(
                 &self,
                 write: W,
-                mapper: impl Fn($crate::Chunk) -> B + Send + Sync + Copy + 'static,
+                mapper: impl Fn($crate::Chunk) -> B + Send + Sync + 'static,
                 write_options: $crate::WriteCollectionOptions<H>,
-            ) -> $crate::Collector<W>
+            ) -> $crate::Consumer<W>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 B: AsRef<[u8]> + Send + 'static,
@@ -329,7 +371,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::write::collect_chunks_into_write_mapped,
+                    $crate::output_stream::consumer::visitors::write::collect_chunks_into_write_mapped,
                     write,
                     mapper,
                     write_options,
@@ -344,20 +386,20 @@ macro_rules! impl_output_stream_consumer_api {
             ///
             /// Sink write failures are handled according to `write_options`. Use
             /// [`crate::WriteCollectionOptions::fail_fast`] to stop collection and return
-            /// [`crate::CollectorError::SinkWrite`] from [`crate::Collector::wait`] or
-            /// [`crate::Collector::cancel`], [`crate::WriteCollectionOptions::log_and_continue`]
+            /// [`crate::ConsumerError::SinkWrite`] from [`crate::Consumer::wait`] or
+            /// [`crate::Consumer::cancel`], [`crate::WriteCollectionOptions::log_and_continue`]
             /// to log each failure and keep collecting, or
             /// [`crate::WriteCollectionOptions::with_error_handler`] to make a per-error
             /// continue-or-stop decision.
-            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the collector effectively dies immediately. You can safely do a `let _collector = ...` binding to ignore the typical 'unused' warning."]
+            #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
             pub fn collect_lines_into_write_mapped<W, B, H>(
                 &self,
                 write: W,
-                mapper: impl Fn(::std::borrow::Cow<'_, str>) -> B + Send + Sync + Copy + 'static,
+                mapper: impl Fn(::std::borrow::Cow<'_, str>) -> B + Send + Sync + 'static,
                 options: $crate::LineParsingOptions,
                 mode: $crate::LineWriteMode,
                 write_options: $crate::WriteCollectionOptions<H>,
-            ) -> $crate::Collector<W>
+            ) -> $crate::Consumer<W>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 B: AsRef<[u8]> + Send + 'static,
@@ -366,7 +408,7 @@ macro_rules! impl_output_stream_consumer_api {
                 __consumer_call!(
                     Direct,
                     self,
-                    $crate::output_stream::consumer::write::collect_lines_into_write_mapped,
+                    $crate::output_stream::consumer::visitors::write::collect_lines_into_write_mapped,
                     write,
                     mapper,
                     options,
@@ -407,7 +449,7 @@ macro_rules! impl_output_stream_consumer_api {
             ) -> $crate::output_stream::consumer::line_waiter::LineWaiter {
                 let subscription = <Self as $crate::output_stream::Subscribable>::subscribe(self);
                 $crate::output_stream::consumer::line_waiter::LineWaiter::new(
-                    $crate::output_stream::consumer::wait::wait_for_line_bounded(
+                    $crate::output_stream::consumer::visitors::wait::wait_for_line_bounded(
                         subscription,
                         predicate,
                         options,
@@ -423,6 +465,52 @@ macro_rules! impl_fallible_output_stream_consumer_api {
     (impl $($impl_header:tt)*) => {
         #[allow(dead_code)]
         impl $($impl_header)* {
+            /// Tries to drive the provided synchronous [`StreamVisitor`](crate::StreamVisitor)
+            /// over this stream.
+            ///
+            /// See [`consume_with`](Self::consume_with) — wait, that's the infallible variant on
+            /// the other backends. This method has the same role: it returns a
+            /// [`Consumer`](crate::Consumer) that owns the spawned task driving the visitor.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`crate::StreamConsumerError`] if the backend rejects the consumer.
+            pub fn consume_with<V>(
+                &self,
+                visitor: V,
+            ) -> Result<$crate::Consumer<V::Output>, $crate::StreamConsumerError>
+            where
+                V: $crate::StreamVisitor,
+            {
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::consumer::consume_with,
+                    visitor,
+                )
+            }
+
+            /// Tries to drive the provided asynchronous
+            /// [`AsyncStreamVisitor`](crate::AsyncStreamVisitor) over this stream.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`crate::StreamConsumerError`] if the backend rejects the consumer.
+            pub fn consume_with_async<V>(
+                &self,
+                visitor: V,
+            ) -> Result<$crate::Consumer<V::Output>, $crate::StreamConsumerError>
+            where
+                V: $crate::AsyncStreamVisitor,
+            {
+                __consumer_call!(
+                    Fallible,
+                    self,
+                    $crate::output_stream::consumer::consumer::consume_with_async,
+                    visitor,
+                )
+            }
+
             /// Tries to inspect chunks of output from the stream without storing them.
             ///
             /// # Errors
@@ -435,7 +523,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::inspect::inspect_chunks,
+                    $crate::output_stream::consumer::visitors::inspect::inspect_chunks,
                     f,
                 )
             }
@@ -455,7 +543,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::inspect::inspect_chunks_async,
+                    $crate::output_stream::consumer::visitors::inspect::inspect_chunks_async,
                     f,
                 )
             }
@@ -477,7 +565,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::inspect::inspect_lines,
+                    $crate::output_stream::consumer::visitors::inspect::inspect_lines,
                     f,
                     options,
                 )
@@ -503,7 +591,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::inspect::inspect_lines_async,
+                    $crate::output_stream::consumer::visitors::inspect::inspect_lines_async,
                     f,
                     options,
                 )
@@ -518,11 +606,11 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 &self,
                 into: S,
                 collect: impl FnMut($crate::Chunk, &mut S) + Send + 'static,
-            ) -> Result<$crate::Collector<S>, $crate::StreamConsumerError> {
+            ) -> Result<$crate::Consumer<S>, $crate::StreamConsumerError> {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::collect::collect_chunks,
+                    $crate::output_stream::consumer::visitors::collect::collect_chunks,
                     into,
                     collect,
                 )
@@ -537,7 +625,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 &self,
                 into: S,
                 collect: C,
-            ) -> Result<$crate::Collector<S>, $crate::StreamConsumerError>
+            ) -> Result<$crate::Consumer<S>, $crate::StreamConsumerError>
             where
                 S: $crate::Sink,
                 C: $crate::AsyncChunkCollector<S>,
@@ -545,7 +633,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::collect::collect_chunks_async,
+                    $crate::output_stream::consumer::visitors::collect::collect_chunks_async,
                     into,
                     collect,
                 )
@@ -567,7 +655,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                     + Send
                     + 'static,
                 options: $crate::LineParsingOptions,
-            ) -> Result<$crate::Collector<S>, $crate::StreamConsumerError> {
+            ) -> Result<$crate::Consumer<S>, $crate::StreamConsumerError> {
                 assert!(
                     options.max_line_length.bytes() > 0,
                     "LineParsingOptions::max_line_length must be greater than zero"
@@ -575,7 +663,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::collect::collect_lines,
+                    $crate::output_stream::consumer::visitors::collect::collect_lines,
                     into,
                     collect,
                     options,
@@ -592,7 +680,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 into: S,
                 collect: C,
                 options: $crate::LineParsingOptions,
-            ) -> Result<$crate::Collector<S>, $crate::StreamConsumerError>
+            ) -> Result<$crate::Consumer<S>, $crate::StreamConsumerError>
             where
                 S: $crate::Sink,
                 C: $crate::AsyncLineCollector<S>,
@@ -600,7 +688,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::collect::collect_lines_async,
+                    $crate::output_stream::consumer::visitors::collect::collect_lines_async,
                     into,
                     collect,
                     options,
@@ -615,11 +703,11 @@ macro_rules! impl_fallible_output_stream_consumer_api {
             pub fn collect_chunks_into_vec(
                 &self,
                 options: $crate::RawCollectionOptions,
-            ) -> Result<$crate::Collector<$crate::CollectedBytes>, $crate::StreamConsumerError> {
+            ) -> Result<$crate::Consumer<$crate::CollectedBytes>, $crate::StreamConsumerError> {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::collect::collect_chunks_into_vec,
+                    $crate::output_stream::consumer::visitors::collect::collect_chunks_into_vec,
                     options,
                 )
             }
@@ -637,11 +725,11 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 &self,
                 parsing_options: $crate::LineParsingOptions,
                 collection_options: $crate::LineCollectionOptions,
-            ) -> Result<$crate::Collector<$crate::CollectedLines>, $crate::StreamConsumerError> {
+            ) -> Result<$crate::Consumer<$crate::CollectedLines>, $crate::StreamConsumerError> {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::collect::collect_lines_into_vec,
+                    $crate::output_stream::consumer::visitors::collect::collect_lines_into_vec,
                     parsing_options,
                     collection_options,
                 )
@@ -656,7 +744,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 &self,
                 write: W,
                 write_options: $crate::WriteCollectionOptions<H>,
-            ) -> Result<$crate::Collector<W>, $crate::StreamConsumerError>
+            ) -> Result<$crate::Consumer<W>, $crate::StreamConsumerError>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 H: $crate::SinkWriteErrorHandler,
@@ -664,7 +752,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::write::collect_chunks_into_write,
+                    $crate::output_stream::consumer::visitors::write::collect_chunks_into_write,
                     write,
                     write_options,
                 )
@@ -681,7 +769,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 options: $crate::LineParsingOptions,
                 mode: $crate::LineWriteMode,
                 write_options: $crate::WriteCollectionOptions<H>,
-            ) -> Result<$crate::Collector<W>, $crate::StreamConsumerError>
+            ) -> Result<$crate::Consumer<W>, $crate::StreamConsumerError>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 H: $crate::SinkWriteErrorHandler,
@@ -689,7 +777,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::write::collect_lines_into_write,
+                    $crate::output_stream::consumer::visitors::write::collect_lines_into_write,
                     write,
                     options,
                     mode,
@@ -705,9 +793,9 @@ macro_rules! impl_fallible_output_stream_consumer_api {
             pub fn collect_chunks_into_write_mapped<W, B, H>(
                 &self,
                 write: W,
-                mapper: impl Fn($crate::Chunk) -> B + Send + Sync + Copy + 'static,
+                mapper: impl Fn($crate::Chunk) -> B + Send + Sync + 'static,
                 write_options: $crate::WriteCollectionOptions<H>,
-            ) -> Result<$crate::Collector<W>, $crate::StreamConsumerError>
+            ) -> Result<$crate::Consumer<W>, $crate::StreamConsumerError>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 B: AsRef<[u8]> + Send + 'static,
@@ -716,7 +804,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::write::collect_chunks_into_write_mapped,
+                    $crate::output_stream::consumer::visitors::write::collect_chunks_into_write_mapped,
                     write,
                     mapper,
                     write_options,
@@ -731,11 +819,11 @@ macro_rules! impl_fallible_output_stream_consumer_api {
             pub fn collect_lines_into_write_mapped<W, B, H>(
                 &self,
                 write: W,
-                mapper: impl Fn(::std::borrow::Cow<'_, str>) -> B + Send + Sync + Copy + 'static,
+                mapper: impl Fn(::std::borrow::Cow<'_, str>) -> B + Send + Sync + 'static,
                 options: $crate::LineParsingOptions,
                 mode: $crate::LineWriteMode,
                 write_options: $crate::WriteCollectionOptions<H>,
-            ) -> Result<$crate::Collector<W>, $crate::StreamConsumerError>
+            ) -> Result<$crate::Consumer<W>, $crate::StreamConsumerError>
             where
                 W: $crate::Sink + tokio::io::AsyncWriteExt + Unpin,
                 B: AsRef<[u8]> + Send + 'static,
@@ -744,7 +832,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 __consumer_call!(
                     Fallible,
                     self,
-                    $crate::output_stream::consumer::write::collect_lines_into_write_mapped,
+                    $crate::output_stream::consumer::visitors::write::collect_lines_into_write_mapped,
                     write,
                     mapper,
                     options,
@@ -771,7 +859,7 @@ macro_rules! impl_fallible_output_stream_consumer_api {
                 let subscription =
                     <Self as $crate::output_stream::TrySubscribable>::try_subscribe(self)?;
                 Ok($crate::output_stream::consumer::line_waiter::LineWaiter::new(
-                    $crate::output_stream::consumer::wait::wait_for_line_bounded(
+                    $crate::output_stream::consumer::visitors::wait::wait_for_line_bounded(
                         subscription,
                         predicate,
                         options,
@@ -967,6 +1055,91 @@ mod tests {
                 overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
             },
         );
+    }
+
+    /// A custom synchronous visitor that counts chunks and breaks after `limit`.
+    struct CountChunks {
+        seen: usize,
+        limit: usize,
+    }
+
+    impl crate::StreamVisitor for CountChunks {
+        type Output = usize;
+
+        fn on_chunk(&mut self, _chunk: Chunk) -> Next {
+            self.seen += 1;
+            if self.seen >= self.limit {
+                Next::Break
+            } else {
+                Next::Continue
+            }
+        }
+
+        fn into_output(self) -> usize {
+            self.seen
+        }
+    }
+
+    #[tokio::test]
+    async fn consume_with_runs_a_custom_sync_visitor_until_break() {
+        let (stream, tx) = stream_with_sender();
+        let consumer = stream.consume_with(CountChunks { seen: 0, limit: 2 });
+
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"first"))))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"second"))))
+            .await
+            .unwrap();
+        // Third chunk should never be observed because the visitor breaks at 2.
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"third"))))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::Eof).await.unwrap();
+
+        let observed = consumer.wait().await.unwrap();
+        assert_that!(observed).is_equal_to(2);
+    }
+
+    /// A custom async visitor that pushes every chunk to a Vec via .await.
+    struct ForwardChunksAsync {
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    }
+
+    impl crate::AsyncStreamVisitor for ForwardChunksAsync {
+        type Output = ();
+
+        async fn on_chunk(&mut self, chunk: Chunk) -> Next {
+            match self.tx.send(chunk.as_ref().to_vec()).await {
+                Ok(()) => Next::Continue,
+                Err(_) => Next::Break,
+            }
+        }
+
+        fn into_output(self) {}
+    }
+
+    #[tokio::test]
+    async fn consume_with_async_runs_a_custom_async_visitor_to_eof() {
+        let (stream, tx) = stream_with_sender();
+        let (forwarded_tx, mut forwarded_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let consumer = stream.consume_with_async(ForwardChunksAsync { tx: forwarded_tx });
+
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"alpha"))))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::Chunk(Chunk(Bytes::from_static(b"beta"))))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::Eof).await.unwrap();
+
+        consumer.wait().await.unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(bytes) = forwarded_rx.recv().await {
+            forwarded.push(bytes);
+        }
+        assert_that!(forwarded).is_equal_to(vec![b"alpha".to_vec(), b"beta".to_vec()]);
     }
 
     #[tokio::test]

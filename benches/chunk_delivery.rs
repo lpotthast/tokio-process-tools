@@ -8,7 +8,7 @@ use std::time::Duration;
 use support::{BackendKind, DeliveryKind};
 use tokio_process_tools::{
     AsyncChunkCollector, BestEffortDelivery, BroadcastOutputStream, Chunk, CollectedBytes,
-    Collector, Next, NoReplay, RawCollectionOptions, ReliableDelivery,
+    Consumer, Next, NoReplay, RawCollectionOptions, ReliableDelivery,
     SingleSubscriberOutputStream, WriteCollectionOptions,
 };
 
@@ -199,13 +199,13 @@ const CHUNK_BENCH_CASES: [ChunkBenchCase; 16] = [
 ];
 
 trait ChunkBenchStream {
-    fn collect_chunk_stats(&self) -> Collector<support::ChunkStats>;
+    fn collect_chunk_stats(&self) -> Consumer<support::ChunkStats>;
 
-    fn collect_chunk_bytes(&self) -> Collector<CollectedBytes>;
+    fn collect_chunk_bytes(&self) -> Consumer<CollectedBytes>;
 
-    fn collect_chunk_stats_async(&self) -> Collector<support::ChunkStats>;
+    fn collect_chunk_stats_async(&self) -> Consumer<support::ChunkStats>;
 
-    fn write_chunks(&self) -> Collector<support::CountingWrite>;
+    fn write_chunks(&self) -> Consumer<support::CountingWrite>;
 }
 
 struct AsyncChunkStatsCollector;
@@ -222,7 +222,7 @@ where
     D: tokio_process_tools::Delivery,
     R: tokio_process_tools::Replay,
 {
-    fn collect_chunk_stats(&self) -> Collector<support::ChunkStats> {
+    fn collect_chunk_stats(&self) -> Consumer<support::ChunkStats> {
         self.collect_chunks(
             support::ChunkStats::default(),
             |chunk, stats: &mut support::ChunkStats| {
@@ -232,17 +232,17 @@ where
         .expect("single-subscriber benchmark consumer should start")
     }
 
-    fn collect_chunk_bytes(&self) -> Collector<CollectedBytes> {
+    fn collect_chunk_bytes(&self) -> Consumer<CollectedBytes> {
         self.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
             .expect("single-subscriber benchmark consumer should start")
     }
 
-    fn collect_chunk_stats_async(&self) -> Collector<support::ChunkStats> {
+    fn collect_chunk_stats_async(&self) -> Consumer<support::ChunkStats> {
         self.collect_chunks_async(support::ChunkStats::default(), AsyncChunkStatsCollector)
             .expect("single-subscriber benchmark consumer should start")
     }
 
-    fn write_chunks(&self) -> Collector<support::CountingWrite> {
+    fn write_chunks(&self) -> Consumer<support::CountingWrite> {
         self.collect_chunks_into_write(
             support::CountingWrite::default(),
             WriteCollectionOptions::fail_fast(),
@@ -252,7 +252,7 @@ where
 }
 
 impl ChunkBenchStream for BroadcastOutputStream<BestEffortDelivery, NoReplay> {
-    fn collect_chunk_stats(&self) -> Collector<support::ChunkStats> {
+    fn collect_chunk_stats(&self) -> Consumer<support::ChunkStats> {
         self.collect_chunks(
             support::ChunkStats::default(),
             |chunk, stats: &mut support::ChunkStats| {
@@ -261,15 +261,15 @@ impl ChunkBenchStream for BroadcastOutputStream<BestEffortDelivery, NoReplay> {
         )
     }
 
-    fn collect_chunk_bytes(&self) -> Collector<CollectedBytes> {
+    fn collect_chunk_bytes(&self) -> Consumer<CollectedBytes> {
         self.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
     }
 
-    fn collect_chunk_stats_async(&self) -> Collector<support::ChunkStats> {
+    fn collect_chunk_stats_async(&self) -> Consumer<support::ChunkStats> {
         self.collect_chunks_async(support::ChunkStats::default(), AsyncChunkStatsCollector)
     }
 
-    fn write_chunks(&self) -> Collector<support::CountingWrite> {
+    fn write_chunks(&self) -> Consumer<support::CountingWrite> {
         self.collect_chunks_into_write(
             support::CountingWrite::default(),
             WriteCollectionOptions::fail_fast(),
@@ -278,7 +278,7 @@ impl ChunkBenchStream for BroadcastOutputStream<BestEffortDelivery, NoReplay> {
 }
 
 impl ChunkBenchStream for BroadcastOutputStream<ReliableDelivery, NoReplay> {
-    fn collect_chunk_stats(&self) -> Collector<support::ChunkStats> {
+    fn collect_chunk_stats(&self) -> Consumer<support::ChunkStats> {
         self.collect_chunks(
             support::ChunkStats::default(),
             |chunk, stats: &mut support::ChunkStats| {
@@ -287,15 +287,15 @@ impl ChunkBenchStream for BroadcastOutputStream<ReliableDelivery, NoReplay> {
         )
     }
 
-    fn collect_chunk_bytes(&self) -> Collector<CollectedBytes> {
+    fn collect_chunk_bytes(&self) -> Consumer<CollectedBytes> {
         self.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
     }
 
-    fn collect_chunk_stats_async(&self) -> Collector<support::ChunkStats> {
+    fn collect_chunk_stats_async(&self) -> Consumer<support::ChunkStats> {
         self.collect_chunks_async(support::ChunkStats::default(), AsyncChunkStatsCollector)
     }
 
-    fn write_chunks(&self) -> Collector<support::CountingWrite> {
+    fn write_chunks(&self) -> Consumer<support::CountingWrite> {
         self.collect_chunks_into_write(
             support::CountingWrite::default(),
             WriteCollectionOptions::fail_fast(),

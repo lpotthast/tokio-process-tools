@@ -8,7 +8,7 @@ use std::time::Duration;
 use support::{BackendKind, DeliveryKind};
 use tokio_process_tools::{
     AsyncChunkCollector, BestEffortDelivery, BroadcastOutputStream, Chunk, CollectedLines,
-    Collector, LineCollectionOptions, LineParsingOptions, Next, NoReplay, ReliableDelivery,
+    Consumer, LineCollectionOptions, LineParsingOptions, Next, NoReplay, ReliableDelivery,
     ReplayEnabled, SingleSubscriberOutputStream,
 };
 
@@ -219,9 +219,9 @@ const LINE_BENCH_CASES: [LineBenchCase; 8] = [
 ];
 
 trait LineBenchStream {
-    fn collect_line_stats(&self, options: LineParsingOptions) -> Collector<support::LineStats>;
+    fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats>;
 
-    fn collect_line_buffer(&self, options: LineParsingOptions) -> Collector<CollectedLines>;
+    fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines>;
 }
 
 impl<D, R> LineBenchStream for SingleSubscriberOutputStream<D, R>
@@ -229,7 +229,7 @@ where
     D: tokio_process_tools::Delivery,
     R: tokio_process_tools::Replay,
 {
-    fn collect_line_stats(&self, options: LineParsingOptions) -> Collector<support::LineStats> {
+    fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
         self.collect_lines(
             support::LineStats::default(),
             |line, stats: &mut support::LineStats| {
@@ -241,14 +241,14 @@ where
         .expect("single-subscriber benchmark consumer should start")
     }
 
-    fn collect_line_buffer(&self, options: LineParsingOptions) -> Collector<CollectedLines> {
+    fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
         self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
             .expect("single-subscriber benchmark consumer should start")
     }
 }
 
 impl LineBenchStream for BroadcastOutputStream<BestEffortDelivery, NoReplay> {
-    fn collect_line_stats(&self, options: LineParsingOptions) -> Collector<support::LineStats> {
+    fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
         self.collect_lines(
             support::LineStats::default(),
             |line, stats: &mut support::LineStats| {
@@ -259,13 +259,13 @@ impl LineBenchStream for BroadcastOutputStream<BestEffortDelivery, NoReplay> {
         )
     }
 
-    fn collect_line_buffer(&self, options: LineParsingOptions) -> Collector<CollectedLines> {
+    fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
         self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
     }
 }
 
 impl LineBenchStream for BroadcastOutputStream<ReliableDelivery, NoReplay> {
-    fn collect_line_stats(&self, options: LineParsingOptions) -> Collector<support::LineStats> {
+    fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
         self.collect_lines(
             support::LineStats::default(),
             |line, stats: &mut support::LineStats| {
@@ -276,13 +276,13 @@ impl LineBenchStream for BroadcastOutputStream<ReliableDelivery, NoReplay> {
         )
     }
 
-    fn collect_line_buffer(&self, options: LineParsingOptions) -> Collector<CollectedLines> {
+    fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
         self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
     }
 }
 
 impl LineBenchStream for BroadcastOutputStream<BestEffortDelivery, ReplayEnabled> {
-    fn collect_line_stats(&self, options: LineParsingOptions) -> Collector<support::LineStats> {
+    fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
         self.collect_lines(
             support::LineStats::default(),
             |line, stats: &mut support::LineStats| {
@@ -293,13 +293,13 @@ impl LineBenchStream for BroadcastOutputStream<BestEffortDelivery, ReplayEnabled
         )
     }
 
-    fn collect_line_buffer(&self, options: LineParsingOptions) -> Collector<CollectedLines> {
+    fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
         self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
     }
 }
 
 impl LineBenchStream for BroadcastOutputStream<ReliableDelivery, ReplayEnabled> {
-    fn collect_line_stats(&self, options: LineParsingOptions) -> Collector<support::LineStats> {
+    fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
         self.collect_lines(
             support::LineStats::default(),
             |line, stats: &mut support::LineStats| {
@@ -310,7 +310,7 @@ impl LineBenchStream for BroadcastOutputStream<ReliableDelivery, ReplayEnabled> 
         )
     }
 
-    fn collect_line_buffer(&self, options: LineParsingOptions) -> Collector<CollectedLines> {
+    fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
         self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
     }
 }

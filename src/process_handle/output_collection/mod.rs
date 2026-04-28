@@ -16,7 +16,7 @@ use crate::error::{
     WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitWithOutputError,
 };
 use crate::output_stream::TrySubscribable;
-use crate::output_stream::consumer::collect;
+use crate::output_stream::consumer::visitors::collect;
 use crate::process_handle::WaitForCompletionOrTerminateOptions;
 use crate::process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
 use crate::{CollectedBytes, CollectedLines};

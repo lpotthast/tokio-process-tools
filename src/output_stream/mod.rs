@@ -60,7 +60,7 @@ pub trait TrySubscribable: OutputStream {
 
 /// Control flag to indicate whether processing should continue or break.
 ///
-/// Returning `Break` from an `Inspector`/`Collector` will let that instance stop visiting any
+/// Returning `Break` from an `Inspector`/`Consumer` will let that instance stop visiting any
 /// more data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Next {

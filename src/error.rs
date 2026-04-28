@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::CollectorError;
+use crate::ConsumerError;
 
 /// Errors that can occur when terminating a process.
 #[derive(Debug, Error)]
@@ -349,7 +349,7 @@ pub enum WaitWithOutputError {
         process_name: Cow<'static, str>,
         /// The collector error that caused output collection to fail.
         #[source]
-        source: CollectorError,
+        source: ConsumerError,
     },
 
     /// Starting stdout or stderr output collection failed.
