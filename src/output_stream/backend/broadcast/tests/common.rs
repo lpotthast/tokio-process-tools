@@ -239,10 +239,8 @@ impl AsyncWrite for CountingWrite {
     }
 }
 
-pub(super) async fn wait_for_bytes_ingested<D, R>(
-    stream: &BroadcastOutputStream<D, R>,
-    bytes: u64,
-) where
+pub(super) async fn wait_for_bytes_ingested<D, R>(stream: &BroadcastOutputStream<D, R>, bytes: u64)
+where
     D: Delivery,
     R: Replay,
 {

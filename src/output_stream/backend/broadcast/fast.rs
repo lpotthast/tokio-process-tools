@@ -106,8 +106,7 @@ async fn read_chunked_fast<S: AsyncRead + Unpin + Send + 'static>(
         match read.read_buf(&mut buf).await {
             Ok(bytes_read) => {
                 if bytes_read > 0 {
-                    bytes_ingested_tx
-                        .send_modify(|n| *n = n.saturating_add(bytes_read as u64));
+                    bytes_ingested_tx.send_modify(|n| *n = n.saturating_add(bytes_read as u64));
                 }
                 let is_eof = bytes_read == 0;
 
