@@ -36,6 +36,31 @@ async fn timeout_allows_later_collector() {
 }
 
 #[tokio::test]
+async fn subscribes_before_polling() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        best_effort_no_replay_options(),
+    );
+
+    // Construct the waiter first; output written *before* the first poll must still be observed.
+    let waiter = stream
+        .wait_for_line(
+            Duration::from_secs(1),
+            |line| line == "ready",
+            LineParsingOptions::default(),
+        )
+        .unwrap();
+    write_half.write_all(b"ready\n").await.unwrap();
+    drop(write_half);
+
+    assert_that!(waiter.await)
+        .is_ok()
+        .is_equal_to(WaitForLineResult::Matched);
+}
+
+#[tokio::test]
 async fn stream_drop_closes_waiting_line_waiters() {
     let (read_half, _write_half) = tokio::io::duplex(64);
     let stream = SingleSubscriberOutputStream::from_stream(

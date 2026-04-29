@@ -15,11 +15,63 @@ use super::ProcessHandle;
 use crate::error::{
     WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitWithOutputError,
 };
-use crate::output_stream::TrySubscribable;
-use crate::output_stream::consumer::visitors::collect;
+use crate::output_stream::consumer::consumer::{Consumer, spawn_consumer_sync};
+use crate::output_stream::consumer::visitors::collect::{CollectChunks, CollectLines};
+use crate::output_stream::event::Chunk;
+use crate::output_stream::line::{LineParserState, LineParsingOptions};
+use crate::output_stream::{Next, Subscription, TrySubscribable};
 use crate::process_handle::WaitForCompletionOrTerminateOptions;
 use crate::process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
-use crate::{CollectedBytes, CollectedLines};
+use crate::{CollectedBytes, CollectedLines, LineCollectionOptions, RawCollectionOptions};
+use std::borrow::Cow;
+
+/// Spawn a consumer that collects line output into a [`CollectedLines`] sink. Used by the
+/// generic `wait_for_completion_with_*output*` paths that take a `TrySubscribable` and can't
+/// call backend-specific methods.
+fn spawn_lines_into_vec_consumer<S>(
+    stream_name: &'static str,
+    subscription: S,
+    parsing_options: LineParsingOptions,
+    collection_options: LineCollectionOptions,
+) -> Consumer<CollectedLines>
+where
+    S: Subscription,
+{
+    spawn_consumer_sync(
+        stream_name,
+        subscription,
+        CollectLines::builder()
+            .parser(LineParserState::new())
+            .options(parsing_options)
+            .sink(CollectedLines::new())
+            .f(move |line: Cow<'_, str>, sink: &mut CollectedLines| {
+                sink.push_line(line.into_owned(), collection_options);
+                Next::Continue
+            })
+            .build(),
+    )
+}
+
+/// Spawn a consumer that collects raw byte output into a [`CollectedBytes`] sink.
+fn spawn_chunks_into_vec_consumer<S>(
+    stream_name: &'static str,
+    subscription: S,
+    options: RawCollectionOptions,
+) -> Consumer<CollectedBytes>
+where
+    S: Subscription,
+{
+    spawn_consumer_sync(
+        stream_name,
+        subscription,
+        CollectChunks::builder()
+            .sink(CollectedBytes::new())
+            .f(move |chunk: Chunk, sink: &mut CollectedBytes| {
+                sink.push_chunk(chunk.as_ref(), options);
+            })
+            .build(),
+    )
+}
 
 impl<Stdout, Stderr> ProcessHandle<Stdout, Stderr>
 where
@@ -57,7 +109,7 @@ where
                 source,
             }
         })?;
-        let out_collector = collect::collect_lines_into_vec(
+        let out_collector = spawn_lines_into_vec_consumer(
             stdout.name(),
             out_subscription,
             line_parsing_options,
@@ -74,7 +126,7 @@ where
                 });
             }
         };
-        let err_collector = collect::collect_lines_into_vec(
+        let err_collector = spawn_lines_into_vec_consumer(
             stderr.name(),
             err_subscription,
             line_parsing_options,
@@ -119,7 +171,7 @@ where
                 source,
             }
         })?;
-        let out_collector = collect::collect_chunks_into_vec(
+        let out_collector = spawn_chunks_into_vec_consumer(
             stdout.name(),
             out_subscription,
             stdout_collection_options,
@@ -135,7 +187,7 @@ where
                 });
             }
         };
-        let err_collector = collect::collect_chunks_into_vec(
+        let err_collector = spawn_chunks_into_vec_consumer(
             stderr.name(),
             err_subscription,
             stderr_collection_options,
@@ -186,7 +238,7 @@ where
                 source,
             }
         })?;
-        let out_collector = collect::collect_lines_into_vec(
+        let out_collector = spawn_lines_into_vec_consumer(
             stdout.name(),
             out_subscription,
             line_parsing_options,
@@ -203,7 +255,7 @@ where
                 });
             }
         };
-        let err_collector = collect::collect_lines_into_vec(
+        let err_collector = spawn_lines_into_vec_consumer(
             stderr.name(),
             err_subscription,
             line_parsing_options,
@@ -260,7 +312,7 @@ where
                 source,
             }
         })?;
-        let out_collector = collect::collect_chunks_into_vec(
+        let out_collector = spawn_chunks_into_vec_consumer(
             stdout.name(),
             out_subscription,
             stdout_collection_options,
@@ -276,7 +328,7 @@ where
                 });
             }
         };
-        let err_collector = collect::collect_chunks_into_vec(
+        let err_collector = spawn_chunks_into_vec_consumer(
             stderr.name(),
             err_subscription,
             stderr_collection_options,

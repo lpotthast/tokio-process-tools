@@ -5,9 +5,10 @@ use crate::{
 };
 
 mod active_consumer;
-mod consumer_lifecycle;
 mod common;
-mod inspector_lifecycle;
+mod consume_with;
+mod consumer_lifecycle;
+mod consumer_unit_lifecycle;
 mod line_waiter;
 mod reader_backpressure;
 mod reader_chunking;

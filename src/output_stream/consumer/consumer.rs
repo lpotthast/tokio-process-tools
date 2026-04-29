@@ -1,14 +1,21 @@
 use super::visitor::{AsyncStreamVisitor, StreamVisitor, consume_async, consume_sync};
 use crate::StreamReadError;
 use crate::output_stream::Subscription;
-use std::io;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
-/// Errors that can occur while a [`Consumer`] is driving its stream.
+/// Errors that the [`Consumer`] infrastructure itself can raise while driving its stream.
+///
+/// These describe failures of the consumer task — joining, or reading the underlying stream.
+/// Visitor-specific failures (for example, a write-backed visitor's sink rejecting bytes) live
+/// in the visitor's own [`StreamVisitor::Output`](crate::StreamVisitor::Output) /
+/// [`AsyncStreamVisitor::Output`](crate::AsyncStreamVisitor::Output) type, not here. So a
+/// writer-backed consumer's `wait` returns
+/// `Result<Result<W, SinkWriteError>, ConsumerError>`: the outer result is what `ConsumerError`
+/// describes, the inner is the writer visitor's own outcome.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConsumerError {
@@ -30,29 +37,6 @@ pub enum ConsumerError {
         #[source]
         source: StreamReadError,
     },
-
-    /// The sink rejected output written by a writer-backed consumer.
-    #[error("Failed to write consumed output from stream '{stream_name}' to sink: {source}")]
-    SinkWrite {
-        /// The name of the stream this consumer operates on.
-        stream_name: &'static str,
-
-        /// The source error.
-        #[source]
-        source: io::Error,
-    },
-}
-
-#[derive(Debug)]
-pub(crate) enum ConsumerTaskError {
-    StreamRead(StreamReadError),
-    SinkWrite(io::Error),
-}
-
-impl From<StreamReadError> for ConsumerTaskError {
-    fn from(source: StreamReadError) -> Self {
-        Self::StreamRead(source)
-    }
 }
 
 /// A trait for types that can act as sinks for collected stream data.
@@ -92,7 +76,7 @@ pub struct Consumer<S: Sink> {
     /// The name of the stream this consumer operates on.
     pub(crate) stream_name: &'static str,
 
-    pub(crate) task: Option<JoinHandle<Result<S, ConsumerTaskError>>>,
+    pub(crate) task: Option<JoinHandle<Result<S, StreamReadError>>>,
     pub(crate) task_termination_sender: Option<Sender<()>>,
 }
 
@@ -109,7 +93,7 @@ pub(crate) struct ConsumerWait<S: Sink> {
 /// `wait` cancellation safe by signalling termination and aborting the task if the wait future is
 /// dropped early.
 struct ConsumerWaitGuard<S: Sink> {
-    task: Option<JoinHandle<Result<S, ConsumerTaskError>>>,
+    task: Option<JoinHandle<Result<S, StreamReadError>>>,
     task_termination_sender: Option<Sender<()>>,
 }
 
@@ -132,13 +116,7 @@ impl<S: Sink> ConsumerWaitGuard<S> {
                 stream_name,
                 source: err,
             })?
-            .map_err(|err| match err {
-                ConsumerTaskError::StreamRead(source) => ConsumerError::StreamRead { source },
-                ConsumerTaskError::SinkWrite(source) => ConsumerError::SinkWrite {
-                    stream_name,
-                    source,
-                },
-            });
+            .map_err(|source| ConsumerError::StreamRead { source });
 
         self.task = None;
         self.task_termination_sender = None;
@@ -242,10 +220,10 @@ impl<S: Sink> Consumer<S> {
     ///
     /// # Errors
     ///
-    /// Returns [`ConsumerError::TaskJoin`] if the consumer task cannot be joined,
-    /// [`ConsumerError::StreamRead`] if the underlying stream fails while being read, or
-    /// [`ConsumerError::SinkWrite`] if a writer-backed consumer stops after a sink write
-    /// failure.
+    /// Returns [`ConsumerError::TaskJoin`] if the consumer task cannot be joined, or
+    /// [`ConsumerError::StreamRead`] if the underlying stream fails while being read.
+    /// Visitor-specific outcomes (e.g. a writer-backed visitor's sink failure) appear inside
+    /// the returned `S`, not in [`ConsumerError`].
     ///
     /// # Panics
     ///
@@ -267,10 +245,9 @@ impl<S: Sink> Consumer<S> {
     ///
     /// # Errors
     ///
-    /// Returns [`ConsumerError::TaskJoin`] if the consumer task cannot be joined,
+    /// Returns [`ConsumerError::TaskJoin`] if the consumer task cannot be joined, or
     /// [`ConsumerError::StreamRead`] if the underlying stream fails while being read before the
-    /// cancellation is observed, or [`ConsumerError::SinkWrite`] if a writer-backed consumer
-    /// stops after a sink write failure before cancellation is observed.
+    /// cancellation is observed. Visitor-specific outcomes appear inside the returned `S`.
     ///
     /// # Panics
     ///
@@ -308,9 +285,9 @@ impl<S: Sink> Consumer<S> {
     /// # Errors
     ///
     /// Returns [`ConsumerError::TaskJoin`] if the consumer task cannot be joined before the
-    /// timeout, [`ConsumerError::StreamRead`] if the underlying stream fails while being read
-    /// before cancellation is observed, or [`ConsumerError::SinkWrite`] if a writer-backed
-    /// consumer stops after a sink write failure before cancellation is observed.
+    /// timeout, or [`ConsumerError::StreamRead`] if the underlying stream fails while being read
+    /// before cancellation is observed. Visitor-specific outcomes appear inside the returned
+    /// `S` (carried by [`ConsumerCancelOutcome::Cancelled`]).
     ///
     /// # Panics
     ///
@@ -372,7 +349,7 @@ impl<S: Sink> Drop for Consumer<S> {
     }
 }
 
-pub(crate) fn consume_with<S, V>(
+pub(crate) fn spawn_consumer_sync<S, V>(
     stream_name: &'static str,
     subscription: S,
     visitor: V,
@@ -385,14 +362,12 @@ where
     let driver = consume_sync(subscription, visitor, term_sig_rx);
     Consumer {
         stream_name,
-        task: Some(tokio::spawn(
-            async move { driver.await.map_err(Into::into) },
-        )),
+        task: Some(tokio::spawn(driver)),
         task_termination_sender: Some(term_sig_tx),
     }
 }
 
-pub(crate) fn consume_with_async<S, V>(
+pub(crate) fn spawn_consumer_async<S, V>(
     stream_name: &'static str,
     subscription: S,
     visitor: V,
@@ -405,9 +380,7 @@ where
     let driver = consume_async(subscription, visitor, term_sig_rx);
     Consumer {
         stream_name,
-        task: Some(tokio::spawn(
-            async move { driver.await.map_err(Into::into) },
-        )),
+        task: Some(tokio::spawn(driver)),
         task_termination_sender: Some(term_sig_tx),
     }
 }

@@ -52,7 +52,7 @@ async fn block_until_subscribers_catch_up_gated_multi_subscriber_collection_comp
     let result = tokio::time::timeout(Duration::from_secs(1), async {
         let mut bytes_written = 0;
         for collector in collectors {
-            bytes_written += collector.wait().await.unwrap().bytes_written;
+            bytes_written += collector.wait().await.unwrap().unwrap().bytes_written;
         }
         bytes_written
     })

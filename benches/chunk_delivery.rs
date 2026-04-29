@@ -8,8 +8,8 @@ use std::time::Duration;
 use support::{BackendKind, DeliveryKind};
 use tokio_process_tools::{
     AsyncChunkCollector, BestEffortDelivery, BroadcastOutputStream, Chunk, CollectedBytes,
-    Consumer, Next, NoReplay, RawCollectionOptions, ReliableDelivery,
-    SingleSubscriberOutputStream, WriteCollectionOptions,
+    Consumer, Next, NoReplay, RawCollectionOptions, ReliableDelivery, SingleSubscriberOutputStream,
+    SinkWriteError, WriteCollectionOptions,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +205,7 @@ trait ChunkBenchStream {
 
     fn collect_chunk_stats_async(&self) -> Consumer<support::ChunkStats>;
 
-    fn write_chunks(&self) -> Consumer<support::CountingWrite>;
+    fn write_chunks(&self) -> Consumer<Result<support::CountingWrite, SinkWriteError>>;
 }
 
 struct AsyncChunkStatsCollector;
@@ -242,7 +242,7 @@ where
             .expect("single-subscriber benchmark consumer should start")
     }
 
-    fn write_chunks(&self) -> Consumer<support::CountingWrite> {
+    fn write_chunks(&self) -> Consumer<Result<support::CountingWrite, SinkWriteError>> {
         self.collect_chunks_into_write(
             support::CountingWrite::default(),
             WriteCollectionOptions::fail_fast(),
@@ -269,7 +269,7 @@ impl ChunkBenchStream for BroadcastOutputStream<BestEffortDelivery, NoReplay> {
         self.collect_chunks_async(support::ChunkStats::default(), AsyncChunkStatsCollector)
     }
 
-    fn write_chunks(&self) -> Consumer<support::CountingWrite> {
+    fn write_chunks(&self) -> Consumer<Result<support::CountingWrite, SinkWriteError>> {
         self.collect_chunks_into_write(
             support::CountingWrite::default(),
             WriteCollectionOptions::fail_fast(),
@@ -295,7 +295,7 @@ impl ChunkBenchStream for BroadcastOutputStream<ReliableDelivery, NoReplay> {
         self.collect_chunks_async(support::ChunkStats::default(), AsyncChunkStatsCollector)
     }
 
-    fn write_chunks(&self) -> Consumer<support::CountingWrite> {
+    fn write_chunks(&self) -> Consumer<Result<support::CountingWrite, SinkWriteError>> {
         self.collect_chunks_into_write(
             support::CountingWrite::default(),
             WriteCollectionOptions::fail_fast(),
@@ -364,7 +364,7 @@ where
         ChunkConsumerKind::Write => {
             let collector = stream.write_chunks();
             open_gate_after_subscriber_is_polling(gate).await;
-            let sink = collector.wait().await.unwrap();
+            let sink = collector.wait().await.unwrap().unwrap();
             ChunkBenchResult::bytes_only(sink.bytes)
         }
     }

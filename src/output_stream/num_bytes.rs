@@ -10,6 +10,13 @@
 pub struct NumBytes(pub(crate) usize);
 
 impl NumBytes {
+    /// The largest representable byte count (`usize::MAX`).
+    ///
+    /// Use this when an API requires an explicit byte limit but you don't actually want to cap
+    /// it — for example, line-parsing options that require a non-zero `max_line_length` but you
+    /// trust the source to produce reasonable lines.
+    pub const MAX: NumBytes = NumBytes(usize::MAX);
+
     /// Creates a `NumBytes` value of zero.
     #[must_use]
     pub fn zero() -> Self {

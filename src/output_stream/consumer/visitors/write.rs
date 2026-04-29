@@ -1,12 +1,13 @@
-use super::super::consumer::{Consumer, ConsumerTaskError, Sink};
-use super::super::visitor::{AsyncStreamVisitor, consume_async};
+use super::super::consumer::Sink;
+use super::super::visitor::AsyncStreamVisitor;
+use super::inspect::assert_max_line_length_non_zero;
 use crate::output_stream::Next;
-use crate::output_stream::Subscription;
 use crate::output_stream::event::Chunk;
 use crate::output_stream::line::{LineParserState, LineParsingOptions};
 use std::borrow::Cow;
 use std::io;
 use tokio::io::AsyncWriteExt;
+use typed_builder::TypedBuilder;
 
 /// Controls how line-based write helpers delimit successive lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +28,8 @@ pub enum LineWriteMode {
 /// Action to take after an async writer sink rejects collected output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkWriteErrorAction {
-    /// Stop collection and return [`crate::ConsumerError::SinkWrite`] from the collector.
+    /// Stop collection and surface the [`SinkWriteError`] as the consumer's output. The
+    /// writer-backed consumer's `wait` returns `Ok(Err(sink_write_error))` in that case.
     Stop,
 
     /// Accept the individual write failure and keep collecting later stream output.
@@ -94,9 +96,21 @@ impl SinkWriteError {
     pub fn source(&self) -> &io::Error {
         &self.source
     }
+}
 
-    pub(crate) fn into_source(self) -> io::Error {
-        self.source
+impl std::fmt::Display for SinkWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to write consumed output from stream '{}' to sink: {}",
+            self.stream_name, self.source
+        )
+    }
+}
+
+impl std::error::Error for SinkWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -169,22 +183,29 @@ impl<H> WriteCollectionOptions<H> {
     }
 }
 
-pub(crate) struct WriteChunks<W, H, F> {
-    pub stream_name: &'static str,
-    pub writer: W,
-    pub error_handler: H,
-    pub mapper: F,
-    pub error: Option<ConsumerTaskError>,
-}
-
-impl<W, H, F, B> AsyncStreamVisitor for WriteChunks<W, H, F>
+#[derive(TypedBuilder)]
+pub(crate) struct WriteChunks<W, H, F, B>
 where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
     B: AsRef<[u8]> + Send + 'static,
     F: Fn(Chunk) -> B + Send + Sync + 'static,
 {
-    type Output = Result<W, ConsumerTaskError>;
+    pub stream_name: &'static str,
+    pub writer: W,
+    pub error_handler: H,
+    pub mapper: F,
+    pub error: Option<SinkWriteError>,
+}
+
+impl<W, H, F, B> AsyncStreamVisitor for WriteChunks<W, H, F, B>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+    B: AsRef<[u8]> + Send + 'static,
+    F: Fn(Chunk) -> B + Send + Sync + 'static,
+{
+    type Output = Result<W, SinkWriteError>;
 
     async fn on_chunk(&mut self, chunk: Chunk) -> Next {
         let mapped_output = (self.mapper)(chunk);
@@ -214,25 +235,36 @@ where
     }
 }
 
-pub(crate) struct WriteLines<W, H, F> {
-    pub stream_name: &'static str,
-    pub writer: W,
-    pub error_handler: H,
-    pub mapper: F,
-    pub parser: LineParserState,
-    pub options: LineParsingOptions,
-    pub mode: LineWriteMode,
-    pub error: Option<ConsumerTaskError>,
-}
-
-impl<W, H, F, B> AsyncStreamVisitor for WriteLines<W, H, F>
+#[derive(TypedBuilder)]
+pub(crate) struct WriteLines<W, H, F, B>
 where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
     B: AsRef<[u8]> + Send + 'static,
     F: Fn(Cow<'_, str>) -> B + Send + Sync + 'static,
 {
-    type Output = Result<W, ConsumerTaskError>;
+    pub stream_name: &'static str,
+    pub writer: W,
+    pub error_handler: H,
+    pub mapper: F,
+    pub parser: LineParserState,
+    #[builder(setter(transform = |options: LineParsingOptions| {
+        assert_max_line_length_non_zero(&options);
+        options
+    }))]
+    pub options: LineParsingOptions,
+    pub mode: LineWriteMode,
+    pub error: Option<SinkWriteError>,
+}
+
+impl<W, H, F, B> AsyncStreamVisitor for WriteLines<W, H, F, B>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+    B: AsRef<[u8]> + Send + 'static,
+    F: Fn(Cow<'_, str>) -> B + Send + Sync + 'static,
+{
+    type Output = Result<W, SinkWriteError>;
 
     async fn on_chunk(&mut self, chunk: Chunk) -> Next {
         let Self {
@@ -292,154 +324,13 @@ where
     }
 }
 
-fn spawn_write_collector<S, W, V>(
-    stream_name: &'static str,
-    subscription: S,
-    visitor: V,
-) -> Consumer<W>
-where
-    S: Subscription,
-    W: Sink,
-    V: AsyncStreamVisitor<Output = Result<W, ConsumerTaskError>>,
-{
-    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = consume_async(subscription, visitor, term_sig_rx);
-    Consumer {
-        stream_name,
-        task: Some(tokio::spawn(async move {
-            driver.await.map_err(ConsumerTaskError::from)?
-        })),
-        task_termination_sender: Some(term_sig_tx),
-    }
-}
-
-fn identity_chunk(chunk: Chunk) -> Chunk {
-    chunk
-}
-
-fn identity_line(line: Cow<'_, str>) -> String {
-    line.into_owned()
-}
-
-pub(crate) fn collect_chunks_into_write<S, W, H>(
-    stream_name: &'static str,
-    subscription: S,
-    write: W,
-    write_options: WriteCollectionOptions<H>,
-) -> Consumer<W>
-where
-    S: Subscription,
-    W: Sink + AsyncWriteExt + Unpin,
-    H: SinkWriteErrorHandler,
-{
-    spawn_write_collector(
-        stream_name,
-        subscription,
-        WriteChunks {
-            stream_name,
-            writer: write,
-            error_handler: write_options.into_error_handler(),
-            mapper: identity_chunk as fn(Chunk) -> Chunk,
-            error: None,
-        },
-    )
-}
-
-pub(crate) fn collect_chunks_into_write_mapped<S, W, B, F, H>(
-    stream_name: &'static str,
-    subscription: S,
-    write: W,
-    mapper: F,
-    write_options: WriteCollectionOptions<H>,
-) -> Consumer<W>
-where
-    S: Subscription,
-    W: Sink + AsyncWriteExt + Unpin,
-    B: AsRef<[u8]> + Send + 'static,
-    F: Fn(Chunk) -> B + Send + Sync + 'static,
-    H: SinkWriteErrorHandler,
-{
-    spawn_write_collector(
-        stream_name,
-        subscription,
-        WriteChunks {
-            stream_name,
-            writer: write,
-            error_handler: write_options.into_error_handler(),
-            mapper,
-            error: None,
-        },
-    )
-}
-
-pub(crate) fn collect_lines_into_write<S, W, H>(
-    stream_name: &'static str,
-    subscription: S,
-    write: W,
-    options: LineParsingOptions,
-    mode: LineWriteMode,
-    write_options: WriteCollectionOptions<H>,
-) -> Consumer<W>
-where
-    S: Subscription,
-    W: Sink + AsyncWriteExt + Unpin,
-    H: SinkWriteErrorHandler,
-{
-    spawn_write_collector(
-        stream_name,
-        subscription,
-        WriteLines {
-            stream_name,
-            writer: write,
-            error_handler: write_options.into_error_handler(),
-            mapper: identity_line as fn(Cow<'_, str>) -> String,
-            parser: LineParserState::new(),
-            options,
-            mode,
-            error: None,
-        },
-    )
-}
-
-pub(crate) fn collect_lines_into_write_mapped<S, W, B, F, H>(
-    stream_name: &'static str,
-    subscription: S,
-    write: W,
-    mapper: F,
-    options: LineParsingOptions,
-    mode: LineWriteMode,
-    write_options: WriteCollectionOptions<H>,
-) -> Consumer<W>
-where
-    S: Subscription,
-    W: Sink + AsyncWriteExt + Unpin,
-    B: AsRef<[u8]> + Send + 'static,
-    F: Fn(Cow<'_, str>) -> B + Send + Sync + 'static,
-    H: SinkWriteErrorHandler,
-{
-    spawn_write_collector(
-        stream_name,
-        subscription,
-        WriteLines {
-            stream_name,
-            writer: write,
-            error_handler: write_options.into_error_handler(),
-            mapper,
-            parser: LineParserState::new(),
-            options,
-            mode,
-            error: None,
-        },
-    )
-}
-
 async fn write_line<W, H>(
     stream_name: &'static str,
     write: &mut W,
     error_handler: &mut H,
     line: &[u8],
     mode: LineWriteMode,
-) -> Result<(), ConsumerTaskError>
+) -> Result<(), SinkWriteError>
 where
     W: AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
@@ -473,7 +364,7 @@ fn handle_write_result<H>(
     operation: SinkWriteOperation,
     attempted_len: usize,
     result: io::Result<()>,
-) -> Result<bool, ConsumerTaskError>
+) -> Result<bool, SinkWriteError>
 where
     H: SinkWriteErrorHandler,
 {
@@ -482,9 +373,7 @@ where
         Err(source) => {
             let error = SinkWriteError::new(stream_name, operation, attempted_len, source);
             match error_handler.handle(&error) {
-                SinkWriteErrorAction::Stop => {
-                    Err(ConsumerTaskError::SinkWrite(error.into_source()))
-                }
+                SinkWriteErrorAction::Stop => Err(error),
                 SinkWriteErrorAction::Continue => Ok(false),
             }
         }
@@ -493,9 +382,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::consumer::{Consumer, spawn_consumer_async};
     use super::super::super::test_support::event_receiver;
     use super::*;
-    use crate::ConsumerError;
+    use crate::output_stream::Subscription;
     use crate::output_stream::event::StreamEvent;
     use assertr::prelude::*;
     use bytes::Bytes;
@@ -505,6 +395,121 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::io::AsyncWrite;
+
+    // Test-only helpers replacing the deleted factory functions. They build the visitor via
+    // the typed builder and spawn a consumer task — the same shape every test wants without
+    // each test repeating the builder boilerplate.
+    fn collect_chunks_into_write<S, W, H>(
+        stream_name: &'static str,
+        subscription: S,
+        write: W,
+        write_options: WriteCollectionOptions<H>,
+    ) -> Consumer<Result<W, SinkWriteError>>
+    where
+        S: Subscription,
+        W: Sink + AsyncWriteExt + Unpin,
+        H: SinkWriteErrorHandler,
+    {
+        spawn_consumer_async(
+            stream_name,
+            subscription,
+            WriteChunks::builder()
+                .stream_name(stream_name)
+                .writer(write)
+                .error_handler(write_options.into_error_handler())
+                .mapper((|chunk: Chunk| chunk) as fn(Chunk) -> Chunk)
+                .error(None)
+                .build(),
+        )
+    }
+
+    fn collect_chunks_into_write_mapped<S, W, B, F, H>(
+        stream_name: &'static str,
+        subscription: S,
+        write: W,
+        mapper: F,
+        write_options: WriteCollectionOptions<H>,
+    ) -> Consumer<Result<W, SinkWriteError>>
+    where
+        S: Subscription,
+        W: Sink + AsyncWriteExt + Unpin,
+        B: AsRef<[u8]> + Send + 'static,
+        F: Fn(Chunk) -> B + Send + Sync + 'static,
+        H: SinkWriteErrorHandler,
+    {
+        spawn_consumer_async(
+            stream_name,
+            subscription,
+            WriteChunks::builder()
+                .stream_name(stream_name)
+                .writer(write)
+                .error_handler(write_options.into_error_handler())
+                .mapper(mapper)
+                .error(None)
+                .build(),
+        )
+    }
+
+    fn collect_lines_into_write<S, W, H>(
+        stream_name: &'static str,
+        subscription: S,
+        write: W,
+        options: LineParsingOptions,
+        mode: LineWriteMode,
+        write_options: WriteCollectionOptions<H>,
+    ) -> Consumer<Result<W, SinkWriteError>>
+    where
+        S: Subscription,
+        W: Sink + AsyncWriteExt + Unpin,
+        H: SinkWriteErrorHandler,
+    {
+        spawn_consumer_async(
+            stream_name,
+            subscription,
+            WriteLines::builder()
+                .stream_name(stream_name)
+                .writer(write)
+                .error_handler(write_options.into_error_handler())
+                .mapper((|line: Cow<'_, str>| line.into_owned()) as fn(Cow<'_, str>) -> String)
+                .parser(LineParserState::new())
+                .options(options)
+                .mode(mode)
+                .error(None)
+                .build(),
+        )
+    }
+
+    fn collect_lines_into_write_mapped<S, W, B, F, H>(
+        stream_name: &'static str,
+        subscription: S,
+        write: W,
+        mapper: F,
+        options: LineParsingOptions,
+        mode: LineWriteMode,
+        write_options: WriteCollectionOptions<H>,
+    ) -> Consumer<Result<W, SinkWriteError>>
+    where
+        S: Subscription,
+        W: Sink + AsyncWriteExt + Unpin,
+        B: AsRef<[u8]> + Send + 'static,
+        F: Fn(Cow<'_, str>) -> B + Send + Sync + 'static,
+        H: SinkWriteErrorHandler,
+    {
+        spawn_consumer_async(
+            stream_name,
+            subscription,
+            WriteLines::builder()
+                .stream_name(stream_name)
+                .writer(write)
+                .error_handler(write_options.into_error_handler())
+                .mapper(mapper)
+                .parser(LineParserState::new())
+                .options(options)
+                .mode(mode)
+                .error(None)
+                .build(),
+        )
+    }
 
     #[derive(Debug)]
     struct FailingWrite {
@@ -592,12 +597,9 @@ mod tests {
         );
 
         match collector.wait().await {
-            Err(ConsumerError::SinkWrite {
-                stream_name,
-                source,
-            }) => {
-                assert_that!(stream_name).is_equal_to("custom");
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
+            Ok(Err(err)) => {
+                assert_that!(err.stream_name()).is_equal_to("custom");
+                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::BrokenPipe);
             }
             other => {
                 assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
@@ -622,7 +624,7 @@ mod tests {
             }),
         );
 
-        let write = collector.wait().await.unwrap();
+        let write = collector.wait().await.unwrap().unwrap();
         assert_that!(write.bytes_written).is_equal_to(0);
         assert_that!(*handled_count.lock().unwrap()).is_equal_to(1);
     }
@@ -644,8 +646,8 @@ mod tests {
         .wait()
         .await;
         match line_error {
-            Err(ConsumerError::SinkWrite { source, .. }) => {
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
+            Ok(Err(err)) => {
+                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::BrokenPipe);
             }
             other => {
                 assert_that!(&other).fail(format_args!("expected line write error, got {other:?}"));
@@ -667,8 +669,8 @@ mod tests {
         .wait()
         .await;
         match delimiter_error {
-            Err(ConsumerError::SinkWrite { source, .. }) => {
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::WriteZero);
+            Ok(Err(err)) => {
+                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::WriteZero);
             }
             other => {
                 assert_that!(&other).fail(format_args!(
@@ -695,7 +697,7 @@ mod tests {
             WriteCollectionOptions::fail_fast(),
         );
 
-        let writer = collector.wait().await.unwrap();
+        let writer = collector.wait().await.unwrap().unwrap();
         assert_that!(writer.bytes).is_equal_to(b"Cargo.lockCargo.tomlREADME.mdsrctarget".to_vec());
     }
 
@@ -713,7 +715,7 @@ mod tests {
             WriteCollectionOptions::fail_fast(),
         );
 
-        let writer = collector.wait().await.unwrap();
+        let writer = collector.wait().await.unwrap().unwrap();
         assert_that!(writer.bytes).is_equal_to(b"abcdef".to_vec());
         assert_that!(writer.write_calls.get()).is_greater_than(0);
     }
@@ -733,7 +735,7 @@ mod tests {
             WriteCollectionOptions::fail_fast(),
         );
 
-        let writer = collector.wait().await.unwrap();
+        let writer = collector.wait().await.unwrap().unwrap();
         assert_that!(writer.bytes).is_equal_to(b"Cargo.lock\nCargo.toml\n".to_vec());
     }
 
@@ -753,8 +755,8 @@ mod tests {
         .wait()
         .await;
         match chunk_error {
-            Err(ConsumerError::SinkWrite { source, .. }) => {
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::ConnectionReset);
+            Ok(Err(err)) => {
+                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::ConnectionReset);
             }
             other => {
                 assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
@@ -777,8 +779,8 @@ mod tests {
         .wait()
         .await;
         match line_error {
-            Err(ConsumerError::SinkWrite { source, .. }) => {
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
+            Ok(Err(err)) => {
+                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::BrokenPipe);
             }
             other => {
                 assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
@@ -811,7 +813,7 @@ mod tests {
             }),
         );
 
-        let write = collector.wait().await.unwrap();
+        let write = collector.wait().await.unwrap().unwrap();
         assert_that!(write.bytes_written).is_equal_to(0);
         assert_that!(events.lock().unwrap().as_slice()).is_equal_to([
             (
@@ -855,8 +857,8 @@ mod tests {
         );
 
         match collector.wait().await {
-            Err(ConsumerError::SinkWrite { source, .. }) => {
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
+            Ok(Err(err)) => {
+                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::BrokenPipe);
             }
             other => {
                 assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));

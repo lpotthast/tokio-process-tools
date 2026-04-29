@@ -2,8 +2,6 @@
 //! [`StreamVisitor`](self::visitor::StreamVisitor) abstraction and built-in visitors that
 //! drive output stream events.
 
-#[macro_use]
-pub(crate) mod api;
 #[allow(clippy::module_inception)]
 pub(crate) mod consumer;
 pub(crate) mod line_waiter;

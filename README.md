@@ -445,9 +445,11 @@ async fn main() {
         .unwrap()
         .expect_completed("process should complete");
 
-    // Stream is closed now that the child has exited; the collector drains and
-    // returns the file handle so we can flush/close it explicitly.
-    let _log_file = log_collector.wait().await.unwrap();
+    // Stream is closed now that the child has exited; the collector drains. The outer
+    // `Result` reflects consumer-infrastructure outcomes (task join, stream read), the
+    // inner one reflects whether the writer accepted every byte; with
+    // `log_and_continue()` write failures are logged so the inner result is `Ok` here.
+    let _log_file = log_collector.wait().await.unwrap().unwrap();
 }
 ```
 
@@ -548,14 +550,14 @@ directly:
   whether parsed lines get the stripped trailing `\n` reattached. See
   [Stream output to a sink](#stream-output-to-a-sink) for an end-to-end example.
 
-Each of these returns a `Consumer` or `Inspector` handle. Unlike the wait helpers,
-nothing else will end them for you — the next subsection is about how to do that.
+Each of these returns a `Consumer` handle. Unlike the wait helpers, nothing else will
+end them for you — the next subsection is about how to do that.
 
 ### Background consumer lifecycle
 
-A `Consumer` or `Inspector` exposes four ways to finish, and the choice between them
-is a trade-off between recovering the consumer's state (the writer, the collected
-output) and not getting stuck:
+A `Consumer` exposes four ways to finish, and the choice between them is a trade-off
+between recovering the consumer's state (the writer, the collected output) and not
+getting stuck:
 
 - `wait()` — let the consumer drain naturally. It returns when the stream closes (the
   child exited and any retained replay has been read out) or the callback returned

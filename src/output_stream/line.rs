@@ -33,12 +33,14 @@ pub struct LineParsingOptions {
     /// When reached, further data won't be appended to the current line.
     /// The line will be emitted in its current state.
     ///
-    /// A value of `0` means that "no limit" is imposed.
-    ///
-    /// Only set this to `0` when you absolutely trust the input stream! Remember that an observed
-    /// stream maliciously writing endless amounts of data without ever writing a line break
-    /// would starve this system from ever emitting a line and will lead to an infinite amount of
-    /// memory being allocated to hold the line data, letting this process running out of memory!
+    /// **Must be greater than zero** for any line-consuming visitor (`inspect_lines`,
+    /// `collect_lines`, `wait_for_line`, `collect_lines_into_write`, `collect_lines_into_vec`).
+    /// Constructing such a consumer with `max_line_length = 0` panics. If you want effectively
+    /// unbounded line parsing — i.e. accept arbitrarily long lines from a trusted source —
+    /// pass [`NumBytes::MAX`] explicitly instead of zero. Remember that a malicious or
+    /// misbehaving stream that writes endless data without a line break would otherwise hold
+    /// memory until the process runs out: the explicit `MAX` makes that decision visible at
+    /// the call site.
     ///
     /// Defaults to 16 kilobytes.
     pub max_line_length: NumBytes,

@@ -1,6 +1,6 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::{best_effort_no_replay_options, wait_for_no_active_consumer};
-use crate::{InspectorCancelOutcome, LineParsingOptions, Next, RawCollectionOptions};
+use crate::{ConsumerCancelOutcome, LineParsingOptions, Next, RawCollectionOptions};
 use assertr::prelude::*;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -170,7 +170,7 @@ async fn cancel_or_abort_after_aborts_hanging_callback() {
         .await
         .unwrap();
 
-    assert_that!(outcome).is_equal_to(InspectorCancelOutcome::Aborted);
+    assert_that!(matches!(outcome, ConsumerCancelOutcome::Aborted)).is_true();
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream

@@ -1,6 +1,5 @@
 //! Built-in [`StreamVisitor`](crate::StreamVisitor) and
-//! [`AsyncStreamVisitor`](crate::AsyncStreamVisitor) implementations and the factory functions
-//! that drive them through a [`Consumer`](crate::Consumer).
+//! [`AsyncStreamVisitor`](crate::AsyncStreamVisitor) implementations.
 //!
 //! Each submodule corresponds to one family of visitors:
 //! - [`collect`] retains observed output in a sink (`Vec`, `CollectedBytes`, `CollectedLines`, ...).

@@ -1,12 +1,15 @@
-use super::super::consumer::{Consumer, Sink};
-use super::super::visitor::{AsyncStreamVisitor, StreamVisitor, consume_async, consume_sync};
+use super::super::consumer::Sink;
+use super::super::visitor::{AsyncStreamVisitor, StreamVisitor};
+use super::inspect::assert_max_line_length_non_zero;
+use crate::output_stream::Next;
 use crate::output_stream::event::Chunk;
 use crate::output_stream::line::{LineParserState, LineParsingOptions};
 use crate::output_stream::num_bytes::NumBytes;
-use crate::output_stream::{Next, Subscription};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::ops::Deref;
+use typed_builder::TypedBuilder;
 
 /// Controls which output is retained once a bounded in-memory collection reaches its limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -123,7 +126,7 @@ impl Default for CollectedBytes {
     }
 }
 
-impl std::ops::Deref for CollectedBytes {
+impl Deref for CollectedBytes {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -239,7 +242,7 @@ impl Default for CollectedLines {
     }
 }
 
-impl std::ops::Deref for CollectedLines {
+impl Deref for CollectedLines {
     type Target = VecDeque<String>;
 
     fn deref(&self) -> &Self::Target {
@@ -250,7 +253,7 @@ impl std::ops::Deref for CollectedLines {
 /// An async collector for raw output chunks.
 ///
 /// The collector itself may hold state via `&mut self`, but only the sink `S` is returned from
-/// [`Consumer::wait`] or [`Consumer::cancel`].
+/// [`Consumer::wait`](crate::Consumer::wait) or [`Consumer::cancel`](crate::Consumer::cancel).
 ///
 /// This trait-based API avoids allocating a boxed future for every collected item while still
 /// letting the returned future borrow `chunk` and `sink` across `.await`.
@@ -270,7 +273,7 @@ pub trait AsyncChunkCollector<S: Sink>: Send + 'static {
 /// An async collector for parsed output lines.
 ///
 /// The collector itself may hold state via `&mut self`, but only the sink `S` is returned from
-/// [`Consumer::wait`] or [`Consumer::cancel`].
+/// [`Consumer::wait`](crate::Consumer::wait) or [`Consumer::cancel`](crate::Consumer::cancel).
 ///
 /// This uses a trait rather than `std::ops::AsyncFn` because stable Rust can express the lending
 /// async callback shape, but cannot yet express the `Send` bound required on an `AsyncFn`
@@ -285,7 +288,12 @@ pub trait AsyncLineCollector<S: Sink>: Send + 'static {
     ) -> impl Future<Output = Next> + Send + 'a;
 }
 
-pub(crate) struct CollectChunks<T, F> {
+#[derive(TypedBuilder)]
+pub(crate) struct CollectChunks<T, F>
+where
+    T: Sink,
+    F: FnMut(Chunk, &mut T) + Send + 'static,
+{
     pub sink: T,
     pub f: F,
 }
@@ -307,7 +315,12 @@ where
     }
 }
 
-pub(crate) struct CollectChunksAsync<T, C> {
+#[derive(TypedBuilder)]
+pub(crate) struct CollectChunksAsync<T, C>
+where
+    T: Sink,
+    C: AsyncChunkCollector<T>,
+{
     pub sink: T,
     pub collector: C,
 }
@@ -328,8 +341,17 @@ where
     }
 }
 
-pub(crate) struct CollectLines<T, F> {
+#[derive(TypedBuilder)]
+pub(crate) struct CollectLines<T, F>
+where
+    T: Sink,
+    F: FnMut(Cow<'_, str>, &mut T) -> Next + Send + 'static,
+{
     pub parser: LineParserState,
+    #[builder(setter(transform = |options: LineParsingOptions| {
+        assert_max_line_length_non_zero(&options);
+        options
+    }))]
     pub options: LineParsingOptions,
     pub sink: T,
     pub f: F,
@@ -367,8 +389,17 @@ where
     }
 }
 
-pub(crate) struct CollectLinesAsync<T, C> {
+#[derive(TypedBuilder)]
+pub(crate) struct CollectLinesAsync<T, C>
+where
+    T: Sink,
+    C: AsyncLineCollector<T>,
+{
     pub parser: LineParserState,
+    #[builder(setter(transform = |options: LineParsingOptions| {
+        assert_max_line_length_non_zero(&options);
+        options
+    }))]
     pub options: LineParsingOptions,
     pub sink: T,
     pub collector: C,
@@ -414,174 +445,9 @@ where
     }
 }
 
-pub(crate) fn collect_chunks<S, T, F>(
-    stream_name: &'static str,
-    subscription: S,
-    into: T,
-    collect: F,
-) -> Consumer<T>
-where
-    S: Subscription,
-    T: Sink,
-    F: FnMut(Chunk, &mut T) + Send + 'static,
-{
-    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = consume_sync(
-        subscription,
-        CollectChunks {
-            sink: into,
-            f: collect,
-        },
-        term_sig_rx,
-    );
-    Consumer {
-        stream_name,
-        task: Some(tokio::spawn(
-            async move { driver.await.map_err(Into::into) },
-        )),
-        task_termination_sender: Some(term_sig_tx),
-    }
-}
-
-pub(crate) fn collect_chunks_into_vec<S>(
-    stream_name: &'static str,
-    subscription: S,
-    options: RawCollectionOptions,
-) -> Consumer<CollectedBytes>
-where
-    S: Subscription,
-{
-    collect_chunks(
-        stream_name,
-        subscription,
-        CollectedBytes::new(),
-        move |chunk, collected| {
-            collected.push_chunk(chunk.as_ref(), options);
-        },
-    )
-}
-
-pub(crate) fn collect_chunks_async<S, T, C>(
-    stream_name: &'static str,
-    subscription: S,
-    into: T,
-    collect: C,
-) -> Consumer<T>
-where
-    S: Subscription,
-    T: Sink,
-    C: AsyncChunkCollector<T>,
-{
-    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = consume_async(
-        subscription,
-        CollectChunksAsync {
-            sink: into,
-            collector: collect,
-        },
-        term_sig_rx,
-    );
-    Consumer {
-        stream_name,
-        task: Some(tokio::spawn(
-            async move { driver.await.map_err(Into::into) },
-        )),
-        task_termination_sender: Some(term_sig_tx),
-    }
-}
-
-pub(crate) fn collect_lines<S, T, F>(
-    stream_name: &'static str,
-    subscription: S,
-    into: T,
-    collect: F,
-    options: LineParsingOptions,
-) -> Consumer<T>
-where
-    S: Subscription,
-    T: Sink,
-    F: FnMut(Cow<'_, str>, &mut T) -> Next + Send + 'static,
-{
-    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = consume_sync(
-        subscription,
-        CollectLines {
-            parser: LineParserState::new(),
-            options,
-            sink: into,
-            f: collect,
-        },
-        term_sig_rx,
-    );
-    Consumer {
-        stream_name,
-        task: Some(tokio::spawn(
-            async move { driver.await.map_err(Into::into) },
-        )),
-        task_termination_sender: Some(term_sig_tx),
-    }
-}
-
-pub(crate) fn collect_lines_into_vec<S>(
-    stream_name: &'static str,
-    subscription: S,
-    parsing_options: LineParsingOptions,
-    collection_options: LineCollectionOptions,
-) -> Consumer<CollectedLines>
-where
-    S: Subscription,
-{
-    assert!(
-        parsing_options.max_line_length.bytes() > 0
-            || matches!(collection_options, LineCollectionOptions::TrustedUnbounded),
-        "parsing_options.max_line_length must be greater than zero unless line collection is trusted-unbounded"
-    );
-    collect_lines(
-        stream_name,
-        subscription,
-        CollectedLines::new(),
-        move |line, collected| {
-            collected.push_line(line.into_owned(), collection_options);
-            Next::Continue
-        },
-        parsing_options,
-    )
-}
-
-pub(crate) fn collect_lines_async<S, T, C>(
-    stream_name: &'static str,
-    subscription: S,
-    into: T,
-    collect: C,
-    options: LineParsingOptions,
-) -> Consumer<T>
-where
-    S: Subscription,
-    T: Sink,
-    C: AsyncLineCollector<T>,
-{
-    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = consume_async(
-        subscription,
-        CollectLinesAsync {
-            parser: LineParserState::new(),
-            options,
-            sink: into,
-            collector: collect,
-        },
-        term_sig_rx,
-    );
-    Consumer {
-        stream_name,
-        task: Some(tokio::spawn(
-            async move { driver.await.map_err(Into::into) },
-        )),
-        task_termination_sender: Some(term_sig_tx),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::super::consumer::{spawn_consumer_async, spawn_consumer_sync};
     use super::super::super::test_support::event_receiver;
     use super::*;
     use crate::ConsumerError;
@@ -1070,19 +936,22 @@ mod tests {
     async fn collectors_return_stream_read_error() {
         let error =
             crate::StreamReadError::new("custom", io::Error::from(io::ErrorKind::BrokenPipe));
-        let collector = collect_lines(
+        let collector = spawn_consumer_sync(
             "custom",
             event_receiver(vec![
                 StreamEvent::Chunk(Chunk(Bytes::from_static(b"complete\npartial"))),
                 StreamEvent::ReadError(error),
             ])
             .await,
-            Vec::<String>::new(),
-            |line, lines| {
-                lines.push(line.into_owned());
-                Next::Continue
-            },
-            LineParsingOptions::default(),
+            CollectLines::builder()
+                .parser(LineParserState::new())
+                .options(LineParsingOptions::default())
+                .sink(Vec::<String>::new())
+                .f(|line, lines: &mut Vec<String>| {
+                    lines.push(line.into_owned());
+                    Next::Continue
+                })
+                .build(),
         );
 
         match collector.wait().await {
@@ -1100,7 +969,7 @@ mod tests {
 
     #[tokio::test]
     async fn collectors_skip_gaps_and_keep_final_unterminated_line() {
-        let collector = collect_lines(
+        let collector = spawn_consumer_sync(
             "custom",
             event_receiver(vec![
                 StreamEvent::Chunk(Chunk(Bytes::from_static(b"one\npar"))),
@@ -1109,12 +978,15 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            Vec::<String>::new(),
-            |line, lines| {
-                lines.push(line.into_owned());
-                Next::Continue
-            },
-            LineParsingOptions::default(),
+            CollectLines::builder()
+                .parser(LineParserState::new())
+                .options(LineParsingOptions::default())
+                .sink(Vec::<String>::new())
+                .f(|line, lines: &mut Vec<String>| {
+                    lines.push(line.into_owned());
+                    Next::Continue
+                })
+                .build(),
         );
 
         let lines = collector.wait().await.unwrap();
@@ -1132,7 +1004,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_collector_async_extends_sink_until_eof() {
-        let collector = collect_chunks_async(
+        let collector = spawn_consumer_async(
             "custom",
             event_receiver(vec![
                 StreamEvent::Chunk(Chunk(Bytes::from_static(b"ab"))),
@@ -1141,8 +1013,10 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            Vec::new(),
-            ExtendChunks,
+            CollectChunksAsync::builder()
+                .sink(Vec::new())
+                .collector(ExtendChunks)
+                .build(),
         );
 
         let seen = collector.wait().await.unwrap();
@@ -1152,7 +1026,7 @@ mod tests {
     #[tokio::test]
     async fn chunk_collector_accepts_stateful_callback() {
         let mut chunk_index = 0;
-        let collector = collect_chunks(
+        let collector = spawn_consumer_sync(
             "custom",
             event_receiver(vec![
                 StreamEvent::Chunk(Chunk(Bytes::from_static(b"ab"))),
@@ -1161,11 +1035,15 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            Vec::new(),
-            move |chunk, indexed_chunks| {
-                chunk_index += 1;
-                indexed_chunks.push((chunk_index, chunk.as_ref().to_vec()));
-            },
+            CollectChunks::builder()
+                .sink(Vec::new())
+                .f(
+                    move |chunk: Chunk, indexed_chunks: &mut Vec<(usize, Vec<u8>)>| {
+                        chunk_index += 1;
+                        indexed_chunks.push((chunk_index, chunk.as_ref().to_vec()));
+                    },
+                )
+                .build(),
         );
 
         let indexed_chunks = collector.wait().await.unwrap();
@@ -1179,20 +1057,23 @@ mod tests {
     #[tokio::test]
     async fn line_collector_accepts_stateful_callback() {
         let mut line_index = 0;
-        let collector = collect_lines(
+        let collector = spawn_consumer_sync(
             "custom",
             event_receiver(vec![
                 StreamEvent::Chunk(Chunk(Bytes::from_static(b"alpha\nbeta\ngamma\n"))),
                 StreamEvent::Eof,
             ])
             .await,
-            Vec::new(),
-            move |line, indexed_lines| {
-                line_index += 1;
-                indexed_lines.push(format!("{line_index}:{line}"));
-                Next::Continue
-            },
-            LineParsingOptions::default(),
+            CollectLines::builder()
+                .parser(LineParserState::new())
+                .options(LineParsingOptions::default())
+                .sink(Vec::new())
+                .f(move |line: Cow<'_, str>, indexed_lines: &mut Vec<String>| {
+                    line_index += 1;
+                    indexed_lines.push(format!("{line_index}:{line}"));
+                    Next::Continue
+                })
+                .build(),
         );
 
         let indexed_lines = collector.wait().await.unwrap();
@@ -1219,16 +1100,19 @@ mod tests {
 
     #[tokio::test]
     async fn line_collector_async_break_stops_after_requested_line() {
-        let collector = collect_lines_async(
+        let collector = spawn_consumer_async(
             "custom",
             event_receiver(vec![
                 StreamEvent::Chunk(Chunk(Bytes::from_static(b"start\nbreak\nend\n"))),
                 StreamEvent::Eof,
             ])
             .await,
-            Vec::new(),
-            BreakOnLine,
-            LineParsingOptions::default(),
+            CollectLinesAsync::builder()
+                .parser(LineParserState::new())
+                .options(LineParsingOptions::default())
+                .sink(Vec::new())
+                .collector(BreakOnLine)
+                .build(),
         );
 
         let seen = collector.wait().await.unwrap();

@@ -1,6 +1,5 @@
 //! Process output stream types and helpers.
 
-#[macro_use]
 pub(crate) mod consumer;
 
 /// Output stream backend implementations.
@@ -44,12 +43,6 @@ pub trait OutputStream {
 pub trait Subscription: Send + 'static {
     /// Returns the next stream event, or `None` once the subscription is closed.
     fn next_event(&mut self) -> impl Future<Output = Option<StreamEvent>> + Send + '_;
-}
-
-/// Output stream backend that can create consumer subscriptions.
-pub trait Subscribable: OutputStream {
-    /// Creates a new subscription for a consumer.
-    fn subscribe(&self) -> impl Subscription;
 }
 
 /// Output stream backend that can reject consumer subscriptions.
