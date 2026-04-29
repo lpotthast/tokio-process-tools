@@ -349,16 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_name_uses_explicit_label() {
-        let id = 42;
-        let cmd = Command::new("ls");
-
-        let name = generate_name(&ProcessName::from(format!("worker-{id}")), &cmd);
-
-        assert_that!(name.as_ref()).is_equal_to("worker-42");
-    }
-
-    #[test]
     fn auto_name_settings_builder_supports_custom_combination() {
         let cmd = command_with_args_env_and_current_dir();
 

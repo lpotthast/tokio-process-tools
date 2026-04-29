@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn single_subscriber_process_stream_builder_panics_on_zero_max_buffered_chunks() {
+    fn process_stream_builder_panics_on_zero_max_buffered_chunks() {
         assert_that_panic_by(|| {
             let _config = ProcessStreamBuilder
                 .single_subscriber()
@@ -248,10 +248,7 @@ mod tests {
         })
         .has_type::<String>()
         .is_equal_to("max_buffered_chunks must be greater than zero");
-    }
 
-    #[test]
-    fn broadcast_process_stream_builder_panics_on_zero_max_buffered_chunks() {
         assert_that_panic_by(|| {
             let _config = ProcessStreamBuilder
                 .broadcast()
