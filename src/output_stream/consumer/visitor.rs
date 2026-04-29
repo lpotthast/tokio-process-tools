@@ -63,6 +63,8 @@ pub trait StreamVisitor: Send + 'static {
     ///
     /// The default implementation does nothing. Override it to reset any partial-line buffers or
     /// other accumulated state that would be invalidated by the gap.
+    ///
+    /// Whether gaps can occur depends on the guarantees chosen for the backend.
     fn on_gap(&mut self) {}
 
     /// Invoked exactly once when the stream ends (EOF or write side dropped).
