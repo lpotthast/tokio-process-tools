@@ -623,6 +623,106 @@ mod tests {
         }
     }
 
+    mod discard {
+        use super::*;
+        use crate::OutputStream;
+
+        #[tokio::test]
+        async fn stdout_and_stderr_complete_with_wait_for_completion() {
+            let mut process = Process::new(
+                ScriptedOutput::builder()
+                    .stdout("out\n")
+                    .stderr("err\n")
+                    .build(),
+            )
+            .name(AutoName::program_only())
+            .stdout_and_stderr(ProcessStreamBuilder::discard)
+            .spawn()
+            .expect("Failed to spawn");
+
+            assert_that!(process.stdout().name()).is_equal_to("stdout");
+            assert_that!(process.stderr().name()).is_equal_to("stderr");
+
+            process
+                .wait_for_completion(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .expect_completed("process should complete");
+        }
+
+        #[tokio::test]
+        async fn can_discard_stdout_and_broadcast_stderr() {
+            let mut process = Process::new(
+                ScriptedOutput::builder()
+                    .stdout("out\n")
+                    .stderr("err\n")
+                    .build(),
+            )
+            .name(AutoName::program_only())
+            .stdout(ProcessStreamBuilder::discard)
+            .stderr(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .spawn()
+            .expect("Failed to spawn");
+
+            let collector = process.stderr().collect_lines_into_vec(
+                crate::LineParsingOptions::default(),
+                crate::test_support::line_collection_options(),
+            );
+
+            process
+                .wait_for_completion(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .expect_completed("process should complete");
+
+            let collected = collector.wait().await.unwrap();
+            assert_that!(collected.lines()).contains_exactly(["err"]);
+        }
+
+        #[tokio::test]
+        async fn can_broadcast_stdout_and_discard_stderr() {
+            let mut process = Process::new(
+                ScriptedOutput::builder()
+                    .stdout("out\n")
+                    .stderr("err\n")
+                    .build(),
+            )
+            .name(AutoName::program_only())
+            .stdout(|stream| {
+                stream
+                    .broadcast()
+                    .best_effort_delivery()
+                    .replay_last_bytes(1.megabytes())
+                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            })
+            .stderr(ProcessStreamBuilder::discard)
+            .spawn()
+            .expect("Failed to spawn");
+
+            let collector = process.stdout().collect_lines_into_vec(
+                crate::LineParsingOptions::default(),
+                crate::test_support::line_collection_options(),
+            );
+
+            process
+                .wait_for_completion(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .expect_completed("process should complete");
+
+            let collected = collector.wait().await.unwrap();
+            assert_that!(collected.lines()).contains_exactly(["out"]);
+        }
+    }
+
     mod spawn_errors {
         use super::*;
 

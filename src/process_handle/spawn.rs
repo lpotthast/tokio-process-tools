@@ -10,23 +10,17 @@ use tokio::process::Child;
 const STDOUT_STREAM_NAME: &str = "stdout";
 const STDERR_STREAM_NAME: &str = "stderr";
 
-struct PipedChildIo {
+struct ChildIo {
     stdin: Stdin,
-    stdout: tokio::process::ChildStdout,
-    stderr: tokio::process::ChildStderr,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
 }
 
-fn take_piped_child_io(child: &mut Child) -> PipedChildIo {
-    PipedChildIo {
+fn take_child_io(child: &mut Child) -> ChildIo {
+    ChildIo {
         stdin: child.stdin.take().map_or(Stdin::Closed, Stdin::Open),
-        stdout: child
-            .stdout
-            .take()
-            .expect("Child process stdout wasn't captured"),
-        stderr: child
-            .stderr
-            .take()
-            .expect("Child process stderr wasn't captured"),
+        stdout: child.stdout.take(),
+        stderr: child.stderr.take(),
     }
 }
 
@@ -51,11 +45,15 @@ where
     }
 }
 
-fn prepare_command(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+fn prepare_command(
+    command: &mut tokio::process::Command,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> &mut tokio::process::Command {
     signal::prepare_command_for_signalling(command)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(stdout)
+        .stderr(stderr)
         // ProcessHandle itself performs the last-resort cleanup while its panic-on-drop guard
         // is armed. Keeping Tokio's unconditional kill-on-drop disabled ensures that
         // `must_not_be_terminated()` can really opt out.
@@ -78,7 +76,9 @@ where
         StderrConfig: ProcessStreamConfig<Stderr>,
     {
         let process_name = name.into();
-        prepare_command(&mut cmd)
+        let stdout_stdio = stdout_config.child_stdio();
+        let stderr_stdio = stderr_config.child_stdio();
+        prepare_command(&mut cmd, stdout_stdio, stderr_stdio)
             .spawn()
             .map(|child| {
                 Self::new_from_child_with_stream_configs(
@@ -104,11 +104,11 @@ where
         StdoutConfig: ProcessStreamConfig<Stdout>,
         StderrConfig: ProcessStreamConfig<Stderr>,
     {
-        let PipedChildIo {
+        let ChildIo {
             stdin,
             stdout,
             stderr,
-        } = take_piped_child_io(&mut child);
+        } = take_child_io(&mut child);
 
         let std_out_stream = stdout_config.into_stream(stdout, STDOUT_STREAM_NAME);
         let std_err_stream = stderr_config.into_stream(stderr, STDERR_STREAM_NAME);

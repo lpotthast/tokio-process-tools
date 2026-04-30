@@ -68,8 +68,9 @@ tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
 The interactive-stdin example further down uses `tokio::io::AsyncWriteExt`, which requires the `io-util` Tokio feature
 in your own crate.
 
-The minimum viable spawn: run a command to completion with a deadline and check its exit status. Output is streamed
-through but not retained. Use this when you only care about whether the process succeeded, not what it wrote.
+The minimum viable spawn: run a command to completion with a deadline and check its exit status. `stream.discard()`
+routes the child's stdout and stderr to `/dev/null` at the OS level, so no pipe is allocated and no reader task runs in
+the parent. Use this when you only care about whether the process succeeded, not what it wrote.
 
 ```rust,no_run
 use std::time::Duration;
@@ -80,14 +81,7 @@ use tokio_process_tools::*;
 async fn main() {
     let mut process = Process::new(Command::new("ls"))
         .name(AutoName::program_only())
-        .stdout_and_stderr(|stream| {
-            stream
-                .single_subscriber()
-                .best_effort_delivery()
-                .no_replay()
-                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-        })
+        .stdout_and_stderr(|stream| stream.discard())
         .spawn()
         .expect("failed to spawn command");
 
@@ -100,6 +94,11 @@ async fn main() {
     println!("exit status: {status:?}");
 }
 ```
+
+A discarded stream still implements `OutputStream` (so `process.stdout()` and `process.stderr()` still return
+something), but it does not implement `TrySubscribable`: the consumer-attaching APIs (`wait_for_completion_with_output`,
+`inspect_lines`, `collect_lines`, etc.) are not in scope on a handle whose stream is discarded. If you later decide you
+do want to read the output, swap `discard()` for one of the streaming chains described in the next section.
 
 Code throughout this README uses `use tokio_process_tools::*;` to keep examples short; prefer named imports in
 application code. Byte sizes use the `NumBytes` type, and the `NumBytesExt` trait (re-exported at the crate root) lets
@@ -117,6 +116,11 @@ Each stdout/stderr stream is configured along five axes: backend, delivery, repl
   the stream from one place at a time. It turns accidental fanout into a loud error at the point of mistake. Once a
   consumer is dropped again, a new one can be registered. Just never two at any given time. This implementation may be
   slightly more performant.
+- `discard()`: No consumption at all. The matching child stdio slot is set to `Stdio::null()`, so the OS drops the
+  bytes; no pipe is allocated and no reader task runs in the parent. The remaining axes (delivery, replay, buffering)
+  are skipped because they have nothing to act on. Reach for this when only the exit status matters; pair it with a
+  consumed stream on the other slot if you still want one stream's output (`.stdout(|s| s.discard()).stderr(|s|
+  s.broadcast()...)` is fine).
 
 **Delivery: what happens when a consumer can't keep up?**
 

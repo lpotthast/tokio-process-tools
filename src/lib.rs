@@ -22,6 +22,7 @@ pub use error::{
     WaitOrTerminateError, WaitWithOutputError,
 };
 pub use output_stream::backend::broadcast::BroadcastOutputStream;
+pub use output_stream::backend::discard::DiscardedOutputStream;
 pub use output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
 pub use output_stream::config::{
     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, StreamConfig, StreamConfigBuilder,
@@ -52,7 +53,9 @@ pub use output_stream::visitors::write::{
 pub use output_stream::{Next, OutputStream, Subscription, TrySubscribable};
 pub use process::builder::Process;
 pub use process::name::{AutoName, AutoNameSettings, ProcessName};
-pub use process::stream_config::{ProcessStreamBuilder, ProcessStreamConfig};
+pub use process::stream_config::{
+    DiscardedStreamConfig, ProcessStreamBuilder, ProcessStreamConfig,
+};
 pub use process_handle::WaitForCompletionOrTerminateOptions;
 pub use process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
 pub use process_handle::output_collection::output::ProcessOutput;
