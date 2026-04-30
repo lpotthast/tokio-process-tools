@@ -44,8 +44,8 @@ macro_rules! impl_consumer_factories {
     () => {
         /// Inspects chunks of output from the stream without storing them.
         ///
-        /// The provided closure is called for each chunk of data. Return [`Next::Continue`] to
-        /// keep processing or [`Next::Break`] to stop.
+        /// The provided closure is called for each chunk of data. Return [`Next::Continue`](crate::Next::Continue) to
+        /// keep processing or [`Next::Break`](crate::Next::Break) to stop.
         #[allow(clippy::missing_errors_doc)]
         #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
         pub fn inspect_chunks(
@@ -63,7 +63,7 @@ macro_rules! impl_consumer_factories {
         /// closure.
         ///
         /// The provided async closure is called for each chunk of data. Return
-        /// [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
+        /// [`Next::Continue`](crate::Next::Continue) to keep processing or [`Next::Break`](crate::Next::Break) to stop.
         #[allow(clippy::missing_errors_doc)]
         #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
         pub fn inspect_chunks_async<Fut>(
@@ -82,8 +82,8 @@ macro_rules! impl_consumer_factories {
 
         /// Inspects lines of output from the stream without storing them.
         ///
-        /// The provided closure is called for each line. Return [`Next::Continue`] to keep
-        /// processing or [`Next::Break`] to stop.
+        /// The provided closure is called for each line. Return [`Next::Continue`](crate::Next::Continue) to keep
+        /// processing or [`Next::Break`](crate::Next::Break) to stop.
         ///
         /// # Panics
         ///
@@ -104,8 +104,8 @@ macro_rules! impl_consumer_factories {
         /// Inspects lines of output from the stream without storing them, using an async
         /// closure.
         ///
-        /// The provided async closure is called for each line. Return [`Next::Continue`] to
-        /// keep processing or [`Next::Break`] to stop.
+        /// The provided async closure is called for each line. Return [`Next::Continue`](crate::Next::Continue) to
+        /// keep processing or [`Next::Break`](crate::Next::Break) to stop.
         ///
         /// # Panics
         ///
@@ -172,7 +172,7 @@ macro_rules! impl_consumer_factories {
         /// Collects lines from the stream into a sink.
         ///
         /// The provided closure is called for each line, with mutable access to the sink.
-        /// Return [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
+        /// Return [`Next::Continue`](crate::Next::Continue) to keep processing or [`Next::Break`](crate::Next::Break) to stop.
         ///
         /// # Panics
         ///
@@ -196,7 +196,7 @@ macro_rules! impl_consumer_factories {
         /// Collects lines from the stream into a sink using an async collector.
         ///
         /// The provided async collector is called for each line, with mutable access to the
-        /// sink. Return [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
+        /// sink. Return [`Next::Continue`](crate::Next::Continue) to keep processing or [`Next::Break`](crate::Next::Break) to stop.
         ///
         /// # Panics
         ///
@@ -243,7 +243,7 @@ macro_rules! impl_consumer_factories {
         /// Convenience method to collect lines into a line buffer.
         ///
         /// `parsing_options.max_line_length` must be non-zero unless `collection_options` is
-        /// [`LineCollectionOptions::TrustedUnbounded`].
+        /// [`LineCollectionOptions::TrustedUnbounded`](crate::LineCollectionOptions::TrustedUnbounded).
         ///
         /// # Panics
         ///
@@ -270,10 +270,10 @@ macro_rules! impl_consumer_factories {
         /// Collects chunks into an async writer.
         ///
         /// Sink write failures are handled according to `write_options`. Use
-        /// [`WriteCollectionOptions::fail_fast`] to stop collection and surface the
-        /// [`SinkWriteError`] as the inner `Err` of the resulting `Result<W, SinkWriteError>`,
-        /// [`WriteCollectionOptions::log_and_continue`] to log each failure and keep
-        /// collecting, or [`WriteCollectionOptions::with_error_handler`] to make a per-error
+        /// [`WriteCollectionOptions::fail_fast`](crate::WriteCollectionOptions::fail_fast) to stop collection and surface the
+        /// [`SinkWriteError`](crate::SinkWriteError) as the inner `Err` of the resulting `Result<W, SinkWriteError>`,
+        /// [`WriteCollectionOptions::log_and_continue`](crate::WriteCollectionOptions::log_and_continue) to log each failure and keep
+        /// collecting, or [`WriteCollectionOptions::with_error_handler`](crate::WriteCollectionOptions::with_error_handler) to make a per-error
         /// continue-or-stop decision.
         #[allow(clippy::missing_errors_doc)]
         #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
@@ -364,8 +364,8 @@ macro_rules! impl_consumer_factories {
 
         /// Collects lines into an async writer after mapping them with the provided function.
         ///
-        /// `mode` applies after `mapper`: choose [`LineWriteMode::AsIs`] when the mapped
-        /// output already contains delimiters, or [`LineWriteMode::AppendLf`] to append `\n`
+        /// `mode` applies after `mapper`: choose [`LineWriteMode::AsIs`](crate::LineWriteMode::AsIs) when the mapped
+        /// output already contains delimiters, or [`LineWriteMode::AppendLf`](crate::LineWriteMode::AppendLf) to append `\n`
         /// after each mapped line.
         ///
         /// Sink write failures are handled according to `write_options` — see
