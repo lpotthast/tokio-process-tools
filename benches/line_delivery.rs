@@ -3,13 +3,13 @@
 mod support;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Duration;
 use support::{BackendKind, DeliveryKind};
 use tokio_process_tools::{
-    AsyncChunkCollector, BestEffortDelivery, BroadcastOutputStream, Chunk, CollectedLines,
-    Consumer, LineCollectionOptions, LineParsingOptions, Next, NoReplay, ReliableDelivery,
-    ReplayEnabled, SingleSubscriberOutputStream,
+    AsyncChunkCollector, BroadcastOutputStream, Chunk, CollectedLines, Consumer,
+    LineCollectionOptions, LineParsingOptions, Next, SingleSubscriberOutputStream,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,19 +28,11 @@ impl LineConsumerKind {
 }
 
 #[derive(Clone, Copy)]
-enum LinePayloadKind {
-    Ascii,
-    Utf8,
-}
-
-#[derive(Clone, Copy)]
 struct LinePayloadCase {
     label: &'static str,
-    payload_kind: LinePayloadKind,
     line_len: usize,
     line_count: usize,
     read_chunk_size: usize,
-    purpose: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,22 +40,21 @@ struct LineBenchCase {
     consumer: LineConsumerKind,
     backend: BackendKind,
     delivery: DeliveryKind,
-    purpose: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct LineBenchResult {
     bytes: usize,
     lines: usize,
-    checksum: Option<u64>,
 }
 
 impl LineBenchResult {
     fn from_stats(stats: &support::LineStats) -> Self {
+        // Keep the per-line checksum read alive so the parser cannot elide line content.
+        black_box(stats.checksum);
         Self {
             bytes: stats.bytes,
             lines: stats.lines,
-            checksum: Some(stats.checksum),
         }
     }
 
@@ -71,7 +62,6 @@ impl LineBenchResult {
         Self {
             bytes: lines.iter().map(String::len).sum(),
             lines: lines.len(),
-            checksum: None,
         }
     }
 }
@@ -80,7 +70,6 @@ impl LineBenchResult {
 struct ExpectedLineResult {
     bytes: usize,
     lines: usize,
-    checksum: u64,
 }
 
 impl ExpectedLineResult {
@@ -89,81 +78,50 @@ impl ExpectedLineResult {
         Self {
             bytes: stats.bytes,
             lines: stats.lines,
-            checksum: stats.checksum,
         }
     }
 }
 
-const LINE_COUNT_ONLY_PAYLOADS: [LinePayloadCase; 3] = [
+const LINE_COUNT_ONLY_PAYLOADS: [LinePayloadCase; 2] = [
     LinePayloadCase {
-        label: "short_ascii_256B",
-        payload_kind: LinePayloadKind::Ascii,
+        label: "short_256B",
         line_len: support::SHORT_LINE_LEN,
         line_count: support::SHORT_LINE_COUNT,
         read_chunk_size: support::SHORT_LINE_SMALL_READ_CHUNK_SIZE,
-        purpose: "uses small chunks so per-event backend cost is visible during line parsing",
     },
     LinePayloadCase {
-        label: "short_ascii_16KiB",
-        payload_kind: LinePayloadKind::Ascii,
+        label: "short_16KiB",
         line_len: support::SHORT_LINE_LEN,
         line_count: support::SHORT_LINE_COUNT,
         read_chunk_size: support::SHORT_LINE_LARGE_READ_CHUNK_SIZE,
-        purpose: "keeps a larger-chunk parser baseline with minimal retained allocation",
-    },
-    LinePayloadCase {
-        label: "short_utf8_256B",
-        payload_kind: LinePayloadKind::Utf8,
-        line_len: support::UTF8_SHORT_LINE_LEN,
-        line_count: support::UTF8_SHORT_LINE_COUNT,
-        read_chunk_size: support::UTF8_SHORT_LINE_SMALL_READ_CHUNK_SIZE,
-        purpose: "checks non-ASCII decoding cost without storing emitted lines",
     },
 ];
 
-const LINE_COUNT_ONLY_BEST_EFFORT_PAYLOADS: [LinePayloadCase; 2] = [
-    LinePayloadCase {
-        label: "short_ascii_16KiB",
-        payload_kind: LinePayloadKind::Ascii,
-        line_len: support::SHORT_LINE_LEN,
-        line_count: support::SHORT_LINE_COUNT,
-        read_chunk_size: support::SHORT_LINE_LARGE_READ_CHUNK_SIZE,
-        purpose: "keeps a larger-chunk parser baseline with minimal retained allocation",
-    },
-    LinePayloadCase {
-        label: "short_utf8_16KiB",
-        payload_kind: LinePayloadKind::Utf8,
-        line_len: support::UTF8_SHORT_LINE_LEN,
-        line_count: support::UTF8_SHORT_LINE_COUNT,
-        read_chunk_size: support::UTF8_SHORT_LINE_LARGE_READ_CHUNK_SIZE,
-        purpose: "checks non-ASCII decoding cost without storing emitted lines",
-    },
-];
+const LINE_COUNT_ONLY_BEST_EFFORT_PAYLOADS: [LinePayloadCase; 1] = [LinePayloadCase {
+    label: "short_16KiB",
+    line_len: support::SHORT_LINE_LEN,
+    line_count: support::SHORT_LINE_COUNT,
+    read_chunk_size: support::SHORT_LINE_LARGE_READ_CHUNK_SIZE,
+}];
 
 const LINE_COLLECT_PAYLOADS: [LinePayloadCase; 3] = [
     LinePayloadCase {
-        label: "short_ascii_16KiB",
-        payload_kind: LinePayloadKind::Ascii,
+        label: "short_16KiB",
         line_len: support::SHORT_LINE_LEN,
         line_count: support::SHORT_LINE_COUNT,
         read_chunk_size: support::SHORT_LINE_LARGE_READ_CHUNK_SIZE,
-        purpose: "represents common short-line collection where allocations may dominate",
     },
     LinePayloadCase {
-        label: "long_ascii_16KiB",
-        payload_kind: LinePayloadKind::Ascii,
+        label: "long_16KiB",
         line_len: support::LONG_LINE_LEN,
         line_count: support::LONG_LINE_COUNT,
-        read_chunk_size: support::LONG_LINE_READ_CHUNK_SIZE,
-        purpose: "checks long-line collection with fewer emitted lines but larger strings",
+        read_chunk_size: support::LONG_LINE_SMALL_READ_CHUNK_SIZE,
     },
     LinePayloadCase {
-        label: "long_utf8_64KiB",
-        payload_kind: LinePayloadKind::Utf8,
-        line_len: support::UTF8_LONG_LINE_LEN,
-        line_count: support::UTF8_LONG_LINE_COUNT,
-        read_chunk_size: support::UTF8_LONG_LINE_READ_CHUNK_SIZE,
-        purpose: "keeps the allocation-heavy UTF-8 line collection baseline",
+        label: "long_64KiB",
+        line_len: support::LONG_LINE_LEN,
+        line_count: support::LONG_LINE_COUNT,
+        read_chunk_size: support::LONG_LINE_LARGE_READ_CHUNK_SIZE,
     },
 ];
 
@@ -172,49 +130,41 @@ const LINE_BENCH_CASES: [LineBenchCase; 8] = [
         consumer: LineConsumerKind::CountOnly,
         backend: BackendKind::Single,
         delivery: DeliveryKind::BestEffort,
-        purpose: "isolates single-subscriber best-effort delivery under line parsing",
     },
     LineBenchCase {
         consumer: LineConsumerKind::CountOnly,
         backend: BackendKind::Broadcast,
         delivery: DeliveryKind::BestEffort,
-        purpose: "isolates broadcast fast-path delivery under line parsing",
     },
     LineBenchCase {
         consumer: LineConsumerKind::CountOnly,
         backend: BackendKind::Single,
         delivery: DeliveryKind::Reliable,
-        purpose: "isolates single-subscriber reliable delivery under line parsing",
     },
     LineBenchCase {
         consumer: LineConsumerKind::CountOnly,
         backend: BackendKind::Broadcast,
         delivery: DeliveryKind::Reliable,
-        purpose: "isolates broadcast fanout reliable delivery under line parsing",
     },
     LineBenchCase {
         consumer: LineConsumerKind::CollectVec,
         backend: BackendKind::Single,
         delivery: DeliveryKind::BestEffort,
-        purpose: "checks whether line allocation hides single best-effort delivery cost",
     },
     LineBenchCase {
         consumer: LineConsumerKind::CollectVec,
         backend: BackendKind::Broadcast,
         delivery: DeliveryKind::BestEffort,
-        purpose: "checks whether line allocation hides broadcast fast-path delivery cost",
     },
     LineBenchCase {
         consumer: LineConsumerKind::CollectVec,
         backend: BackendKind::Single,
         delivery: DeliveryKind::Reliable,
-        purpose: "keeps the practical single-subscriber reliable line collection baseline",
     },
     LineBenchCase {
         consumer: LineConsumerKind::CollectVec,
         backend: BackendKind::Broadcast,
         delivery: DeliveryKind::Reliable,
-        purpose: "keeps the practical broadcast reliable line collection baseline",
     },
 ];
 
@@ -247,58 +197,11 @@ where
     }
 }
 
-impl LineBenchStream for BroadcastOutputStream<BestEffortDelivery, NoReplay> {
-    fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
-        self.collect_lines(
-            support::LineStats::default(),
-            |line, stats: &mut support::LineStats| {
-                stats.observe(line.as_ref());
-                Next::Continue
-            },
-            options,
-        )
-    }
-
-    fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
-        self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
-    }
-}
-
-impl LineBenchStream for BroadcastOutputStream<ReliableDelivery, NoReplay> {
-    fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
-        self.collect_lines(
-            support::LineStats::default(),
-            |line, stats: &mut support::LineStats| {
-                stats.observe(line.as_ref());
-                Next::Continue
-            },
-            options,
-        )
-    }
-
-    fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
-        self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
-    }
-}
-
-impl LineBenchStream for BroadcastOutputStream<BestEffortDelivery, ReplayEnabled> {
-    fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
-        self.collect_lines(
-            support::LineStats::default(),
-            |line, stats: &mut support::LineStats| {
-                stats.observe(line.as_ref());
-                Next::Continue
-            },
-            options,
-        )
-    }
-
-    fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
-        self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
-    }
-}
-
-impl LineBenchStream for BroadcastOutputStream<ReliableDelivery, ReplayEnabled> {
+impl<D, R> LineBenchStream for BroadcastOutputStream<D, R>
+where
+    D: tokio_process_tools::Delivery,
+    R: tokio_process_tools::Replay,
+{
     fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
         self.collect_lines(
             support::LineStats::default(),
@@ -396,8 +299,6 @@ fn assert_line_result(case: LineBenchCase, expected: ExpectedLineResult, result:
         "{} delivered an unexpected line count",
         case_id(case),
     );
-
-    black_box((expected.checksum, result.checksum));
 }
 
 fn assert_best_effort_slow_subscriber_result(
@@ -412,26 +313,6 @@ fn assert_best_effort_slow_subscriber_result(
         result.lines <= expected.lines,
         "best-effort slow-subscriber case delivered more lines than the source payload"
     );
-
-    black_box((
-        expected.bytes,
-        expected.lines,
-        expected.checksum,
-        result.bytes,
-        result.lines,
-        result.checksum,
-    ));
-}
-
-fn build_payload(case: LinePayloadCase) -> support::Payload {
-    match case.payload_kind {
-        LinePayloadKind::Ascii => {
-            support::build_line_payload(case.line_len, case.line_count, case.read_chunk_size)
-        }
-        LinePayloadKind::Utf8 => {
-            support::build_utf8_line_payload(case.line_len, case.line_count, case.read_chunk_size)
-        }
-    }
 }
 
 fn payloads_for(case: LineBenchCase) -> &'static [LinePayloadCase] {
@@ -460,19 +341,45 @@ fn bench_line_delivery(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(2));
     let options = LineParsingOptions::default();
 
+    let mut payloads: HashMap<(usize, usize, usize), (support::Payload, ExpectedLineResult)> =
+        HashMap::new();
+    for payload_case in LINE_COUNT_ONLY_PAYLOADS
+        .iter()
+        .chain(LINE_COUNT_ONLY_BEST_EFFORT_PAYLOADS.iter())
+        .chain(LINE_COLLECT_PAYLOADS.iter())
+    {
+        let key = (
+            payload_case.line_len,
+            payload_case.line_count,
+            payload_case.read_chunk_size,
+        );
+        payloads.entry(key).or_insert_with(|| {
+            let payload = support::build_line_payload(
+                payload_case.line_len,
+                payload_case.line_count,
+                payload_case.read_chunk_size,
+            );
+            let expected = ExpectedLineResult::from_payload(&payload);
+            (payload, expected)
+        });
+    }
+
     for case in LINE_BENCH_CASES {
         for payload_case in payloads_for(case) {
-            let payload = build_payload(*payload_case);
-            let expected = ExpectedLineResult::from_payload(&payload);
-            group.throughput(Throughput::Bytes(support::total_bytes(&payload) as u64));
+            let key = (
+                payload_case.line_len,
+                payload_case.line_count,
+                payload_case.read_chunk_size,
+            );
+            let (payload, expected) = payloads.get(&key).expect("payload precomputed");
+            let expected = *expected;
+            group.throughput(Throughput::Bytes(support::total_bytes(payload) as u64));
 
             group.bench_with_input(
                 BenchmarkId::new(case_id(case), payload_case.label),
-                &payload,
+                payload,
                 |b, payload| {
                     b.to_async(&rt).iter(|| async {
-                        black_box(case.purpose);
-                        black_box(payload_case.purpose);
                         let result =
                             run_line_case(case, payload, payload_case.read_chunk_size, options)
                                 .await;
@@ -520,12 +427,12 @@ fn bench_line_delivery_replay(c: &mut Criterion) {
     let options = LineParsingOptions::default();
 
     for read_chunk_size in [
-        support::UTF8_SHORT_LINE_SMALL_READ_CHUNK_SIZE,
-        support::UTF8_SHORT_LINE_LARGE_READ_CHUNK_SIZE,
+        support::SHORT_LINE_SMALL_READ_CHUNK_SIZE,
+        support::SHORT_LINE_LARGE_READ_CHUNK_SIZE,
     ] {
-        let payload = support::build_utf8_line_payload(
-            support::UTF8_SHORT_LINE_LEN,
-            support::UTF8_SHORT_LINE_COUNT,
+        let payload = support::build_line_payload(
+            support::SHORT_LINE_LEN,
+            support::SHORT_LINE_COUNT,
             read_chunk_size,
         );
         let expected = ExpectedLineResult::from_payload(&payload);
@@ -533,7 +440,7 @@ fn bench_line_delivery_replay(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new(
                 "count_only/broadcast/reliable_replay",
-                format!("short_utf8_{read_chunk_size}B"),
+                format!("short_{read_chunk_size}B"),
             ),
             &payload,
             |b, payload| {
@@ -545,7 +452,6 @@ fn bench_line_delivery_replay(c: &mut Criterion) {
                             consumer: LineConsumerKind::CountOnly,
                             backend: BackendKind::Broadcast,
                             delivery: DeliveryKind::Reliable,
-                            purpose: "checks reliable replay count-only line delivery",
                         },
                         expected,
                         result,
@@ -566,7 +472,7 @@ fn bench_line_delivery_replay(c: &mut Criterion) {
     group.bench_with_input(
         BenchmarkId::new(
             "count_only/broadcast/best_effort_replay_slow_subscriber",
-            "short_ascii_256B",
+            "short_256B",
         ),
         &payload,
         |b, payload| {

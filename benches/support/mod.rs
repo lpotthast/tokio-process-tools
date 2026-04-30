@@ -9,7 +9,6 @@
 // workspace crate or a `test-support` feature on the main crate; neither is
 // justified by the size of the duplication. Keep the two copies in sync.
 
-use assertr::prelude::*;
 use bytes::Bytes;
 use std::io;
 use std::pin::Pin;
@@ -38,16 +37,8 @@ pub const SHORT_LINE_LARGE_READ_CHUNK_SIZE: usize = 16 * 1024;
 
 pub const LONG_LINE_LEN: usize = 4 * 1024;
 pub const LONG_LINE_COUNT: usize = 2_048;
-pub const LONG_LINE_READ_CHUNK_SIZE: usize = 16 * 1024;
-
-pub const UTF8_SHORT_LINE_LEN: usize = 64;
-pub const UTF8_SHORT_LINE_COUNT: usize = 16_384;
-pub const UTF8_SHORT_LINE_SMALL_READ_CHUNK_SIZE: usize = 256;
-pub const UTF8_SHORT_LINE_LARGE_READ_CHUNK_SIZE: usize = 16 * 1024;
-
-pub const UTF8_LONG_LINE_LEN: usize = 4 * 1024;
-pub const UTF8_LONG_LINE_COUNT: usize = 2_048;
-pub const UTF8_LONG_LINE_READ_CHUNK_SIZE: usize = 64 * 1024;
+pub const LONG_LINE_SMALL_READ_CHUNK_SIZE: usize = 16 * 1024;
+pub const LONG_LINE_LARGE_READ_CHUNK_SIZE: usize = 64 * 1024;
 
 pub type Payload = Arc<[Bytes]>;
 
@@ -287,49 +278,6 @@ pub fn build_line_payload(line_len: usize, line_count: usize, read_chunk_size: u
 }
 
 #[must_use]
-pub fn build_utf8_line_payload(
-    line_len: usize,
-    line_count: usize,
-    read_chunk_size: usize,
-) -> Payload {
-    let pattern = "tokio-process-tools-line-éλЖ:";
-    assert_that!(line_len)
-        .with_detail_message("UTF-8 line length must fit the non-ASCII pattern")
-        .is_greater_or_equal_to(pattern.len());
-
-    let mut payload = Vec::with_capacity((line_len + 1) * line_count);
-
-    for _ in 0..line_count {
-        let line_start = payload.len();
-        payload.extend_from_slice(pattern.as_bytes());
-
-        while payload.len() - line_start < line_len {
-            let remaining = line_len - (payload.len() - line_start);
-            let ch = pattern
-                .chars()
-                .find(|ch| ch.len_utf8() <= remaining)
-                .expect("UTF-8 pattern should contain a character that fits the remaining bytes");
-            let mut encoded = [0_u8; 4];
-            payload.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
-        }
-
-        let line = &payload[line_start..];
-        assert_that!(line.iter().any(|byte| !byte.is_ascii()))
-            .with_detail_message("UTF-8 benchmark line should contain non-ASCII bytes")
-            .is_true();
-        assert_that!(line.len())
-            .with_detail_message("UTF-8 benchmark line should match target byte length")
-            .is_equal_to(line_len);
-
-        payload.push(b'\n');
-    }
-
-    std::str::from_utf8(&payload).expect("UTF-8 benchmark payload should be valid");
-
-    split_bytes(&payload, read_chunk_size)
-}
-
-#[must_use]
 pub fn total_bytes(chunks: &Payload) -> usize {
     chunks.iter().map(Bytes::len).sum()
 }
@@ -367,18 +315,6 @@ pub fn single_stream_best_effort<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    single_stream_best_effort_with_capacity(reader, read_chunk_size, THROUGHPUT_MAX_BUFFERED_CHUNKS)
-}
-
-#[must_use]
-pub fn single_stream_best_effort_with_capacity<R>(
-    reader: R,
-    read_chunk_size: usize,
-    max_buffered_chunks: usize,
-) -> SingleSubscriberOutputStream<BestEffortDelivery, NoReplay>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
     SingleSubscriberOutputStream::from_stream(
         reader,
         BENCH_STREAM_NAME,
@@ -386,7 +322,7 @@ where
             .best_effort_delivery()
             .no_replay()
             .read_chunk_size(read_chunk_size.bytes())
-            .max_buffered_chunks(max_buffered_chunks)
+            .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)
             .build(),
     )
 }
@@ -399,18 +335,6 @@ pub fn single_stream_reliable<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    single_stream_reliable_with_capacity(reader, read_chunk_size, THROUGHPUT_MAX_BUFFERED_CHUNKS)
-}
-
-#[must_use]
-pub fn single_stream_reliable_with_capacity<R>(
-    reader: R,
-    read_chunk_size: usize,
-    max_buffered_chunks: usize,
-) -> SingleSubscriberOutputStream<ReliableDelivery, NoReplay>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
     SingleSubscriberOutputStream::from_stream(
         reader,
         BENCH_STREAM_NAME,
@@ -418,7 +342,7 @@ where
             .reliable_for_active_subscribers()
             .no_replay()
             .read_chunk_size(read_chunk_size.bytes())
-            .max_buffered_chunks(max_buffered_chunks)
+            .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)
             .build(),
     )
 }
@@ -431,22 +355,6 @@ pub fn broadcast_stream_best_effort<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    broadcast_stream_best_effort_with_capacity(
-        reader,
-        read_chunk_size,
-        THROUGHPUT_MAX_BUFFERED_CHUNKS,
-    )
-}
-
-#[must_use]
-pub fn broadcast_stream_best_effort_with_capacity<R>(
-    reader: R,
-    read_chunk_size: usize,
-    max_buffered_chunks: usize,
-) -> BroadcastOutputStream<BestEffortDelivery, NoReplay>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
     BroadcastOutputStream::from_stream(
         reader,
         BENCH_STREAM_NAME,
@@ -454,7 +362,7 @@ where
             .best_effort_delivery()
             .no_replay()
             .read_chunk_size(read_chunk_size.bytes())
-            .max_buffered_chunks(max_buffered_chunks)
+            .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)
             .build(),
     )
 }
@@ -467,18 +375,6 @@ pub fn broadcast_stream_reliable<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    broadcast_stream_reliable_with_capacity(reader, read_chunk_size, THROUGHPUT_MAX_BUFFERED_CHUNKS)
-}
-
-#[must_use]
-pub fn broadcast_stream_reliable_with_capacity<R>(
-    reader: R,
-    read_chunk_size: usize,
-    max_buffered_chunks: usize,
-) -> BroadcastOutputStream<ReliableDelivery, NoReplay>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
     BroadcastOutputStream::from_stream(
         reader,
         BENCH_STREAM_NAME,
@@ -486,7 +382,7 @@ where
             .reliable_for_active_subscribers()
             .no_replay()
             .read_chunk_size(read_chunk_size.bytes())
-            .max_buffered_chunks(max_buffered_chunks)
+            .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)
             .build(),
     )
 }
