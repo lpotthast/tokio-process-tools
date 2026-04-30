@@ -66,6 +66,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `DEFAULT_MAX_LINE_LENGTH` next to the existing `DEFAULT_READ_CHUNK_SIZE` and
   `DEFAULT_MAX_BUFFERED_CHUNKS` constants so the 16 KB `LineParsingOptions::default()` value is
   nameable from caller code.
+- Documented the "treat as still running" reading on `RunningState::Uncertain`, including that
+  `is_running()` is a pure status query that does not disarm the drop-cleanup or panic guards.
+- Documented the whole-chunks rounding rule on `ReplayRetention::LastBytes`, including the
+  consequence that a single chunk larger than the configured retention budget is retained in full
+  until newer chunks replace it.
+- Documented the per-line allocation in the `AsyncLineSink` async path next to the zero-copy fast
+  path of the synchronous `LineSink`, so callers can pick the right sink trait knowingly.
+- Added a "Subprocess trees" section to the README covering the new whole-tree termination
+  behavior and how to interact with grandchildren that detach themselves.
+- Added property-based tests for `LineParser` covering chunk-boundary invariance, single-byte
+  chunking with multibyte UTF-8, embedded NULs, drop/emit overflow modes, and gap-driven
+  resynchronization.
+- Added drain-timeout coverage for the asymmetric-abort path in
+  `wait_for_output_consumers` (stdout-finished/stderr-hanging and the mirror image).
 - Re-exported `Chunk`, `StreamEvent`, `Subscription`, `TrySubscribable`, `LineParser`,
   `LineAdapter`, `LineSink`, `AsyncLineSink`, `NumBytes`, and `NumBytesExt` at the crate root, so
   custom visitors and stream observers can be written without reaching into the internal module
@@ -185,6 +199,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   piped stdin ownership was split out of `Child`.
 - **Breaking:** Fixed `terminate()` so failed or canceled termination attempts no longer disarm the
   drop cleanup and panic guards before the process has successfully terminated.
+- Fixed Unix termination so it reaches the whole subprocess tree. Spawned children are now set up
+  as the leaders of a new process group via `Command::process_group(0)`, and `SIGINT`, `SIGTERM`,
+  and `SIGKILL` are delivered to that group via `killpg`. Previously the signals targeted only
+  the spawned PID, so any grandchildren the child had fork-execed (shell wrappers, build tools
+  that launch workers) survived `terminate()` and `kill()` as orphaned descendants reparented to
+  init. Windows already created its own console process group and is unchanged in behavior;
+  graceful interrupts continue to deliver `CTRL_BREAK_EVENT` to the group, and the kill fallback
+  still targets the leader as before.
 - Fixed `ProcessHandle::kill()` so a successful kill-and-wait disarms the drop cleanup and panic
   guards, allowing the handle to be dropped safely afterward.
 - Fixed `ProcessHandle::must_be_terminated()` so calling it on an already-armed handle is

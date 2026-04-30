@@ -71,6 +71,17 @@ pub trait LineSink: Send + 'static {
 /// `collect_lines_async`, `collect_lines_into_write*`) all need to `.await` per-line work.
 /// `on_gap` stays synchronous because gap notification carries no payload to await on,
 /// mirroring [`AsyncStreamVisitor::on_gap`].
+///
+/// # Allocation note
+///
+/// The async path materializes every parsed line as an owned `String` before handing it to
+/// `on_line`. The synchronous [`LineSink`] path can instead pass a `Cow::Borrowed` straight out
+/// of the chunk on the fast path, so it avoids a per-line allocation when the line fits in the
+/// current chunk. The allocation is the cost of holding the parser's borrow across an `.await`,
+/// which Rust does not allow because the next iteration re-borrows the parser. Use [`LineSink`]
+/// (and the corresponding `inspect_lines` / `collect_lines` factories) when per-line work is
+/// non-blocking and you want the zero-copy fast path; reach for [`AsyncLineSink`] only when the
+/// per-line work genuinely needs to await.
 pub trait AsyncLineSink: Send + 'static {
     /// Final value produced once the adapter is finished.
     type Output: Send + 'static;

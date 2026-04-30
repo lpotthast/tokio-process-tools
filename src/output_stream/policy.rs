@@ -116,6 +116,16 @@ pub enum ReplayRetention {
     LastChunks(usize),
 
     /// Keep whole chunks covering at least the latest number of bytes.
+    ///
+    /// Trimming happens at chunk boundaries: chunks are removed from the front of the retained
+    /// log only while doing so leaves the remaining size at or above the requested limit. Chunks
+    /// are never split, so the actual retained size is "rounded up to whole chunks." A single
+    /// chunk that is itself larger than the configured limit is retained in full until a newer
+    /// chunk arrives that can replace it; the limit is therefore a soft floor on retention, not
+    /// a hard upper bound on memory.
+    ///
+    /// To make the practical bound predictable, pair this with a `read_chunk_size` smaller than
+    /// the retention limit so a single chunk cannot exceed the configured budget.
     LastBytes(NumBytes),
 
     /// Keep all output for the stream lifetime.

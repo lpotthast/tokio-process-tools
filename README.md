@@ -165,7 +165,15 @@ Every chain ends with two buffering knobs:
   values cap memory.
 
 Pass `DEFAULT_READ_CHUNK_SIZE` and `DEFAULT_MAX_BUFFERED_CHUNKS` unless you have measured a reason to tune them. The
-defaults (16 KB and 128 chunks) are tuned for general-purpose streaming.
+defaults (16 KB and 128 chunks) are tuned for general-purpose streaming. Both knobs must be named at the spawn site:
+the spelled-out values keep the choice visible in code review and stop accidental mismatches between sites that all
+silently rely on a default.
+
+The async line-aware consumers (`inspect_lines_async`, `collect_lines_async`, `collect_lines_into_write`, and friends
+that take an `AsyncLineSink`) materialize every parsed line as an owned `String` before invoking the per-line callback.
+The synchronous line consumers can pass the line as `Cow::Borrowed` straight out of the chunk on the fast path, so they
+avoid the allocation. Prefer the synchronous flavor when per-line work is non-blocking; reach for the async flavor only
+when the per-line callback genuinely needs to `.await`.
 
 ### Consumers
 
@@ -761,10 +769,12 @@ all four.
 
 The termination escalation is per-platform but follows the same idea: try the gentle signal first (so the child can
 flush, close sockets, persist state), then a stronger signal, then unconditional kill. Pick the timeouts you pass to
-`terminate()` and the `_or_terminate` helpers based on how long your child legitimately needs at each step.
+`terminate()` and the `_or_terminate` helpers based on how long your child legitimately needs at each step. Each step
+targets the child's process group rather than its PID alone, so grandchildren are signaled with the leader; see
+[Subprocess trees](#subprocess-trees) for the spawn-time setup that makes this work.
 
-- **Linux/macOS:** `SIGINT` → `SIGTERM` → kill.
-- **Windows:** `CTRL_BREAK_EVENT` → kill.
+- **Linux/macOS:** `SIGINT` → `SIGTERM` → `SIGKILL`, all delivered to the child's process group via `killpg`.
+- **Windows:** `CTRL_BREAK_EVENT` to the console process group → `TerminateProcess` on the leader as the kill fallback.
 
 The Windows path uses `CTRL_BREAK_EVENT` rather than `CTRL_C_EVENT` because Windows does not allow targeting
 `CTRL_C_EVENT` at a nonzero child process group. A child that only handles Ctrl+C will not respond to either signal,
@@ -773,6 +783,25 @@ and needs its own graceful shutdown channel (stdin, IPC, or a command protocol).
 Signal sends (`send_interrupt_signal`, `send_terminate_signal`, and the equivalent steps inside `terminate()`) check
 for an already-exited child first and return `Ok(())` without sending a signal in that case, so calling them after the
 child has died is harmless rather than racy.
+
+## Subprocess trees
+
+Every spawned child is set up as the leader of its own process group, so termination signals reach the whole subtree
+rather than only the child the library spawned. If your child fork-execs further processes (an `npm start` that
+launches `node`, a shell wrapper that launches the real binary, a build tool that fans out workers), the grandchildren
+inherit the group and are signaled along with the leader by `send_interrupt_signal()`, `send_terminate_signal()`,
+`terminate()`, and `kill()`.
+
+- **Linux/macOS:** the child is spawned with `process_group(0)`, making its PID equal to its PGID. `SIGINT`, `SIGTERM`,
+  and `SIGKILL` are delivered with `killpg`, which targets the whole group.
+- **Windows:** the child is spawned with `CREATE_NEW_PROCESS_GROUP`. `CTRL_BREAK_EVENT` is delivered to that console
+  process group via `GenerateConsoleCtrlEvent`. The forceful-kill fallback (`TerminateProcess`) still targets the
+  leader, so a graceful interrupt window is the right place to let cooperative children unwind.
+
+A grandchild that explicitly detaches itself (`setsid`/`setpgid` to leave the group, double-fork into init, or its own
+job-object on Windows) is by definition outside the group and will not be signaled. That is correct: such children
+have asked to outlive their parent. If you do not own the leaf, and it leaks descendants of its own, run it under a
+small reaper (`tini` is the usual choice) so the descendants have a designated owner.
 
 ## MSRV
 

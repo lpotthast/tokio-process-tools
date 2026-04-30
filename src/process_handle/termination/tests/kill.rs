@@ -37,6 +37,77 @@ async fn kill_disarms_cleanup_and_panic_guards() {
     drop(process);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_signals_grandchildren_via_process_group() {
+    // Spawn `sh -c 'sleep 30 & echo $!; wait'`. The shell forks `sleep 30` into the background,
+    // prints its PID on stdout, then waits. With process-group-targeted signal delivery,
+    // killing the shell must also kill the grandchild `sleep`; a PID-targeted kill would only
+    // reap the shell and leave the sleep behind, reparented to init and still ticking.
+    use crate::{DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, LineParsingOptions, Next};
+    use std::sync::Mutex;
+    use std::time::Instant;
+    use tokio::process::Command;
+    use tokio::sync::oneshot;
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg("sleep 30 & echo $!; wait");
+
+    let mut process = crate::Process::new(cmd)
+        .name("group-kill-test")
+        .stdout_and_stderr(|stream| {
+            stream
+                .broadcast()
+                .reliable_for_active_subscribers()
+                .replay_last_bytes(64.bytes())
+                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+        })
+        .spawn()
+        .unwrap();
+
+    let (tx, rx) = oneshot::channel::<u32>();
+    let tx = Mutex::new(Some(tx));
+    let _consumer = process.stdout().inspect_lines(
+        move |line| {
+            if let Ok(pid) = line.trim().parse::<u32>()
+                && let Some(tx) = tx.lock().unwrap().take()
+            {
+                let _ = tx.send(pid);
+            }
+            Next::Continue
+        },
+        LineParsingOptions::default(),
+    );
+
+    let grandchild_pid = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("grandchild should print its PID within 5 s")
+        .expect("oneshot should resolve once the line is observed");
+
+    process.kill().await.unwrap();
+
+    // After group SIGKILL the grandchild becomes a zombie until init reaps it. Poll the
+    // signal-probe until it returns ESRCH, which it does once init has cleaned up.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(grandchild_pid.cast_signed()),
+            None,
+        )
+        .is_ok();
+        if !alive {
+            return;
+        }
+        assert_that!(Instant::now() <= deadline)
+            .with_detail_message(format!(
+                "grandchild PID {grandchild_pid} still answers signal probes 5 s after kill"
+            ))
+            .is_true();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn kill_reports_start_kill_failure_as_termination_error() {
     let mut process = spawn_long_running_process();

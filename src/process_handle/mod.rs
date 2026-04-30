@@ -82,7 +82,15 @@ pub enum RunningState {
     /// The process has terminated with the given exit status.
     Terminated(ExitStatus),
 
-    /// Failed to determine process state.
+    /// Reaping the child failed, so the actual state could not be observed.
+    ///
+    /// The conservative reading is "still running": until termination has been confirmed, the
+    /// drop-cleanup and panic guards on the handle are still required, and the process may yet
+    /// produce output. The variant carries the underlying [`io::Error`] so callers can log or
+    /// retry at their discretion; treating it as "not running" risks dropping a still-live child.
+    /// [`RunningState::is_definitely_running`] returns `false` here on purpose so callers cannot
+    /// mistake "we don't know" for "still running" via a single boolean check, but matching on
+    /// the enum is the only way to distinguish [`RunningState::Terminated`] from this case.
     Uncertain(io::Error),
 }
 
@@ -93,6 +101,10 @@ impl RunningState {
     /// asymmetry is intentional: callers who need to distinguish "not running" from "we don't
     /// know" should match the enum directly. The error carried by
     /// [`RunningState::Uncertain`] is real and worth surfacing, not silently collapsing.
+    ///
+    /// Even when this returns `false` for an [`RunningState::Uncertain`] state, the safe
+    /// interpretation is still "the process may be running"; do not use this predicate to decide
+    /// whether it is safe to drop the handle. See [`RunningState::Uncertain`].
     #[must_use]
     pub fn is_definitely_running(&self) -> bool {
         matches!(self, RunningState::Running)
@@ -227,12 +239,15 @@ where
     ///
     /// Returns [`RunningState::Running`] if the process is still running,
     /// [`RunningState::Terminated`] if it has exited, or [`RunningState::Uncertain`]
-    /// if the state could not be determined.
+    /// if the state could not be determined. Each call re-runs the underlying
+    /// `try_wait`, so a transient probing failure observed once does not become permanent.
     ///
-    /// This is a pure status query: it does not disarm the drop-cleanup or panic guards even when
-    /// it observes that the process has exited. Use [`Self::wait_for_completion`],
-    /// [`Self::terminate`], or [`Self::kill`] to close the lifecycle, or call
-    /// [`Self::must_not_be_terminated`] explicitly to detach the handle.
+    /// This is a pure status query: it does not disarm the drop-cleanup or panic guards, even
+    /// when it observes that the process has exited. A handle whose status reads
+    /// [`RunningState::Terminated`] still panics on drop until one of the lifecycle methods has
+    /// closed it. Use [`Self::wait_for_completion`], [`Self::terminate`], or [`Self::kill`] to
+    /// close the lifecycle through a successful terminal call, or call
+    /// [`Self::must_not_be_terminated`] explicitly to detach the handle without termination.
     //noinspection RsSelfConvention
     pub fn is_running(&mut self) -> RunningState {
         match self.try_reap_exit_status() {

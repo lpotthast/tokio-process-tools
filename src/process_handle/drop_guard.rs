@@ -13,10 +13,12 @@ where
         match &self.drop_mode {
             DropMode::Armed { .. } => {
                 // We want users to explicitly await or terminate spawned processes.
-                // If not done so, kill the process now to have some sort of last-resort cleanup.
-                // The panic guard will additionally raise a panic when this method returns,
-                // signalling the misuse loudly.
-                if let Err(err) = self.child.start_kill() {
+                // If not done so, kill the process group now to have some sort of last-resort
+                // cleanup. The panic guard will additionally raise a panic when this method
+                // returns, signalling the misuse loudly. Targeting the group (rather than the
+                // child's PID alone) catches any grandchildren the child has fork-execed, which
+                // is the same invariant the explicit `kill()` path upholds.
+                if let Err(err) = drop_kill(&mut self.child) {
                     tracing::warn!(
                         process = %self.name,
                         error = %err,
@@ -118,6 +120,20 @@ where
             interrupt_timeout: graceful_termination_timeout,
             terminate_timeout: forceful_termination_timeout,
         }
+    }
+}
+
+fn drop_kill(child: &mut tokio::process::Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        match child.id() {
+            Some(pid) => crate::signal::send_kill_to_process_group(pid),
+            None => child.start_kill(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        child.start_kill()
     }
 }
 

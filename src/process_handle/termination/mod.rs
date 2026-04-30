@@ -560,7 +560,7 @@ where
         &mut self,
         mut diagnostics: TerminationDiagnostics,
     ) -> Result<TerminationOutcome, TerminationError> {
-        match self.child.start_kill() {
+        match Self::start_kill_process_group(&mut self.child) {
             Ok(()) => {
                 // Note: A forceful kill should typically (somewhat) immediately lead to
                 // termination of the process. But there are cases in which even a forceful kill
@@ -672,7 +672,31 @@ where
     }
 
     fn start_kill_raw(&mut self) -> Result<(), io::Error> {
-        self.child.start_kill()
+        Self::start_kill_process_group(&mut self.child)
+    }
+
+    /// Sends `SIGKILL` to the child's process group on Unix and forwards to Tokio's
+    /// `Child::start_kill` on every other platform.
+    ///
+    /// On Unix the child is the leader of a process group set up at spawn time, so targeting the
+    /// group reaches any grandchildren the child has fork-execed. Tokio's stock `start_kill`
+    /// targets only the child's PID and would orphan that subtree. On Windows the standard
+    /// `TerminateProcess` semantics still apply; the pre-kill `CTRL_BREAK_EVENT` step in
+    /// [`Self::terminate`] is what reaches the rest of the console process group there.
+    fn start_kill_process_group(child: &mut tokio::process::Child) -> Result<(), io::Error> {
+        #[cfg(unix)]
+        {
+            match child.id() {
+                Some(pid) => signal::send_kill_to_process_group(pid),
+                // Already reaped. Tokio's start_kill would have surfaced this as an error;
+                // matching its behavior keeps the caller paths identical.
+                None => child.start_kill(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            child.start_kill()
+        }
     }
 }
 

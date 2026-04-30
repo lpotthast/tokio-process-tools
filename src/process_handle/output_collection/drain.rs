@@ -304,6 +304,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_output_collection_times_out_stderr_when_stdout_finishes_first() {
+        // Stdout EOFs immediately (the writer half of the duplex is dropped right away), so
+        // its collector completes inside the `tokio::select!` arm. Stderr's writer is held
+        // open for the lifetime of the test, so its collector keeps waiting for data or EOF
+        // that never arrive. The deadline elapses inside `drain_remaining_consumer`,
+        // exercising the asymmetric-abort path that aborts the slower sibling once the budget
+        // is gone.
+        let (stdout_read, stdout_write) = tokio::io::duplex(64);
+        drop(stdout_write);
+        let stdout_stream = BroadcastOutputStream::from_stream(
+            stdout_read,
+            "stdout",
+            best_effort_no_replay_options(),
+        );
+        let (stderr_read, _stderr_write) = tokio::io::duplex(64);
+        let stderr_stream = BroadcastOutputStream::from_stream(
+            stderr_read,
+            "stderr",
+            best_effort_no_replay_options(),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_output_consumers(
+                stdout_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
+                stderr_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
+                Some(Instant::now() + Duration::from_millis(150)),
+            ),
+        )
+        .await
+        .expect("drain should resolve via deadline-driven timeout, not the outer fallback");
+
+        match result {
+            Err(ConsumerDrainError::Timeout) => {}
+            other => {
+                assert_that!(&other).fail(format_args!(
+                    "expected drain timeout when stderr never finishes, got {other:?}"
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_output_collection_times_out_stdout_when_stderr_finishes_first() {
+        // Mirror image of the previous test: stderr EOFs first, stdout keeps waiting. Verifies
+        // the symmetric branch of the asymmetric-abort logic in `wait_for_output_consumers`.
+        let (stdout_read, _stdout_write) = tokio::io::duplex(64);
+        let stdout_stream = BroadcastOutputStream::from_stream(
+            stdout_read,
+            "stdout",
+            best_effort_no_replay_options(),
+        );
+        let (stderr_read, stderr_write) = tokio::io::duplex(64);
+        drop(stderr_write);
+        let stderr_stream = BroadcastOutputStream::from_stream(
+            stderr_read,
+            "stderr",
+            best_effort_no_replay_options(),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_output_consumers(
+                stdout_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
+                stderr_stream.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded),
+                Some(Instant::now() + Duration::from_millis(150)),
+            ),
+        )
+        .await
+        .expect("drain should resolve via deadline-driven timeout, not the outer fallback");
+
+        match result {
+            Err(ConsumerDrainError::Timeout) => {}
+            other => {
+                assert_that!(&other).fail(format_args!(
+                    "expected drain timeout when stdout never finishes, got {other:?}"
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn timed_output_collection_cancels_hanging_single_subscriber_sibling_after_error() {
         let stdout_stream = BroadcastOutputStream::from_stream(
             ReadErrorAfterBytes::new(b"", io::ErrorKind::BrokenPipe),
