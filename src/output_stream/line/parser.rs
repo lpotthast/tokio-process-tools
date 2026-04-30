@@ -454,6 +454,268 @@ mod tests {
         assert_that!(matches!(line, Cow::Borrowed(_))).is_true();
     }
 
+    mod properties {
+        //! Property-based coverage for [`LineParser`].
+        //!
+        //! These tests randomize chunk boundaries, line content (including embedded NULs and
+        //! multibyte UTF-8 sequences split mid-codepoint), and overflow behavior, then assert
+        //! invariants that no individual case-based test can cover comprehensively.
+
+        use super::{LineOverflowBehavior, LineParser, LineParsingOptions, NumBytesExt};
+        use proptest::collection::vec;
+        use proptest::prelude::{any, prop, prop_assert, prop_assert_eq, proptest};
+        use proptest::strategy::Strategy;
+
+        /// Drives the parser over `chunks`, returning every emitted line plus any trailing
+        /// flush at EOF. Inserts a gap before any chunk index in `gap_before`.
+        fn drive_parser(
+            chunks: &[Vec<u8>],
+            gap_before: &[usize],
+            options: LineParsingOptions,
+        ) -> Vec<String> {
+            let mut parser = LineParser::new();
+            let mut out = Vec::<String>::new();
+            for (i, chunk) in chunks.iter().enumerate() {
+                if gap_before.contains(&i) {
+                    parser.on_gap();
+                }
+                let mut bytes: &[u8] = chunk;
+                while let Some(line) = parser.next_line(&mut bytes, options) {
+                    out.push(line.into_owned());
+                }
+            }
+            if let Some(line) = parser.finish() {
+                out.push(line.into_owned());
+            }
+            out
+        }
+
+        /// Recombines `chunks` into one byte string and runs the parser over it as a single
+        /// chunk. Used as the reference oracle for "rechunking does not change observed lines."
+        fn drive_single_chunk(bytes: &[u8], options: LineParsingOptions) -> Vec<String> {
+            drive_parser(&[bytes.to_vec()], &[], options)
+        }
+
+        /// Splits `bytes` into chunks at the supplied (sorted, deduplicated, in-range) split
+        /// indices.
+        fn split_at_indices(bytes: &[u8], splits: &[usize]) -> Vec<Vec<u8>> {
+            let mut chunks = Vec::with_capacity(splits.len() + 1);
+            let mut prev = 0usize;
+            for &s in splits {
+                chunks.push(bytes[prev..s].to_vec());
+                prev = s;
+            }
+            chunks.push(bytes[prev..].to_vec());
+            chunks
+        }
+
+        /// Produces an ASCII-only line with no newlines so byte length equals character length.
+        fn ascii_no_newline_line() -> impl Strategy<Value = String> {
+            prop::string::string_regex("[a-zA-Z0-9 _.,;:!?-]{0,40}").unwrap()
+        }
+
+        /// Joins `lines` with `\n` and appends a trailing newline if `terminate_last` is true.
+        fn join_lines(lines: &[String], terminate_last: bool) -> String {
+            let mut s = String::new();
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 {
+                    s.push('\n');
+                }
+                s.push_str(line);
+            }
+            if terminate_last && !lines.is_empty() {
+                s.push('\n');
+            }
+            s
+        }
+
+        proptest! {
+            /// Splitting the same byte stream at any boundary set must yield the same lines as
+            /// feeding the whole stream in one chunk. This is the core "chunk boundary
+            /// invariance" property.
+            #[test]
+            fn rechunking_preserves_lines(
+                lines in vec(ascii_no_newline_line(), 0..6),
+                terminate_last in any::<bool>(),
+                splits_seed in vec(any::<u16>(), 0..8),
+            ) {
+                let combined = join_lines(&lines, terminate_last);
+                let bytes = combined.as_bytes();
+
+                let mut splits: Vec<usize> = splits_seed
+                    .into_iter()
+                    .filter_map(|n| {
+                        let len = bytes.len();
+                        if len == 0 { None } else { Some((n as usize) % len) }
+                    })
+                    .collect();
+                splits.sort_unstable();
+                splits.dedup();
+
+                let chunks = split_at_indices(bytes, &splits);
+                let options = LineParsingOptions::default();
+
+                let from_chunks = drive_parser(&chunks, &[], options);
+                let from_single = drive_single_chunk(bytes, options);
+                prop_assert_eq!(from_chunks, from_single);
+            }
+
+            /// Single-byte chunk feeding (the worst case for chunk-boundary handling and
+            /// multibyte UTF-8 reassembly) must produce the same output as feeding the whole
+            /// stream at once.
+            #[test]
+            fn single_byte_chunks_match_single_chunk(
+                content in prop::string::string_regex(
+                    "([a-zA-Z0-9 \u{2764}\u{1F44D}]{0,12}\n){0,4}([a-zA-Z0-9 \u{2764}\u{1F44D}]{0,12})?",
+                ).unwrap(),
+            ) {
+                let bytes = content.as_bytes();
+                let single_byte_chunks: Vec<Vec<u8>> =
+                    bytes.iter().map(|b| vec![*b]).collect();
+                let options = LineParsingOptions::default();
+
+                let from_single_byte = drive_parser(&single_byte_chunks, &[], options);
+                let from_single = drive_single_chunk(bytes, options);
+                prop_assert_eq!(from_single_byte, from_single);
+            }
+
+            /// Embedded NUL bytes are treated as ordinary content; lines remain split only on
+            /// `\n`. Round-tripping through the parser preserves the line count and byte
+            /// content (modulo the dropped delimiters) for ASCII-plus-NUL data.
+            #[test]
+            fn embedded_nuls_are_treated_as_content(
+                lines in vec(
+                    prop::string::string_regex("[a-z\\x00]{0,16}").unwrap(),
+                    1..5,
+                ),
+            ) {
+                let combined = join_lines(&lines, true);
+                let bytes = combined.as_bytes();
+
+                let result = drive_single_chunk(bytes, LineParsingOptions::default());
+                prop_assert_eq!(result.len(), lines.len());
+                for (got, expected) in result.iter().zip(lines.iter()) {
+                    prop_assert_eq!(got, expected);
+                }
+            }
+
+            /// Multibyte UTF-8 codepoints split across chunk boundaries are reassembled
+            /// identically to the single-chunk feed (not split into replacement characters).
+            #[test]
+            fn multibyte_utf8_survives_chunk_split(
+                splits_seed in vec(any::<u8>(), 0..8),
+            ) {
+                let combined = "\u{2764}\u{FE0F}hello\n\u{1F44D}world\nplain\n";
+                let bytes = combined.as_bytes();
+
+                let mut splits: Vec<usize> = splits_seed
+                    .into_iter()
+                    .map(|n| (n as usize) % bytes.len())
+                    .collect();
+                splits.sort_unstable();
+                splits.dedup();
+
+                let chunks = split_at_indices(bytes, &splits);
+                let options = LineParsingOptions::default();
+
+                let from_chunks = drive_parser(&chunks, &[], options);
+                let from_single = drive_single_chunk(bytes, options);
+                prop_assert_eq!(from_chunks, from_single);
+            }
+
+            /// `DropAdditionalData` truncates each emitted line to at most `max_line_length`
+            /// bytes (when `max_line_length > 0`), regardless of how the input is chunked.
+            #[test]
+            fn drop_additional_caps_emitted_line_length(
+                lines in vec(
+                    prop::string::string_regex("[a-z]{0,30}").unwrap(),
+                    1..5,
+                ),
+                max_line in 1usize..=8,
+                splits_seed in vec(any::<u16>(), 0..6),
+            ) {
+                let combined = join_lines(&lines, true);
+                let bytes = combined.as_bytes();
+                let options = LineParsingOptions {
+                    max_line_length: max_line.bytes(),
+                    overflow_behavior: LineOverflowBehavior::DropAdditionalData,
+                    buffer_compaction_threshold: None,
+                };
+
+                let mut splits: Vec<usize> = splits_seed
+                    .into_iter()
+                    .filter_map(|n| {
+                        let len = bytes.len();
+                        if len == 0 { None } else { Some((n as usize) % len) }
+                    })
+                    .collect();
+                splits.sort_unstable();
+                splits.dedup();
+                let chunks = split_at_indices(bytes, &splits);
+
+                let result = drive_parser(&chunks, &[], options);
+                for line in &result {
+                    prop_assert!(
+                        line.len() <= max_line,
+                        "line {line:?} exceeds max_line_length {max_line}",
+                    );
+                }
+            }
+
+            /// `EmitAdditionalAsNewLines` preserves all input bytes (modulo `\n` delimiters)
+            /// across the emitted lines, without inventing or dropping any data.
+            #[test]
+            fn emit_additional_preserves_all_bytes(
+                lines in vec(
+                    prop::string::string_regex("[a-z]{0,20}").unwrap(),
+                    1..5,
+                ),
+                max_line in 1usize..=8,
+            ) {
+                let combined = join_lines(&lines, true);
+                let bytes = combined.as_bytes();
+                let options = LineParsingOptions {
+                    max_line_length: max_line.bytes(),
+                    overflow_behavior: LineOverflowBehavior::EmitAdditionalAsNewLines,
+                    buffer_compaction_threshold: None,
+                };
+
+                let result = drive_single_chunk(bytes, options);
+                let original_no_newlines: String =
+                    combined.chars().filter(|c| *c != '\n').collect();
+                let recombined: String = result.concat();
+                prop_assert_eq!(recombined, original_no_newlines);
+            }
+
+            /// After a gap, the parser drops any partial line and resyncs at the next
+            /// newline. Whatever the parser emits after a gap is therefore a strict subset of
+            /// the lines produced by the same input without the gap.
+            #[test]
+            fn gap_emits_subset_of_no_gap_run(
+                pre_lines in vec(ascii_no_newline_line(), 0..3),
+                post_lines in vec(ascii_no_newline_line(), 1..4),
+            ) {
+                let pre = join_lines(&pre_lines, true);
+                let post = join_lines(&post_lines, true);
+
+                let chunks = vec![pre.as_bytes().to_vec(), post.as_bytes().to_vec()];
+                let options = LineParsingOptions::default();
+
+                let with_gap = drive_parser(&chunks, &[1], options);
+                let without_gap = drive_parser(&chunks, &[], options);
+
+                for line in &with_gap {
+                    prop_assert!(
+                        without_gap.contains(line),
+                        "gap output {line:?} not present in no-gap output {without_gap:?}",
+                    );
+                }
+                // Mid-line gap discards at most one line beyond what the gap arrived in.
+                prop_assert!(with_gap.len() <= without_gap.len());
+            }
+        }
+    }
+
     mod buffer_compaction {
         use super::*;
 
