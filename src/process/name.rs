@@ -157,17 +157,14 @@ impl AutoNameSettings {
             name.push_str(" % ");
         }
         if self.include_envs {
-            let envs = cmd.get_envs();
-            if envs.len() != 0 {
-                for (key, value) in envs
-                    .filter(|(_key, value)| value.is_some())
-                    .map(|(key, value)| (key, value.expect("present")))
-                {
-                    name.push_str(key.to_string_lossy().as_ref());
-                    name.push('=');
-                    name.push_str(value.to_string_lossy().as_ref());
-                    name.push(' ');
-                }
+            for (key, value) in cmd
+                .get_envs()
+                .filter_map(|(key, value)| Some((key, value?)))
+            {
+                name.push_str(key.to_string_lossy().as_ref());
+                name.push('=');
+                name.push_str(value.to_string_lossy().as_ref());
+                name.push(' ');
             }
         }
         if self.include_program {
@@ -175,14 +172,11 @@ impl AutoNameSettings {
             name.push(' ');
         }
         if self.include_args {
-            let args = cmd.get_args();
-            if args.len() != 0 {
-                for arg in args {
-                    name.push('"');
-                    name.push_str(arg.to_string_lossy().as_ref());
-                    name.push('"');
-                    name.push(' ');
-                }
+            for arg in cmd.get_args() {
+                name.push('"');
+                name.push_str(arg.to_string_lossy().as_ref());
+                name.push('"');
+                name.push(' ');
             }
         }
         if name.ends_with(' ') {
