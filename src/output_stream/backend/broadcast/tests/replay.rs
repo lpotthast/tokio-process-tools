@@ -2,8 +2,8 @@ use super::super::BroadcastOutputStream;
 use super::common::{
     best_effort_options_with, line_collection_options, reliable_options, wait_for_bytes_ingested,
 };
-use crate::output_stream::backend::test_support::assert_chunk;
 use crate::output_stream::event::StreamEvent;
+use crate::output_stream::event::tests::StreamEventAssertions;
 use crate::{
     BestEffortDelivery, LineParsingOptions, Next, NumBytesExt, ReplayEnabled, ReplayRetention,
     StreamConfig, WaitForLineResult,
@@ -19,9 +19,11 @@ fn best_effort_replay_options(
     best_effort_options_with(ReplayRetention::All, 1.bytes(), max_buffered_chunks)
 }
 
-fn assert_recv_chunk(event: Option<StreamEvent>, expected: &[u8]) {
-    let event = event.expect("expected chunk event, got stream end");
-    assert_chunk(&event, expected);
+fn assert_recv_chunk(maybe_event: Option<StreamEvent>, expected: &[u8]) {
+    assert_that!(maybe_event)
+        .is_some()
+        .is_chunk()
+        .is_equal_to(expected);
 }
 
 #[tokio::test]

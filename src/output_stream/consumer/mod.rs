@@ -1,27 +1,26 @@
-//! The [`Consumer`] handle plus the [`StreamVisitor`] abstraction and built-in visitors that
-//! drive output stream events.
+//! Tokio runtime adapter. Drives a [`StreamVisitor`](crate::StreamVisitor) over a
+//! [`Subscription`](crate::output_stream::Subscription) on a tokio task and exposes the
+//! [`Consumer<S>`] handle with cooperative-cancel / abort semantics. Required machinery;
+//! tokio-bound by construction. The visitor traits this module drives are runtime-agnostic and
+//! live one level up at [`crate::output_stream::visitor`].
 
-pub(crate) mod visitor;
-pub(crate) mod visitors;
+pub(crate) mod driver;
 
-#[cfg(test)]
-pub(crate) mod test_support;
+pub(crate) use driver::{spawn_consumer_async, spawn_consumer_sync};
 
 use crate::StreamReadError;
-use crate::output_stream::Subscription;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
-use visitor::{AsyncStreamVisitor, StreamVisitor, consume_async, consume_sync};
 
 /// Errors that the [`Consumer`] infrastructure itself can raise while driving its stream.
 ///
 /// These describe failures of the consumer task — joining, or reading the underlying stream.
 /// Visitor-specific failures (for example, a write-backed visitor's sink rejecting bytes) live
-/// in the visitor's own [`StreamVisitor::Output`](StreamVisitor::Output) /
-/// [`AsyncStreamVisitor::Output`](AsyncStreamVisitor::Output) type, not here. So a
+/// in the visitor's own [`StreamVisitor::Output`](crate::StreamVisitor::Output) /
+/// [`AsyncStreamVisitor::Output`](crate::AsyncStreamVisitor::Output) type, not here. So a
 /// writer-backed consumer's `wait` returns
 /// `Result<Result<W, SinkWriteError>, ConsumerError>`: the outer result is what `ConsumerError`
 /// describes, the inner is the writer visitor's own outcome.
@@ -355,42 +354,6 @@ impl<S: Sink> Drop for Consumer<S> {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-    }
-}
-
-pub(crate) fn spawn_consumer_sync<S, V>(
-    stream_name: &'static str,
-    subscription: S,
-    visitor: V,
-) -> Consumer<V::Output>
-where
-    S: Subscription,
-    V: StreamVisitor,
-{
-    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = consume_sync(subscription, visitor, term_sig_rx);
-    Consumer {
-        stream_name,
-        task: Some(tokio::spawn(driver)),
-        task_termination_sender: Some(term_sig_tx),
-    }
-}
-
-pub(crate) fn spawn_consumer_async<S, V>(
-    stream_name: &'static str,
-    subscription: S,
-    visitor: V,
-) -> Consumer<V::Output>
-where
-    S: Subscription,
-    V: AsyncStreamVisitor,
-{
-    let (term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
-    let driver = consume_async(subscription, visitor, term_sig_rx);
-    Consumer {
-        stream_name,
-        task: Some(tokio::spawn(driver)),
-        task_termination_sender: Some(term_sig_tx),
     }
 }
 

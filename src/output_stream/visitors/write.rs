@@ -1,8 +1,8 @@
-use super::super::Sink;
-use crate::output_stream::line::AsyncLineSink;
-use super::super::visitor::AsyncStreamVisitor;
 use crate::output_stream::Next;
+use crate::output_stream::consumer::Sink;
 use crate::output_stream::event::Chunk;
+use crate::output_stream::line::AsyncLineSink;
+use crate::output_stream::visitor::AsyncStreamVisitor;
 use std::borrow::Cow;
 use std::io;
 use tokio::io::AsyncWriteExt;
@@ -378,10 +378,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{Consumer, spawn_consumer_async};
-    use crate::output_stream::line::LineAdapter;
-    use super::super::super::test_support::event_receiver;
     use super::*;
+    use crate::output_stream::consumer::Consumer;
+    use crate::output_stream::consumer::driver::spawn_consumer_async;
+    use crate::output_stream::event::tests::event_receiver;
+    use crate::output_stream::line::LineAdapter;
     use crate::output_stream::Subscription;
     use crate::output_stream::event::StreamEvent;
     use crate::output_stream::line::LineParsingOptions;

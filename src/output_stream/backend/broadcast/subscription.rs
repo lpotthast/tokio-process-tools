@@ -153,7 +153,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::test_support::chunk;
     use super::super::state::{SubscriberSender, append_event};
     use super::*;
     use crate::StreamReadError;
@@ -266,8 +265,8 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let mut subscription = subscribe(&shared, options);
 
-        append_event(&shared, options, chunk(b"old")).await;
-        append_event(&shared, options, chunk(b"new")).await;
+        append_event(&shared, options, StreamEvent::chunk(b"old")).await;
+        append_event(&shared, options, StreamEvent::chunk(b"new")).await;
         append_event(&shared, options, StreamEvent::Eof).await;
 
         assert_that!(subscription.recv().await)
@@ -283,7 +282,7 @@ mod tests {
         let options = reliable_replay_options(ReplayRetention::All);
         let shared = Arc::new(Shared::new());
 
-        append_event(&shared, options, chunk(b"tail")).await;
+        append_event(&shared, options, StreamEvent::chunk(b"tail")).await;
         append_event(&shared, options, StreamEvent::Eof).await;
 
         let mut subscription = subscribe(&shared, options);
@@ -298,7 +297,7 @@ mod tests {
         let options = reliable_no_replay_options();
         let shared = Arc::new(Shared::new());
 
-        append_event(&shared, options, chunk(b"booting\n")).await;
+        append_event(&shared, options, StreamEvent::chunk(b"booting\n")).await;
         append_event(
             &shared,
             options,
@@ -326,7 +325,7 @@ mod tests {
         let options = reliable_replay_options(ReplayRetention::All);
         let shared = Arc::new(Shared::new());
 
-        append_event(&shared, options, chunk(b"booting\npartial")).await;
+        append_event(&shared, options, StreamEvent::chunk(b"booting\npartial")).await;
         append_event(
             &shared,
             options,
@@ -355,9 +354,9 @@ mod tests {
         let options = reliable_replay_options(ReplayRetention::All);
         let shared = Arc::new(Shared::new());
 
-        append_event(&shared, options, chunk(b"replay")).await;
+        append_event(&shared, options, StreamEvent::chunk(b"replay")).await;
         let mut subscription = subscribe(&shared, options);
-        append_event(&shared, options, chunk(b"live")).await;
+        append_event(&shared, options, StreamEvent::chunk(b"live")).await;
         append_event(&shared, options, StreamEvent::Eof).await;
 
         assert_next_chunk(&mut subscription, b"replay").await;

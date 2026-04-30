@@ -379,7 +379,6 @@ pub(super) async fn append_event<D, R>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::test_support::chunk;
     use super::*;
     use crate::{NumBytesExt, ReplayEnabled};
     use assertr::prelude::*;
@@ -417,9 +416,9 @@ mod tests {
         let options = best_effort_options(ReplayRetention::LastChunks(2));
         let mut state = BroadcastState::new();
 
-        state.push_event(chunk(b"a\n"), options);
-        state.push_event(chunk(b"b\n"), options);
-        state.push_event(chunk(b"c\n"), options);
+        state.push_event(StreamEvent::chunk(b"a\n"), options);
+        state.push_event(StreamEvent::chunk(b"b\n"), options);
+        state.push_event(StreamEvent::chunk(b"c\n"), options);
 
         assert_that!(state.replay_start_seq).is_equal_to(1);
         assert_that!(state.replay_chunk_count).is_equal_to(2);
@@ -433,9 +432,9 @@ mod tests {
         let options = best_effort_options(ReplayRetention::LastBytes(3.bytes()));
         let mut state = BroadcastState::new();
 
-        state.push_event(chunk(b"aa"), options);
-        state.push_event(chunk(b"bb"), options);
-        state.push_event(chunk(b"cc"), options);
+        state.push_event(StreamEvent::chunk(b"aa"), options);
+        state.push_event(StreamEvent::chunk(b"bb"), options);
+        state.push_event(StreamEvent::chunk(b"cc"), options);
 
         assert_that!(state.replay_start_seq).is_equal_to(1);
         assert_that!(state.replay_chunk_count).is_equal_to(2);
@@ -449,7 +448,7 @@ mod tests {
         let options = best_effort_options(ReplayRetention::All);
         let mut state = BroadcastState::new();
 
-        state.push_event(chunk(b"old"), options);
+        state.push_event(StreamEvent::chunk(b"old"), options);
         state.push_event(StreamEvent::Eof, options);
         state.seal_replay();
 
@@ -474,10 +473,10 @@ mod tests {
             .expect("broadcast state poisoned")
             .add_subscriber(SubscriberSender::Reliable(sender));
 
-        append_event(&shared, options, chunk(b"a")).await;
+        append_event(&shared, options, StreamEvent::chunk(b"a")).await;
         let second_append = tokio::spawn({
             let shared = Arc::clone(&shared);
-            async move { append_event(&shared, options, chunk(b"b")).await }
+            async move { append_event(&shared, options, StreamEvent::chunk(b"b")).await }
         });
 
         assert_that!(second_append.is_finished()).is_false();
@@ -492,15 +491,15 @@ mod tests {
 
         queue.push(IndexedEvent {
             seq: 0,
-            event: chunk(b"a"),
+            event: StreamEvent::chunk(b"a"),
         });
         queue.push(IndexedEvent {
             seq: 1,
-            event: chunk(b"b"),
+            event: StreamEvent::chunk(b"b"),
         });
         queue.push(IndexedEvent {
             seq: 2,
-            event: chunk(b"c"),
+            event: StreamEvent::chunk(b"c"),
         });
 
         assert_that!(queue.recv().await.unwrap().event).is_equal_to(StreamEvent::Gap);

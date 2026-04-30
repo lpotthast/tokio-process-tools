@@ -28,15 +28,15 @@ pub use output_stream::config::{
 };
 pub use output_stream::consumer::{Consumer, ConsumerCancelOutcome, ConsumerError, Sink};
 pub use output_stream::line::{AsyncLineSink, LineAdapter, LineParser, LineSink};
-pub use output_stream::consumer::visitor::{AsyncStreamVisitor, StreamVisitor};
-pub use output_stream::consumer::visitors::collect::{
-    AsyncChunkCollector, AsyncLineCollector, CollectedBytes, CollectedLines,
-    CollectionOverflowBehavior, CollectLineSink, CollectLineSinkAsync, LineCollectionOptions,
+pub use output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
+pub use output_stream::visitors::collect::{
+    AsyncChunkCollector, AsyncLineCollector, CollectLineSink, CollectLineSinkAsync,
+    CollectedBytes, CollectedLines, CollectionOverflowBehavior, LineCollectionOptions,
     RawCollectionOptions,
 };
-pub use output_stream::consumer::visitors::inspect::{InspectLineSink, InspectLineSinkAsync};
-pub use output_stream::consumer::visitors::wait::WaitForLineSink;
-pub use output_stream::consumer::visitors::write::{
+pub use output_stream::visitors::inspect::{InspectLineSink, InspectLineSinkAsync};
+pub use output_stream::visitors::wait::WaitForLineSink;
+pub use output_stream::visitors::write::{
     LineWriteMode, SinkWriteError, SinkWriteErrorAction, SinkWriteErrorHandler, SinkWriteOperation,
     WriteCollectionOptions, WriteLineSink,
 };

@@ -1,8 +1,19 @@
-use crate::StreamReadError;
-use crate::output_stream::event::{Chunk, StreamEvent};
-use crate::output_stream::{Next, Subscription};
+//! Visitor traits — the core abstraction every stream observer builds against.
+//!
+//! [`StreamVisitor`] and [`AsyncStreamVisitor`] describe what a chunk-level observer is, without
+//! committing to a runtime: methods are plain `&mut self` calls (synchronous) or return-position
+//! `impl Future` (asynchronous), and the trait bounds are `Send + 'static` only.
+//!
+//! The tokio-bound machinery that actually drives a visitor — task spawning, cooperative
+//! cancellation, the `Consumer<S>` handle — lives in [`crate::output_stream::consumer`]. Built-in
+//! implementations (`collect`, `inspect`, `wait`, `write`) live in
+//! [`crate::output_stream::visitors`]. User code can implement these traits directly and pass
+//! the visitor to `consume_with(...)` / `consume_with_async(...)` on any backend without
+//! touching the built-ins.
+
+use crate::output_stream::Next;
+use crate::output_stream::event::Chunk;
 use std::future::Future;
-use tokio::sync::oneshot;
 
 /// A synchronous visitor that observes stream events and produces a final value.
 ///
@@ -147,68 +158,4 @@ pub trait AsyncStreamVisitor: Send + 'static {
     /// Called after the visitor has stopped observing events. Synchronous because no further
     /// stream interaction is required at this point.
     fn into_output(self) -> Self::Output;
-}
-
-pub(crate) async fn consume_sync<S, V>(
-    mut subscription: S,
-    mut visitor: V,
-    mut term_sig_rx: oneshot::Receiver<()>,
-) -> Result<V::Output, StreamReadError>
-where
-    S: Subscription,
-    V: StreamVisitor,
-{
-    loop {
-        tokio::select! {
-            out = subscription.next_event() => {
-                match out {
-                    Some(StreamEvent::Chunk(chunk)) => {
-                        if visitor.on_chunk(chunk) == Next::Break {
-                            break;
-                        }
-                    }
-                    Some(StreamEvent::Gap) => visitor.on_gap(),
-                    Some(StreamEvent::Eof) | None => {
-                        visitor.on_eof();
-                        break;
-                    }
-                    Some(StreamEvent::ReadError(err)) => return Err(err),
-                }
-            }
-            _msg = &mut term_sig_rx => break,
-        }
-    }
-    Ok(visitor.into_output())
-}
-
-pub(crate) async fn consume_async<S, V>(
-    mut subscription: S,
-    mut visitor: V,
-    mut term_sig_rx: oneshot::Receiver<()>,
-) -> Result<V::Output, StreamReadError>
-where
-    S: Subscription,
-    V: AsyncStreamVisitor,
-{
-    loop {
-        tokio::select! {
-            out = subscription.next_event() => {
-                match out {
-                    Some(StreamEvent::Chunk(chunk)) => {
-                        if visitor.on_chunk(chunk).await == Next::Break {
-                            break;
-                        }
-                    }
-                    Some(StreamEvent::Gap) => visitor.on_gap(),
-                    Some(StreamEvent::Eof) | None => {
-                        visitor.on_eof().await;
-                        break;
-                    }
-                    Some(StreamEvent::ReadError(err)) => return Err(err),
-                }
-            }
-            _msg = &mut term_sig_rx => break,
-        }
-    }
-    Ok(visitor.into_output())
 }

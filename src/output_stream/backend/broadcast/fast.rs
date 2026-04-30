@@ -140,7 +140,7 @@ async fn read_chunked_fast<S: AsyncRead + Unpin + Send + 'static>(
 mod tests {
     use super::*;
     use crate::NumBytesExt;
-    use crate::output_stream::backend::test_support::assert_chunk;
+    use crate::output_stream::event::tests::StreamEventAssertions;
     use assertr::prelude::*;
     use std::io::Cursor;
 
@@ -168,9 +168,9 @@ mod tests {
         let third = receiver.recv().await.unwrap();
         let eof = receiver.recv().await.unwrap();
 
-        assert_chunk(&first, b"ab");
-        assert_chunk(&second, b"cd");
-        assert_chunk(&third, b"ef");
+        assert_that!(&first).is_chunk().is_equal_to(b"ab");
+        assert_that!(&second).is_chunk().is_equal_to(b"cd");
+        assert_that!(&third).is_chunk().is_equal_to(b"ef");
         assert_that!(eof).is_equal_to(StreamEvent::Eof);
         assert_that!(closure_state.lock().expect("closure_state poisoned").closed).is_true();
     }

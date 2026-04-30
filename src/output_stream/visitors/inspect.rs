@@ -1,7 +1,7 @@
-use crate::output_stream::line::{AsyncLineSink, LineSink};
-use super::super::visitor::{AsyncStreamVisitor, StreamVisitor};
 use crate::output_stream::Next;
 use crate::output_stream::event::Chunk;
+use crate::output_stream::line::{AsyncLineSink, LineSink};
+use crate::output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
 use std::borrow::Cow;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -126,10 +126,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{Consumer, spawn_consumer_sync};
-    use crate::output_stream::line::LineAdapter;
-    use super::super::super::test_support::event_receiver;
     use super::*;
+    use crate::output_stream::consumer::Consumer;
+    use crate::output_stream::consumer::driver::spawn_consumer_sync;
+    use crate::output_stream::event::tests::event_receiver;
+    use crate::output_stream::line::LineAdapter;
     use crate::output_stream::event::StreamEvent;
     use crate::output_stream::line::LineParsingOptions;
     use crate::{ConsumerCancelOutcome, ConsumerError, StreamReadError};
@@ -273,7 +274,7 @@ mod tests {
     }
 
     mod inspect_chunks_async {
-        use super::super::super::super::spawn_consumer_async;
+        use crate::output_stream::consumer::driver::spawn_consumer_async;
         use super::*;
 
         #[tokio::test]
@@ -317,7 +318,7 @@ mod tests {
     }
 
     mod inspect_lines_async {
-        use super::super::super::super::spawn_consumer_async;
+        use crate::output_stream::consumer::driver::spawn_consumer_async;
         use super::*;
         use crate::NumBytesExt;
 

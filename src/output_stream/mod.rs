@@ -1,4 +1,21 @@
 //! Process output stream types and helpers.
+//!
+//! The submodules below correspond to the four conceptual layers this subsystem is built from:
+//!
+//! - **Core abstractions** — the [`OutputStream`] / [`Subscription`] / [`TrySubscribable`] /
+//!   [`Next`] traits defined here, [`event`]'s [`Chunk`](event::Chunk) /
+//!   [`StreamEvent`](event::StreamEvent), the [`policy`] / [`config`] / [`num_bytes`] / [`line`]
+//!   modules, and the [`visitor`] trait pair every visitor implementation builds against. These
+//!   files have no tokio dependency.
+//! - **Tokio runtime adapter** ([`consumer`]) — the [`Consumer<S>`](consumer::Consumer) handle
+//!   plus the driver loops that step a visitor over a subscription on a tokio task with
+//!   cooperative-cancel / abort semantics.
+//! - **Tokio stream backends** ([`backend`]) — `broadcast` and `single_subscriber`, which ingest
+//!   any [`tokio::io::AsyncRead`] and emit [`StreamEvent`](event::StreamEvent)s.
+//! - **User-replaceable convenience layer** ([`visitors`]) — the built-in `collect`, `inspect`,
+//!   `wait`, and `write` visitors plus the `inspect_*` / `collect_*` factory macro that wires
+//!   them as inherent methods on each backend. `consume_with(my_visitor)` is enough to use the
+//!   library; everything in this module is sugar for the common cases.
 
 pub(crate) mod consumer;
 
@@ -18,6 +35,12 @@ pub mod num_bytes;
 
 /// Delivery and replay policy types shared by output stream backends.
 pub mod policy;
+
+/// Visitor traits — the runtime-agnostic contract every stream observer implements.
+pub mod visitor;
+
+/// Built-in visitors and the convenience factory macro that instantiates them.
+pub(crate) mod visitors;
 
 use crate::StreamConsumerError;
 use event::StreamEvent;

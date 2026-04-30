@@ -46,9 +46,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::output_stream::line::LineAdapter;
-    use super::super::super::visitor::consume_sync;
     use super::*;
+    use crate::output_stream::consumer::driver::consume_sync;
+    use crate::output_stream::line::LineAdapter;
     use crate::output_stream::event::{Chunk, StreamEvent};
     use crate::output_stream::line::LineParsingOptions;
     use crate::{LineOverflowBehavior, NumBytesExt, StreamReadError, WaitForLineResult};

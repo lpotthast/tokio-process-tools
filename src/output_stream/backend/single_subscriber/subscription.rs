@@ -45,7 +45,6 @@ impl Drop for SingleSubscriberSubscription {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::test_support::chunk;
     use super::*;
     use crate::StreamReadError;
     use assertr::prelude::*;
@@ -83,20 +82,20 @@ mod tests {
         let mut subscription = subscription_with(
             Arc::clone(&shared),
             id,
-            [chunk(b"old")],
+            [StreamEvent::chunk(b"old")],
             None,
             Some(receiver),
         );
 
-        sender.send(chunk(b"live")).await.unwrap();
+        sender.send(StreamEvent::chunk(b"live")).await.unwrap();
         drop(sender);
 
         assert_that!(subscription.next_event().await)
             .is_some()
-            .is_equal_to(chunk(b"old"));
+            .is_equal_to(StreamEvent::chunk(b"old"));
         assert_that!(subscription.next_event().await)
             .is_some()
-            .is_equal_to(chunk(b"live"));
+            .is_equal_to(StreamEvent::chunk(b"live"));
         assert_that!(subscription.next_event().await).is_none();
     }
 
@@ -108,16 +107,16 @@ mod tests {
         let mut subscription = subscription_with(
             Arc::clone(&shared),
             id,
-            [chunk(b"old")],
+            [StreamEvent::chunk(b"old")],
             Some(StreamEvent::Eof),
             Some(receiver),
         );
 
-        sender.send(chunk(b"ignored-live")).await.unwrap();
+        sender.send(StreamEvent::chunk(b"ignored-live")).await.unwrap();
 
         assert_that!(subscription.next_event().await)
             .is_some()
-            .is_equal_to(chunk(b"old"));
+            .is_equal_to(StreamEvent::chunk(b"old"));
         assert_that!(subscription.next_event().await)
             .is_some()
             .is_equal_to(StreamEvent::Eof);

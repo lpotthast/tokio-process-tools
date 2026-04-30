@@ -53,7 +53,7 @@ macro_rules! impl_consumer_factories {
             f: impl FnMut($crate::Chunk) -> $crate::Next + Send + 'static,
         ) -> FactoryReturn<$crate::Consumer<()>> {
             self.consume_with(
-                $crate::output_stream::consumer::visitors::inspect::InspectChunks::builder()
+                $crate::output_stream::visitors::inspect::InspectChunks::builder()
                     .f(f)
                     .build(),
             )
@@ -74,7 +74,7 @@ macro_rules! impl_consumer_factories {
             Fut: ::std::future::Future<Output = $crate::Next> + Send + 'static,
         {
             self.consume_with_async(
-                $crate::output_stream::consumer::visitors::inspect::InspectChunksAsync::builder()
+                $crate::output_stream::visitors::inspect::InspectChunksAsync::builder()
                     .f(f)
                     .build(),
             )
@@ -97,7 +97,7 @@ macro_rules! impl_consumer_factories {
         ) -> FactoryReturn<$crate::Consumer<()>> {
             self.consume_with($crate::output_stream::line::LineAdapter::new(
                 options,
-                $crate::output_stream::consumer::visitors::inspect::InspectLineSink::new(f),
+                $crate::output_stream::visitors::inspect::InspectLineSink::new(f),
             ))
         }
 
@@ -123,7 +123,7 @@ macro_rules! impl_consumer_factories {
             self.consume_with_async(
                 $crate::output_stream::line::LineAdapter::new(
                     options,
-                    $crate::output_stream::consumer::visitors::inspect::InspectLineSinkAsync::new(f),
+                    $crate::output_stream::visitors::inspect::InspectLineSinkAsync::new(f),
                 ),
             )
         }
@@ -139,7 +139,7 @@ macro_rules! impl_consumer_factories {
             collect: impl FnMut($crate::Chunk, &mut S) + Send + 'static,
         ) -> FactoryReturn<$crate::Consumer<S>> {
             self.consume_with(
-                $crate::output_stream::consumer::visitors::collect::CollectChunks::builder()
+                $crate::output_stream::visitors::collect::CollectChunks::builder()
                     .sink(into)
                     .f(collect)
                     .build(),
@@ -162,7 +162,7 @@ macro_rules! impl_consumer_factories {
             C: $crate::AsyncChunkCollector<S>,
         {
             self.consume_with_async(
-                $crate::output_stream::consumer::visitors::collect::CollectChunksAsync::builder()
+                $crate::output_stream::visitors::collect::CollectChunksAsync::builder()
                     .sink(into)
                     .collector(collect)
                     .build(),
@@ -187,7 +187,7 @@ macro_rules! impl_consumer_factories {
         ) -> FactoryReturn<$crate::Consumer<S>> {
             self.consume_with($crate::output_stream::line::LineAdapter::new(
                 options,
-                $crate::output_stream::consumer::visitors::collect::CollectLineSink::new(
+                $crate::output_stream::visitors::collect::CollectLineSink::new(
                     into, collect,
                 ),
             ))
@@ -216,7 +216,7 @@ macro_rules! impl_consumer_factories {
             self.consume_with_async(
                 $crate::output_stream::line::LineAdapter::new(
                     options,
-                    $crate::output_stream::consumer::visitors::collect::CollectLineSinkAsync::new(
+                    $crate::output_stream::visitors::collect::CollectLineSinkAsync::new(
                         into, collect,
                     ),
                 ),
@@ -231,7 +231,7 @@ macro_rules! impl_consumer_factories {
             options: $crate::RawCollectionOptions,
         ) -> FactoryReturn<$crate::Consumer<$crate::CollectedBytes>> {
             self.consume_with(
-                $crate::output_stream::consumer::visitors::collect::CollectChunks::builder()
+                $crate::output_stream::visitors::collect::CollectChunks::builder()
                     .sink($crate::CollectedBytes::new())
                     .f(move |chunk: $crate::Chunk, sink: &mut $crate::CollectedBytes| {
                         sink.push_chunk(chunk.as_ref(), options);
@@ -257,7 +257,7 @@ macro_rules! impl_consumer_factories {
         ) -> FactoryReturn<$crate::Consumer<$crate::CollectedLines>> {
             self.consume_with($crate::output_stream::line::LineAdapter::new(
                 parsing_options,
-                $crate::output_stream::consumer::visitors::collect::CollectLineSink::new(
+                $crate::output_stream::visitors::collect::CollectLineSink::new(
                     $crate::CollectedLines::new(),
                     move |line: ::std::borrow::Cow<'_, str>, sink: &mut $crate::CollectedLines| {
                         sink.push_line(line.into_owned(), collection_options);
@@ -287,7 +287,7 @@ macro_rules! impl_consumer_factories {
             H: $crate::SinkWriteErrorHandler,
         {
             self.consume_with_async(
-                $crate::output_stream::consumer::visitors::write::WriteChunks::builder()
+                $crate::output_stream::visitors::write::WriteChunks::builder()
                     .stream_name($crate::output_stream::OutputStream::name(self))
                     .writer(write)
                     .error_handler(write_options.into_error_handler())
@@ -321,7 +321,7 @@ macro_rules! impl_consumer_factories {
             self.consume_with_async(
                 $crate::output_stream::line::LineAdapter::new(
                     options,
-                    $crate::output_stream::consumer::visitors::write::WriteLineSink::new(
+                    $crate::output_stream::visitors::write::WriteLineSink::new(
                         $crate::output_stream::OutputStream::name(self),
                         write,
                         write_options.into_error_handler(),
@@ -352,7 +352,7 @@ macro_rules! impl_consumer_factories {
             H: $crate::SinkWriteErrorHandler,
         {
             self.consume_with_async(
-                $crate::output_stream::consumer::visitors::write::WriteChunks::builder()
+                $crate::output_stream::visitors::write::WriteChunks::builder()
                     .stream_name($crate::output_stream::OutputStream::name(self))
                     .writer(write)
                     .error_handler(write_options.into_error_handler())
@@ -389,7 +389,7 @@ macro_rules! impl_consumer_factories {
             self.consume_with_async(
                 $crate::output_stream::line::LineAdapter::new(
                     options,
-                    $crate::output_stream::consumer::visitors::write::WriteLineSink::new(
+                    $crate::output_stream::visitors::write::WriteLineSink::new(
                         $crate::output_stream::OutputStream::name(self),
                         write,
                         write_options.into_error_handler(),

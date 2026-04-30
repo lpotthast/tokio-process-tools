@@ -111,7 +111,7 @@ async fn read_chunked_shared<S, D, R>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_stream::backend::test_support::assert_chunk;
+    use crate::output_stream::event::tests::StreamEventAssertions;
     use crate::{NumBytesExt, StreamConfig};
     use assertr::prelude::*;
     use std::io::Cursor;
@@ -140,9 +140,9 @@ mod tests {
 
         let state = shared.state.lock().expect("broadcast state poisoned");
         assert_that!(state.replay.len()).is_equal_to(3);
-        assert_chunk(&state.replay[0].event, b"ab");
-        assert_chunk(&state.replay[1].event, b"cd");
-        assert_chunk(&state.replay[2].event, b"ef");
+        assert_that!(&state.replay[0].event).is_chunk().is_equal_to(b"ab");
+        assert_that!(&state.replay[1].event).is_chunk().is_equal_to(b"cd");
+        assert_that!(&state.replay[2].event).is_chunk().is_equal_to(b"ef");
         assert_that!(state.terminal.as_ref().map(|event| &event.event))
             .is_some()
             .is_equal_to(&StreamEvent::Eof);

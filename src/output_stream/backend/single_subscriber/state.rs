@@ -186,7 +186,6 @@ impl ConfiguredShared {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::test_support::chunk;
     use super::*;
     use crate::{NumBytesExt, StreamReadError};
     use assertr::prelude::*;
@@ -207,7 +206,7 @@ mod tests {
     fn no_replay_retains_no_chunks() {
         let mut state = ReplayState::new();
 
-        state.push_replay_event(chunk(b"old"), None);
+        state.push_replay_event(StreamEvent::chunk(b"old"), None);
 
         assert_that!(state.events).is_empty();
         assert_that!(state.chunk_count).is_equal_to(0);
@@ -218,8 +217,8 @@ mod tests {
     fn replay_all_retains_all_chunks() {
         let mut state = ReplayState::new();
 
-        state.push_replay_event(chunk(b"old"), Some(ReplayRetention::All));
-        state.push_replay_event(chunk(b"live"), Some(ReplayRetention::All));
+        state.push_replay_event(StreamEvent::chunk(b"old"), Some(ReplayRetention::All));
+        state.push_replay_event(StreamEvent::chunk(b"live"), Some(ReplayRetention::All));
 
         assert_that!(retained_bytes(&state)).is_equal_to(b"oldlive".to_vec());
         assert_that!(state.chunk_count).is_equal_to(2);
@@ -230,9 +229,9 @@ mod tests {
     fn replay_last_chunks_retains_bounded_tail() {
         let mut state = ReplayState::new();
 
-        state.push_replay_event(chunk(b"aa"), Some(ReplayRetention::LastChunks(2)));
-        state.push_replay_event(chunk(b"bb"), Some(ReplayRetention::LastChunks(2)));
-        state.push_replay_event(chunk(b"cc"), Some(ReplayRetention::LastChunks(2)));
+        state.push_replay_event(StreamEvent::chunk(b"aa"), Some(ReplayRetention::LastChunks(2)));
+        state.push_replay_event(StreamEvent::chunk(b"bb"), Some(ReplayRetention::LastChunks(2)));
+        state.push_replay_event(StreamEvent::chunk(b"cc"), Some(ReplayRetention::LastChunks(2)));
 
         assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
         assert_that!(state.chunk_count).is_equal_to(2);
@@ -243,9 +242,9 @@ mod tests {
     fn replay_last_bytes_retains_bounded_tail() {
         let mut state = ReplayState::new();
 
-        state.push_replay_event(chunk(b"aa"), Some(ReplayRetention::LastBytes(4.bytes())));
-        state.push_replay_event(chunk(b"bb"), Some(ReplayRetention::LastBytes(4.bytes())));
-        state.push_replay_event(chunk(b"cc"), Some(ReplayRetention::LastBytes(4.bytes())));
+        state.push_replay_event(StreamEvent::chunk(b"aa"), Some(ReplayRetention::LastBytes(4.bytes())));
+        state.push_replay_event(StreamEvent::chunk(b"bb"), Some(ReplayRetention::LastBytes(4.bytes())));
+        state.push_replay_event(StreamEvent::chunk(b"cc"), Some(ReplayRetention::LastBytes(4.bytes())));
 
         assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
         assert_that!(state.chunk_count).is_equal_to(2);
@@ -256,9 +255,9 @@ mod tests {
     fn replay_last_bytes_keeps_whole_chunks_covering_boundary() {
         let mut state = ReplayState::new();
 
-        state.push_replay_event(chunk(b"aa"), Some(ReplayRetention::LastBytes(3.bytes())));
-        state.push_replay_event(chunk(b"bb"), Some(ReplayRetention::LastBytes(3.bytes())));
-        state.push_replay_event(chunk(b"cc"), Some(ReplayRetention::LastBytes(3.bytes())));
+        state.push_replay_event(StreamEvent::chunk(b"aa"), Some(ReplayRetention::LastBytes(3.bytes())));
+        state.push_replay_event(StreamEvent::chunk(b"bb"), Some(ReplayRetention::LastBytes(3.bytes())));
+        state.push_replay_event(StreamEvent::chunk(b"cc"), Some(ReplayRetention::LastBytes(3.bytes())));
 
         assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
         assert_that!(state.byte_count).is_equal_to(4);
@@ -268,7 +267,7 @@ mod tests {
     fn seal_trims_retained_replay() {
         let mut state = ReplayState::new();
 
-        state.push_replay_event(chunk(b"old"), Some(ReplayRetention::All));
+        state.push_replay_event(StreamEvent::chunk(b"old"), Some(ReplayRetention::All));
         state.replay_sealed = true;
         state.trim_replay_window(Some(ReplayRetention::All));
 
