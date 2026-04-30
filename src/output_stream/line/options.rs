@@ -1,7 +1,10 @@
 //! Configuration for the line parser: maximum line length and how to handle overflow.
 
-use crate::output_stream::num_bytes::{NumBytes, NumBytesExt};
+use crate::output_stream::num_bytes::NumBytes;
 use typed_builder::TypedBuilder;
+
+/// Default maximum line length used by [`LineParsingOptions::default`]. 16 kilobytes.
+pub const DEFAULT_MAX_LINE_LENGTH: NumBytes = NumBytes(16 * 1024);
 
 /// What should happen when a line is too long?
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -40,7 +43,7 @@ pub struct LineParsingOptions {
     /// memory until the process runs out: the explicit `MAX` makes that decision visible at
     /// the call site.
     ///
-    /// Defaults to 16 kilobytes.
+    /// Defaults to [`DEFAULT_MAX_LINE_LENGTH`].
     pub max_line_length: NumBytes,
 
     /// What should happen when a line is too long?
@@ -84,7 +87,7 @@ pub struct LineParsingOptions {
 impl Default for LineParsingOptions {
     fn default() -> Self {
         Self {
-            max_line_length: 16.kilobytes(),
+            max_line_length: DEFAULT_MAX_LINE_LENGTH,
             overflow_behavior: LineOverflowBehavior::default(),
             buffer_compaction_threshold: None,
         }

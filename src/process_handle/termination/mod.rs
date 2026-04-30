@@ -413,11 +413,17 @@ where
         let mut diagnostics = TerminationDiagnostics::default();
 
         match try_reap_exit_status(self) {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(_)) => {
+                self.must_not_be_terminated();
+                Ok(())
+            }
             Ok(None) => match send_signal(&self.child) {
                 Ok(()) => Ok(()),
                 Err(signal_error) => match try_reap_exit_status(self) {
-                    Ok(Some(_)) => Ok(()),
+                    Ok(Some(_)) => {
+                        self.must_not_be_terminated();
+                        Ok(())
+                    }
                     Ok(None) => {
                         diagnostics.record_graceful_signal_error(phase, signal_name, signal_error);
                         Err(diagnostics.into_signal_failed(self.name.clone()))

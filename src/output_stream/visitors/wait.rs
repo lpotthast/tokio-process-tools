@@ -1,5 +1,5 @@
-use crate::output_stream::line::adapter::LineSink;
 use crate::output_stream::Next;
+use crate::output_stream::line::adapter::LineSink;
 use std::borrow::Cow;
 
 /// [`LineSink`] that breaks the moment a predicate accepts a line and remembers whether it
@@ -48,8 +48,8 @@ where
 mod tests {
     use super::*;
     use crate::output_stream::consumer::driver::consume_sync;
-    use crate::output_stream::line::adapter::LineAdapter;
     use crate::output_stream::event::{Chunk, StreamEvent};
+    use crate::output_stream::line::adapter::LineAdapter;
     use crate::output_stream::line::options::LineParsingOptions;
     use crate::{LineOverflowBehavior, NumBytesExt, StreamReadError, WaitForLineResult};
     use assertr::prelude::*;

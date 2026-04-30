@@ -112,7 +112,10 @@ mod tests {
             Some(receiver),
         );
 
-        sender.send(StreamEvent::chunk(b"ignored-live")).await.unwrap();
+        sender
+            .send(StreamEvent::chunk(b"ignored-live"))
+            .await
+            .unwrap();
 
         assert_that!(subscription.next_event().await)
             .is_some()

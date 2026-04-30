@@ -345,6 +345,10 @@ mod tests {
         let collector = stderr_stream
             .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
             .unwrap();
-        let _collected = collector.cancel().await.unwrap();
+        let _collected = collector
+            .cancel(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect_cancelled("collector should observe cancellation");
     }
 }

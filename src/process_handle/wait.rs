@@ -327,8 +327,7 @@ mod tests {
             .unwrap()
             .expect_completed("process should complete");
 
-        assert_that!(process.cleanup_on_drop).is_false();
-        assert_that!(&process.panic_on_drop).is_none();
+        assert_that!(process.is_drop_disarmed()).is_true();
     }
 
     #[tokio::test]
@@ -396,8 +395,7 @@ mod tests {
             .terminate_after_wait_error(wait_error, Duration::from_secs(1), Duration::from_secs(1))
             .await;
 
-        assert_that!(process.cleanup_on_drop).is_false();
-        assert_that!(process.panic_on_drop.is_none()).is_true();
+        assert_that!(process.is_drop_disarmed()).is_true();
 
         let (wait_error, termination_status) = match result {
             Err(WaitOrTerminateError::WaitFailed {
@@ -452,7 +450,6 @@ mod tests {
         };
 
         assert_that!(status.success()).is_false();
-        assert_that!(process.cleanup_on_drop).is_false();
-        assert_that!(&process.panic_on_drop).is_none();
+        assert_that!(process.is_drop_disarmed()).is_true();
     }
 }

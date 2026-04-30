@@ -450,8 +450,6 @@ impl Eq for StreamReadError {}
 ///
 /// This enum is returned inside a `Result`; stream read failures are surfaced as
 /// [`StreamReadError`] rather than as a variant of this enum.
-///
-/// Stream read failures are surfaced as [`StreamReadError`] instead of as a variant of this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitForLineResult {
     /// A matching line was observed before the stream ended or the timeout elapsed.

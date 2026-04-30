@@ -1,5 +1,4 @@
 use super::*;
-use crate::panic_on_drop::PanicOnDrop;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn terminate_future_can_be_spawned_on_tokio_task() {
@@ -41,8 +40,7 @@ async fn terminate_falls_back_to_kill_when_graceful_signal_sends_fail() {
     assert_that!(terminate_attempted.load(Ordering::SeqCst)).is_true();
     assert_that!(outcome.exit_status.success()).is_false();
     assert_that!(outcome.output_collection_timeout_extension).is_equal_to(FORCE_KILL_WAIT_TIMEOUT);
-    assert_that!(process.cleanup_on_drop).is_false();
-    assert_that!(&process.panic_on_drop).is_none();
+    assert_that!(process.is_drop_disarmed()).is_true();
 }
 
 #[tokio::test]
@@ -56,8 +54,7 @@ async fn terminate_detailed_reports_no_output_extension_when_graceful_phase_succ
 
     assert_that!(outcome.exit_status.success()).is_false();
     assert_that!(outcome.output_collection_timeout_extension).is_equal_to(Duration::ZERO);
-    assert_that!(process.cleanup_on_drop).is_false();
-    assert_that!(&process.panic_on_drop).is_none();
+    assert_that!(process.is_drop_disarmed()).is_true();
 }
 
 #[tokio::test]
@@ -76,14 +73,7 @@ async fn canceled_terminate_keeps_drop_guards_armed() {
     .await;
 
     assert_that!(result.is_err()).is_true();
-    assert_that!(process.cleanup_on_drop).is_true();
-    assert_that!(
-        process
-            .panic_on_drop
-            .as_ref()
-            .is_some_and(PanicOnDrop::is_armed)
-    )
-    .is_true();
+    assert_that!(process.is_drop_armed()).is_true();
 
     process.kill().await.unwrap();
 }
@@ -105,14 +95,7 @@ async fn failed_terminate_result_keeps_drop_guards_armed() {
     ));
 
     assert_that!(result.is_err()).is_true();
-    assert_that!(process.cleanup_on_drop).is_true();
-    assert_that!(
-        process
-            .panic_on_drop
-            .as_ref()
-            .is_some_and(PanicOnDrop::is_armed)
-    )
-    .is_true();
+    assert_that!(process.is_drop_armed()).is_true();
 
     process.kill().await.unwrap();
 }
@@ -144,8 +127,7 @@ async fn terminate_stops_process() {
 
     assert_that!(exit_status.code()).is_none();
     assert_that!(exit_status.success()).is_false();
-    assert_that!(handle.cleanup_on_drop).is_false();
-    assert_that!(&handle.panic_on_drop).is_none();
+    assert_that!(handle.is_drop_disarmed()).is_true();
 }
 
 #[tokio::test]

@@ -1,5 +1,4 @@
 use super::*;
-use crate::panic_on_drop::PanicOnDrop;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_future_can_be_spawned_on_tokio_task() {
@@ -28,20 +27,12 @@ async fn kill_disarms_cleanup_and_panic_guards() {
         .unwrap();
 
     assert_that!(process.stdin().is_open()).is_true();
-    assert_that!(process.cleanup_on_drop).is_true();
-    assert_that!(
-        process
-            .panic_on_drop
-            .as_ref()
-            .is_some_and(PanicOnDrop::is_armed)
-    )
-    .is_true();
+    assert_that!(process.is_drop_armed()).is_true();
 
     process.kill().await.unwrap();
 
     assert_that!(process.stdin().is_open()).is_false();
-    assert_that!(process.cleanup_on_drop).is_false();
-    assert_that!(&process.panic_on_drop).is_none();
+    assert_that!(process.is_drop_disarmed()).is_true();
 
     drop(process);
 }
@@ -71,14 +62,7 @@ async fn kill_reports_start_kill_failure_as_termination_error() {
         io::ErrorKind::PermissionDenied,
         "injected kill failure",
     );
-    assert_that!(process.cleanup_on_drop).is_true();
-    assert_that!(
-        process
-            .panic_on_drop
-            .as_ref()
-            .is_some_and(PanicOnDrop::is_armed)
-    )
-    .is_true();
+    assert_that!(process.is_drop_armed()).is_true();
 
     process.kill().await.unwrap();
 }

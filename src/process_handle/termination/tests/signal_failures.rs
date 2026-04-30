@@ -1,5 +1,4 @@
 use super::*;
-use crate::panic_on_drop::PanicOnDrop;
 
 #[tokio::test]
 async fn send_signal_returns_typed_error_when_child_is_still_running_after_signal_failure() {
@@ -38,14 +37,7 @@ async fn send_signal_returns_typed_error_when_child_is_still_running_after_signa
     );
     assert_that!(signal_attempts).is_equal_to(1);
     assert_that!(reap_attempts).is_equal_to(2);
-    assert_that!(process.cleanup_on_drop).is_true();
-    assert_that!(
-        process
-            .panic_on_drop
-            .as_ref()
-            .is_some_and(PanicOnDrop::is_armed)
-    )
-    .is_true();
+    assert_that!(process.is_drop_armed()).is_true();
 
     process.kill().await.unwrap();
 }

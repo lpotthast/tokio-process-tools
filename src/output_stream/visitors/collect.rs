@@ -416,11 +416,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConsumerError;
     use crate::output_stream::consumer::driver::{spawn_consumer_async, spawn_consumer_sync};
+    use crate::output_stream::event::StreamEvent;
     use crate::output_stream::event::tests::event_receiver;
     use crate::output_stream::line::adapter::LineAdapter;
-    use crate::ConsumerError;
-    use crate::output_stream::event::StreamEvent;
     use crate::output_stream::line::options::LineParsingOptions;
     use crate::output_stream::num_bytes::NumBytesExt;
     use crate::{AsyncChunkCollector, AsyncLineCollector};
@@ -915,13 +915,10 @@ mod tests {
             .await,
             LineAdapter::new(
                 LineParsingOptions::default(),
-                CollectLineSink::new(
-                    Vec::<String>::new(),
-                    |line, lines: &mut Vec<String>| {
-                        lines.push(line.into_owned());
-                        Next::Continue
-                    },
-                ),
+                CollectLineSink::new(Vec::<String>::new(), |line, lines: &mut Vec<String>| {
+                    lines.push(line.into_owned());
+                    Next::Continue
+                }),
             ),
         );
 
@@ -951,13 +948,10 @@ mod tests {
             .await,
             LineAdapter::new(
                 LineParsingOptions::default(),
-                CollectLineSink::new(
-                    Vec::<String>::new(),
-                    |line, lines: &mut Vec<String>| {
-                        lines.push(line.into_owned());
-                        Next::Continue
-                    },
-                ),
+                CollectLineSink::new(Vec::<String>::new(), |line, lines: &mut Vec<String>| {
+                    lines.push(line.into_owned());
+                    Next::Continue
+                }),
             ),
         );
 

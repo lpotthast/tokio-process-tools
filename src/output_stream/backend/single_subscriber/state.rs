@@ -229,9 +229,18 @@ mod tests {
     fn replay_last_chunks_retains_bounded_tail() {
         let mut state = ReplayState::new();
 
-        state.push_replay_event(StreamEvent::chunk(b"aa"), Some(ReplayRetention::LastChunks(2)));
-        state.push_replay_event(StreamEvent::chunk(b"bb"), Some(ReplayRetention::LastChunks(2)));
-        state.push_replay_event(StreamEvent::chunk(b"cc"), Some(ReplayRetention::LastChunks(2)));
+        state.push_replay_event(
+            StreamEvent::chunk(b"aa"),
+            Some(ReplayRetention::LastChunks(2)),
+        );
+        state.push_replay_event(
+            StreamEvent::chunk(b"bb"),
+            Some(ReplayRetention::LastChunks(2)),
+        );
+        state.push_replay_event(
+            StreamEvent::chunk(b"cc"),
+            Some(ReplayRetention::LastChunks(2)),
+        );
 
         assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
         assert_that!(state.chunk_count).is_equal_to(2);
@@ -242,9 +251,18 @@ mod tests {
     fn replay_last_bytes_retains_bounded_tail() {
         let mut state = ReplayState::new();
 
-        state.push_replay_event(StreamEvent::chunk(b"aa"), Some(ReplayRetention::LastBytes(4.bytes())));
-        state.push_replay_event(StreamEvent::chunk(b"bb"), Some(ReplayRetention::LastBytes(4.bytes())));
-        state.push_replay_event(StreamEvent::chunk(b"cc"), Some(ReplayRetention::LastBytes(4.bytes())));
+        state.push_replay_event(
+            StreamEvent::chunk(b"aa"),
+            Some(ReplayRetention::LastBytes(4.bytes())),
+        );
+        state.push_replay_event(
+            StreamEvent::chunk(b"bb"),
+            Some(ReplayRetention::LastBytes(4.bytes())),
+        );
+        state.push_replay_event(
+            StreamEvent::chunk(b"cc"),
+            Some(ReplayRetention::LastBytes(4.bytes())),
+        );
 
         assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
         assert_that!(state.chunk_count).is_equal_to(2);
@@ -255,9 +273,18 @@ mod tests {
     fn replay_last_bytes_keeps_whole_chunks_covering_boundary() {
         let mut state = ReplayState::new();
 
-        state.push_replay_event(StreamEvent::chunk(b"aa"), Some(ReplayRetention::LastBytes(3.bytes())));
-        state.push_replay_event(StreamEvent::chunk(b"bb"), Some(ReplayRetention::LastBytes(3.bytes())));
-        state.push_replay_event(StreamEvent::chunk(b"cc"), Some(ReplayRetention::LastBytes(3.bytes())));
+        state.push_replay_event(
+            StreamEvent::chunk(b"aa"),
+            Some(ReplayRetention::LastBytes(3.bytes())),
+        );
+        state.push_replay_event(
+            StreamEvent::chunk(b"bb"),
+            Some(ReplayRetention::LastBytes(3.bytes())),
+        );
+        state.push_replay_event(
+            StreamEvent::chunk(b"cc"),
+            Some(ReplayRetention::LastBytes(3.bytes())),
+        );
 
         assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
         assert_that!(state.byte_count).is_equal_to(4);

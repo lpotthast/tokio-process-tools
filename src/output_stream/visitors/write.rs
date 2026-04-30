@@ -379,12 +379,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_stream::Subscription;
     use crate::output_stream::consumer::Consumer;
     use crate::output_stream::consumer::driver::spawn_consumer_async;
+    use crate::output_stream::event::StreamEvent;
     use crate::output_stream::event::tests::event_receiver;
     use crate::output_stream::line::adapter::LineAdapter;
-    use crate::output_stream::Subscription;
-    use crate::output_stream::event::StreamEvent;
     use crate::output_stream::line::options::LineParsingOptions;
     use assertr::prelude::*;
     use bytes::Bytes;

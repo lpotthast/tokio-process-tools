@@ -26,10 +26,7 @@ async fn pending_writer_abort_releases_single_subscriber_claim() {
     write_half.write_all(b"ready").await.unwrap();
     entered_rx.await.unwrap();
 
-    let outcome = collector
-        .cancel_or_abort_after(Duration::from_millis(25))
-        .await
-        .unwrap();
+    let outcome = collector.cancel(Duration::from_millis(25)).await.unwrap();
 
     assert_that!(matches!(outcome, ConsumerCancelOutcome::Aborted)).is_true();
     wait_for_no_active_consumer(&stream).await;

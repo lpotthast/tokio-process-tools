@@ -117,7 +117,15 @@ async fn no_replay_discards_output_between_consumers() {
     let collector = stream
         .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
         .unwrap();
-    assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
+    assert_that!(
+        collector
+            .cancel(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect_cancelled("collector should observe cancellation")
+            .bytes
+    )
+    .is_empty();
     wait_for_no_active_consumer(&stream).await;
 
     write_half.write_all(b"idle").await.unwrap();
@@ -145,7 +153,15 @@ async fn replay_retains_output_between_consumers() {
     let collector = stream
         .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
         .unwrap();
-    assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
+    assert_that!(
+        collector
+            .cancel(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect_cancelled("collector should observe cancellation")
+            .bytes
+    )
+    .is_empty();
     wait_for_no_active_consumer(&stream).await;
 
     write_half.write_all(b"idle").await.unwrap();
@@ -173,7 +189,15 @@ async fn replay_retention_limits_later_consumer() {
     let collector = stream
         .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
         .unwrap();
-    assert_that!(collector.cancel().await.unwrap().bytes).is_empty();
+    assert_that!(
+        collector
+            .cancel(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect_cancelled("collector should observe cancellation")
+            .bytes
+    )
+    .is_empty();
     wait_for_no_active_consumer(&stream).await;
 
     write_half.write_all(b"aabbcc").await.unwrap();

@@ -31,8 +31,7 @@ async fn preflight_status_error_does_not_stop_termination_escalation() {
     assert_that!(interrupt_attempted.load(Ordering::SeqCst)).is_true();
     assert_that!(terminate_attempted.load(Ordering::SeqCst)).is_true();
     assert_that!(outcome.exit_status.success()).is_false();
-    assert_that!(process.cleanup_on_drop).is_false();
-    assert_that!(&process.panic_on_drop).is_none();
+    assert_that!(process.is_drop_disarmed()).is_true();
 }
 
 #[tokio::test]
@@ -46,8 +45,7 @@ async fn send_interrupt_signal_reaps_already_exited_child_before_signalling() {
     process.send_interrupt_signal().unwrap();
 
     assert_that!(process.id()).is_none();
-    assert_that!(process.cleanup_on_drop).is_false();
-    assert_that!(&process.panic_on_drop).is_none();
+    assert_that!(process.is_drop_disarmed()).is_true();
 }
 
 #[tokio::test]
@@ -61,8 +59,7 @@ async fn send_terminate_signal_reaps_already_exited_child_before_signalling() {
     process.send_terminate_signal().unwrap();
 
     assert_that!(process.id()).is_none();
-    assert_that!(process.cleanup_on_drop).is_false();
-    assert_that!(&process.panic_on_drop).is_none();
+    assert_that!(process.is_drop_disarmed()).is_true();
 }
 
 #[tokio::test]
@@ -97,8 +94,7 @@ async fn send_signal_reaps_exit_observed_after_signal_failure() {
     assert_that!(result).is_ok();
     assert_that!(signal_attempts).is_equal_to(1);
     assert_that!(reap_attempts).is_equal_to(2);
-    assert_that!(process.cleanup_on_drop).is_false();
-    assert_that!(&process.panic_on_drop).is_none();
+    assert_that!(process.is_drop_disarmed()).is_true();
 
     process.kill().await.unwrap();
 }

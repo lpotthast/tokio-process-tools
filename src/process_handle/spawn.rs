@@ -41,17 +41,14 @@ where
     Stdout: OutputStream,
     Stderr: OutputStream,
 {
-    let mut this = ProcessHandle {
+    ProcessHandle {
         name: name.into(),
         child,
         std_in,
         std_out_stream,
         std_err_stream,
-        cleanup_on_drop: false,
-        panic_on_drop: None,
-    };
-    this.must_be_terminated();
-    this
+        drop_mode: ProcessHandle::<Stdout, Stderr>::new_armed_drop_mode(),
+    }
 }
 
 fn prepare_command(command: &mut tokio::process::Command) -> &mut tokio::process::Command {

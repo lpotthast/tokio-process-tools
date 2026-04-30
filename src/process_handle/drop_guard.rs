@@ -1,4 +1,4 @@
-use super::ProcessHandle;
+use super::{DropMode, ProcessHandle};
 use crate::output_stream::OutputStream;
 use crate::panic_on_drop::PanicOnDrop;
 use crate::terminate_on_drop::TerminateOnDrop;
@@ -10,17 +10,21 @@ where
     Stderr: OutputStream,
 {
     fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            // We want users to explicitly await or terminate spawned processes.
-            // If not done so, kill the process now to have some sort of last-resort cleanup.
-            // A separate panic-on-drop guard may additionally raise a panic to signal the misuse.
-            if let Err(err) = self.child.start_kill() {
-                tracing::warn!(
-                    process = %self.name,
-                    error = %err,
-                    "Failed to kill process while dropping an armed ProcessHandle"
-                );
+        match &self.drop_mode {
+            DropMode::Armed { .. } => {
+                // We want users to explicitly await or terminate spawned processes.
+                // If not done so, kill the process now to have some sort of last-resort cleanup.
+                // The panic guard will additionally raise a panic when this method returns,
+                // signalling the misuse loudly.
+                if let Err(err) = self.child.start_kill() {
+                    tracing::warn!(
+                        process = %self.name,
+                        error = %err,
+                        "Failed to kill process while dropping an armed ProcessHandle"
+                    );
+                }
             }
+            DropMode::Disarmed => {}
         }
     }
 }
@@ -30,6 +34,12 @@ where
     Stdout: OutputStream,
     Stderr: OutputStream,
 {
+    pub(super) fn new_armed_drop_mode() -> DropMode {
+        DropMode::Armed {
+            panic: armed_panic_guard(),
+        }
+    }
+
     /// Sets a panic-on-drop mechanism for this `ProcessHandle`.
     ///
     /// This method enables a safeguard that ensures that the process represented by this
@@ -51,17 +61,15 @@ where
     /// after calling this method, a panic will occur with a descriptive message
     /// to inform about the incorrect usage.
     pub fn must_be_terminated(&mut self) {
-        self.cleanup_on_drop = true;
-        if !self
-            .panic_on_drop
-            .as_ref()
-            .is_some_and(PanicOnDrop::is_armed)
-        {
-            self.panic_on_drop = Some(PanicOnDrop::new(
-                "tokio_process_tools::ProcessHandle",
-                "The process was not terminated.",
-                "Successfully call `wait_for_completion`, `terminate`, or `kill`, or call `must_not_be_terminated` before the type is dropped!",
-            ));
+        match &mut self.drop_mode {
+            DropMode::Armed { panic } if panic.is_armed() => {
+                // Already armed; nothing to do.
+            }
+            _ => {
+                self.drop_mode = DropMode::Armed {
+                    panic: armed_panic_guard(),
+                };
+            }
         }
     }
 
@@ -74,14 +82,22 @@ where
     /// Use plain [`tokio::process::Command`] directly when you need a child process that can
     /// outlive the original handle without depending on captured stdio pipes.
     pub fn must_not_be_terminated(&mut self) {
-        self.cleanup_on_drop = false;
-        self.defuse_drop_panic();
+        // Defuse the panic guard before swapping the variant so the dropped `PanicOnDrop` does
+        // not fire when the old `Armed` value is dropped by the assignment.
+        if let DropMode::Armed { panic } = &mut self.drop_mode {
+            panic.defuse();
+        }
+        self.drop_mode = DropMode::Disarmed;
     }
 
-    pub(super) fn defuse_drop_panic(&mut self) {
-        if let Some(mut it) = self.panic_on_drop.take() {
-            it.defuse();
-        }
+    #[cfg(test)]
+    pub(crate) fn is_drop_armed(&self) -> bool {
+        matches!(&self.drop_mode, DropMode::Armed { panic } if panic.is_armed())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_drop_disarmed(&self) -> bool {
+        matches!(self.drop_mode, DropMode::Disarmed)
     }
 
     /// Wrap this process handle in a `TerminateOnDrop` instance, terminating the controlled process
@@ -103,6 +119,14 @@ where
             terminate_timeout: forceful_termination_timeout,
         }
     }
+}
+
+fn armed_panic_guard() -> PanicOnDrop {
+    PanicOnDrop::new(
+        "tokio_process_tools::ProcessHandle",
+        "The process was not terminated.",
+        "Successfully call `wait_for_completion`, `terminate`, or `kill`, or call `must_not_be_terminated` before the type is dropped!",
+    )
 }
 
 #[cfg(test)]
@@ -136,15 +160,7 @@ mod tests {
         let mut process = spawn_long_running_process();
 
         process.must_be_terminated();
-
-        assert_that!(process.cleanup_on_drop).is_true();
-        assert_that!(
-            process
-                .panic_on_drop
-                .as_ref()
-                .is_some_and(PanicOnDrop::is_armed)
-        )
-        .is_true();
+        assert_that!(process.is_drop_armed()).is_true();
 
         process.kill().await.unwrap();
     }
@@ -154,47 +170,12 @@ mod tests {
         let mut process = spawn_long_running_process();
 
         process.must_not_be_terminated();
-
-        assert_that!(process.cleanup_on_drop).is_false();
-        assert_that!(&process.panic_on_drop).is_none();
+        assert_that!(process.is_drop_disarmed()).is_true();
 
         process.must_be_terminated();
-
-        assert_that!(process.cleanup_on_drop).is_true();
-        assert_that!(
-            process
-                .panic_on_drop
-                .as_ref()
-                .is_some_and(PanicOnDrop::is_armed)
-        )
-        .is_true();
+        assert_that!(process.is_drop_armed()).is_true();
 
         process.kill().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn defuse_drop_panic_disarms_panic_but_keeps_cleanup() {
-        let mut process = spawn_long_running_process();
-
-        assert_that!(process.cleanup_on_drop).is_true();
-        assert_that!(
-            process
-                .panic_on_drop
-                .as_ref()
-                .is_some_and(PanicOnDrop::is_armed)
-        )
-        .is_true();
-
-        process.defuse_drop_panic();
-
-        assert_that!(process.cleanup_on_drop).is_true();
-        assert_that!(&process.panic_on_drop).is_none();
-
-        process.kill().await.unwrap();
-        process
-            .wait_for_completion(Duration::from_secs(2))
-            .await
-            .unwrap();
     }
 
     #[cfg(unix)]
@@ -209,8 +190,7 @@ mod tests {
         let pid = process.id().unwrap();
 
         process.must_not_be_terminated();
-        assert_that!(process.cleanup_on_drop).is_false();
-        assert_that!(&process.panic_on_drop).is_none();
+        assert_that!(process.is_drop_disarmed()).is_true();
         drop(process);
 
         let pid = Pid::from_raw(pid.cast_signed());

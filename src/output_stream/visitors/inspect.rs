@@ -129,9 +129,9 @@ mod tests {
     use super::*;
     use crate::output_stream::consumer::Consumer;
     use crate::output_stream::consumer::driver::spawn_consumer_sync;
+    use crate::output_stream::event::StreamEvent;
     use crate::output_stream::event::tests::event_receiver;
     use crate::output_stream::line::adapter::LineAdapter;
-    use crate::output_stream::event::StreamEvent;
     use crate::output_stream::line::options::LineParsingOptions;
     use crate::{ConsumerCancelOutcome, ConsumerError, StreamReadError};
     use assertr::prelude::*;
@@ -142,7 +142,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     #[tokio::test]
-    async fn cancel_or_abort_after_returns_cancelled_when_cooperative() {
+    async fn cancel_returns_cancelled_when_cooperative() {
         let (task_termination_sender, task_termination_receiver) = oneshot::channel();
         let inspector: Consumer<()> = Consumer {
             stream_name: "custom",
@@ -153,10 +153,7 @@ mod tests {
             task_termination_sender: Some(task_termination_sender),
         };
 
-        let outcome = inspector
-            .cancel_or_abort_after(Duration::from_secs(1))
-            .await
-            .unwrap();
+        let outcome = inspector.cancel(Duration::from_secs(1)).await.unwrap();
 
         assert_that!(matches!(outcome, ConsumerCancelOutcome::Cancelled(()))).is_true();
     }
@@ -274,8 +271,8 @@ mod tests {
     }
 
     mod inspect_chunks_async {
-        use crate::output_stream::consumer::driver::spawn_consumer_async;
         use super::*;
+        use crate::output_stream::consumer::driver::spawn_consumer_async;
 
         #[tokio::test]
         async fn accepts_stateful_callback() {
@@ -318,9 +315,9 @@ mod tests {
     }
 
     mod inspect_lines_async {
-        use crate::output_stream::consumer::driver::spawn_consumer_async;
         use super::*;
         use crate::NumBytesExt;
+        use crate::output_stream::consumer::driver::spawn_consumer_async;
 
         #[test]
         #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]

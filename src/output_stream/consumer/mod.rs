@@ -54,7 +54,7 @@ pub trait Sink: Send + 'static {}
 
 impl<T> Sink for T where T: Send + 'static {}
 
-/// The result of [`Consumer::cancel_or_abort_after`].
+/// The result of [`Consumer::cancel`].
 #[derive(Debug)]
 pub enum ConsumerCancelOutcome<S: Sink> {
     /// The consumer observed cooperative cancellation before the timeout and returned its sink.
@@ -62,6 +62,30 @@ pub enum ConsumerCancelOutcome<S: Sink> {
 
     /// The timeout elapsed, so the consumer task was aborted and its sink was dropped.
     Aborted,
+}
+
+impl<S: Sink> ConsumerCancelOutcome<S> {
+    /// Returns the sink from a cooperative cancellation, or `None` if the timeout elapsed.
+    #[must_use]
+    pub fn into_cancelled(self) -> Option<S> {
+        match self {
+            Self::Cancelled(sink) => Some(sink),
+            Self::Aborted => None,
+        }
+    }
+
+    /// Returns the sink from a cooperative cancellation, panicking with `message` if the timeout
+    /// elapsed and the task was aborted instead.
+    ///
+    /// Useful in tests where cooperative cancellation is expected to win the race; production
+    /// code should match on the outcome explicitly.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `message` when this outcome is [`Self::Aborted`].
+    pub fn expect_cancelled(self, message: &str) -> S {
+        self.into_cancelled().expect(message)
+    }
 }
 
 /// A handle for a tokio task that consumes a stream by driving a visitor over its events.
@@ -74,9 +98,9 @@ pub enum ConsumerCancelOutcome<S: Sink> {
 ///
 /// For proper cleanup, call
 /// - `wait()`, which waits for the consumer task to complete.
-/// - `cancel()`, which asks the consumer to stop and then waits for cooperative completion.
+/// - `cancel(timeout)`, which asks the consumer to stop, waits for cooperative completion, and
+///   aborts the task if the timeout elapses first.
 /// - `abort()`, which forcefully aborts the consumer task.
-/// - `cancel_or_abort_after()`, which tries cooperative cancellation first and aborts on timeout.
 ///
 /// If not cleaned up, the termination signal will be sent when dropping this consumer,
 /// but the task will be aborted (forceful, not waiting for its regular completion).
@@ -171,8 +195,8 @@ impl<S: Sink> Consumer<S> {
     /// Returns whether the consumer task has finished.
     ///
     /// This is a non-blocking task-state check. A finished consumer still owns its task result
-    /// until [`wait`](Self::wait), [`cancel`](Self::cancel), [`abort`](Self::abort), or
-    /// [`cancel_or_abort_after`](Self::cancel_or_abort_after) consumes it.
+    /// until [`wait`](Self::wait), [`cancel`](Self::cancel), or [`abort`](Self::abort) consumes
+    /// it.
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.task.as_ref().is_none_or(JoinHandle::is_finished)
@@ -240,32 +264,6 @@ impl<S: Sink> Consumer<S> {
         self.into_wait().wait().await
     }
 
-    /// Sends a cooperative cancellation event to the consumer and returns its sink.
-    ///
-    /// Cancellation is observed only between stream events. If an async visitor callback or
-    /// writer call is already in progress, `cancel` waits for that work to finish before the
-    /// consumer can observe cancellation. As a result, `cancel` can hang if the in-flight
-    /// callback or writer future hangs.
-    ///
-    /// The sink is preserved and returned only after the consumer task exits normally. For
-    /// bounded cleanup that can sacrifice sink recovery, use [`abort`](Self::abort) or
-    /// [`cancel_or_abort_after`](Self::cancel_or_abort_after).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ConsumerError::TaskJoin`] if the consumer task cannot be joined, or
-    /// [`ConsumerError::StreamRead`] if the underlying stream fails while being read before the
-    /// cancellation is observed. Visitor-specific outcomes appear inside the returned `S`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the consumer's internal cancellation sender has already been taken.
-    pub async fn cancel(self) -> Result<S, ConsumerError> {
-        let mut wait = self.into_wait();
-        wait.cancel();
-        wait.wait().await
-    }
-
     /// Forcefully aborts the consumer task.
     ///
     /// This drops any pending async visitor callback or writer future, releases the stream
@@ -300,7 +298,7 @@ impl<S: Sink> Consumer<S> {
     /// # Panics
     ///
     /// Panics if the consumer's internal cancellation sender has already been taken.
-    pub async fn cancel_or_abort_after(
+    pub async fn cancel(
         self,
         timeout: Duration,
     ) -> Result<ConsumerCancelOutcome<S>, ConsumerError> {
@@ -374,7 +372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_or_abort_after_returns_cancelled_when_cooperative() {
+    async fn cancel_returns_cancelled_when_cooperative() {
         let (task_termination_sender, task_termination_receiver) = oneshot::channel();
         let consumer = Consumer {
             stream_name: "custom",
@@ -385,10 +383,7 @@ mod tests {
             task_termination_sender: Some(task_termination_sender),
         };
 
-        let outcome = consumer
-            .cancel_or_abort_after(Duration::from_secs(1))
-            .await
-            .unwrap();
+        let outcome = consumer.cancel(Duration::from_secs(1)).await.unwrap();
 
         match outcome {
             ConsumerCancelOutcome::Cancelled(bytes) => {

@@ -24,12 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `seal_output_replay`.
 - Added `inspect_chunks_async` for asynchronously inspecting raw output chunks without storing
   them.
-- Added `Collector::abort()`, `Inspector::abort()`,
-  `Collector::cancel_or_abort_after(...)`, `Inspector::cancel_or_abort_after(...)`,
-  `CollectorCancelOutcome`, and `InspectorCancelOutcome` for forceful cleanup when cooperative
-  background-consumer cancellation cannot complete.
-- Added `Collector::is_finished()` and `Inspector::is_finished()` for non-blocking task-state
-  checks.
+- Added `Consumer::abort()` for forceful cleanup of a background consumer task and
+  `Consumer::cancel(timeout)` for bounded cooperative-then-forceful cancellation. The cancel
+  outcome is reported via `ConsumerCancelOutcome` (`Cancelled(sink)` / `Aborted`), which exposes
+  `into_cancelled()` and `expect_cancelled(message)` for projecting the cooperative success path
+  to the sink directly.
+- Added `Consumer::is_finished()` for non-blocking task-state checks.
 - Added in-memory output collection types and options: `RawCollectionOptions`,
   `LineCollectionOptions`, `CollectedBytes`, `CollectedLines`, and
   `CollectionOverflowBehavior`. Collection options distinguish bounded untrusted output from
@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `LineOutputOptions`, `RawOutputOptions`, and
   `WaitForCompletionOrTerminateOptions` for explicit wait and output-collection configuration.
 - Added a required-field builder for `LineParsingOptions` and a builder for `AutoNameSettings`.
+- Added `DEFAULT_MAX_LINE_LENGTH` next to the existing `DEFAULT_READ_CHUNK_SIZE` and
+  `DEFAULT_MAX_BUFFERED_CHUNKS` constants so the 16 KB `LineParsingOptions::default()` value is
+  nameable from caller code.
 - Added `WriteCollectionOptions` and public sink write error handler types for configuring whether
   writer collectors stop or continue after individual sink write failures. The options type remains
   generic so custom handlers are statically dispatched and allocation-free.
@@ -60,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated termination diagnostic display formatting to `thiserror` derives without changing the
   emitted messages.
+- Hardened `TerminateOnDrop`'s drop path: a missing or single-threaded tokio runtime now panics
+  with a message that names `TerminateOnDrop` and points at the multi-threaded-runtime
+  requirement, instead of bubbling up Tokio's internal panic message.
+- **Breaking:** Changed `ProcessHandle::is_running()` to be a side-effect-free status query.
+  Previously it implicitly disarmed the drop-cleanup and panic guards when it observed an exit;
+  now only the wait, terminate, and kill paths close the lifecycle.
+- **Breaking:** Removed `RunningState::as_bool` and the `From<RunningState> for bool`
+  conversion. Both collapsed `Uncertain(io::Error)` into `false`, silently discarding the error
+  case. Match on the enum, or use the new `RunningState::is_definitely_running()` predicate.
+- **Breaking:** Changed `Consumer::cancel()` from an unbounded cooperative cancel that returned
+  the sink directly to `Consumer::cancel(timeout)` returning `ConsumerCancelOutcome`. The new
+  method aborts the task if cooperative cancellation does not complete before `timeout`, so
+  cleanup cannot hang indefinitely.
 - **Breaking:** Changed `Process` into a staged builder: name the process with `.name(...)`,
   configure stdout and stderr with `.broadcast()` or `.single_subscriber()` stream builders, then
   call `.spawn()`.
@@ -129,9 +145,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entire stream lifetime. After a collector, inspector, or line waiter completes, is canceled, is
   dropped, or times out, another consumer can attach. Concurrent consumers are rejected with
   `StreamConsumerError::ActiveConsumer`.
-- Clarified that `Collector::cancel()` and `Inspector::cancel()` are cooperative, wait for
-  in-flight async callbacks or writer calls, and can hang if that work hangs. Collector
-  cancellation continues to return the sink only after normal task completion.
 - Replay-enabled single-subscriber streams retain configured replay history across sequential
   consumers, including output produced while no consumer is active. `.no_replay()` continues to
   discard output drained while no consumer is active.

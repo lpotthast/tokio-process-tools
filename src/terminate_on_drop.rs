@@ -70,6 +70,9 @@ where
                         process = %self.process_handle.name,
                         "Process already terminated"
                     );
+                    // The child has exited; close the lifecycle so the inner ProcessHandle's
+                    // drop guards do not panic when this wrapper drops out of scope.
+                    self.process_handle.must_not_be_terminated();
                     return;
                 }
                 crate::RunningState::Running => {}

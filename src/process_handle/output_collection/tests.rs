@@ -272,7 +272,11 @@ mod wait_for_completion_with_output {
             .stdout()
             .collect_lines_into_vec(line_parsing_options(), line_collection_options())
             .unwrap();
-        let _collected = collector.cancel().await.unwrap();
+        let _collected = collector
+            .cancel(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect_cancelled("collector should observe cancellation");
     }
 
     #[tokio::test]
@@ -360,7 +364,11 @@ mod wait_for_completion_with_output {
             }
         }
 
-        let _collected = active.cancel().await.unwrap();
+        let _collected = active
+            .cancel(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect_cancelled("collector should observe cancellation");
         process
             .wait_for_completion(Duration::from_secs(2))
             .await
@@ -415,8 +423,16 @@ mod wait_for_completion_with_output {
             .stdout()
             .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
             .unwrap();
-        let _stdout = stdout.cancel().await.unwrap();
-        let _stderr = active_stderr.cancel().await.unwrap();
+        let _stdout = stdout
+            .cancel(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect_cancelled("stdout collector should observe cancellation");
+        let _stderr = active_stderr
+            .cancel(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect_cancelled("stderr collector should observe cancellation");
 
         process
             .wait_for_completion(Duration::from_secs(2))

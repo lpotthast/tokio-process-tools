@@ -87,17 +87,30 @@ pub enum RunningState {
 }
 
 impl RunningState {
-    /// Returns `true` if the process is running, `false` otherwise.
+    /// Returns `true` only when the state is [`RunningState::Running`].
+    ///
+    /// Both [`RunningState::Terminated`] and [`RunningState::Uncertain`] return `false`. The
+    /// asymmetry is intentional: callers who need to distinguish "not running" from "we don't
+    /// know" should match the enum directly. The error carried by
+    /// [`RunningState::Uncertain`] is real and worth surfacing, not silently collapsing.
     #[must_use]
-    pub fn as_bool(&self) -> bool {
+    pub fn is_definitely_running(&self) -> bool {
         matches!(self, RunningState::Running)
     }
 }
 
-impl From<RunningState> for bool {
-    fn from(is_running: RunningState) -> Self {
-        is_running.as_bool()
-    }
+/// Drop-time behavior selected by the lifecycle methods on [`ProcessHandle`].
+///
+/// The state machine has two reachable states because every public lifecycle entry point either
+/// keeps both safeguards on (`Armed`) or turns both off (`Disarmed`). There is no "panic only,
+/// no cleanup" or "cleanup only, no panic" combination: the panic guard makes sense only when
+/// paired with the kill that signals the misuse.
+#[derive(Debug)]
+pub(super) enum DropMode {
+    /// Cleanup is attempted on drop and the panic guard fires when it does.
+    Armed { panic: PanicOnDrop },
+    /// Both cleanup and the panic guard are off. Drop is a no-op for this handle's lifecycle.
+    Disarmed,
 }
 
 /// A handle to a spawned process with captured stdout/stderr streams.
@@ -119,8 +132,7 @@ where
     std_in: Stdin,
     std_out_stream: Stdout,
     std_err_stream: Stderr,
-    cleanup_on_drop: bool,
-    panic_on_drop: Option<PanicOnDrop>,
+    pub(super) drop_mode: DropMode,
 }
 
 impl<Stdout, Stderr> ProcessHandle<Stdout, Stderr>
@@ -138,11 +150,7 @@ where
     /// ```no_run
     /// # use tokio::process::Command;
     /// # use tokio_process_tools::{
-    ///     AsyncChunkCollector, AsyncLineCollector, AutoName, Chunk, Consumer,
-    ///     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, DeliveryGuarantee, LineCollectionOptions,
-    ///     LineOverflowBehavior, LineParsingOptions, LineWriteMode, Next, NumBytesExt, Process,
-    ///     ProcessHandle, ProcessOutput, RawCollectionOptions, Sink,
-    ///     StreamConfig, TerminateOnDrop, WaitForLineResult,
+    ///     AutoName, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, Process,
     /// };
     /// # use tokio::io::AsyncWriteExt;
     /// # tokio_test::block_on(async {
@@ -205,15 +213,14 @@ where
         self.child.id()
     }
 
+    /// Reaps the child's exit status without affecting the drop-cleanup or panic guards.
+    ///
+    /// Callers that observe an exit status are responsible for calling
+    /// [`Self::must_not_be_terminated`] when they take ownership of the lifecycle: the wait,
+    /// terminate, and kill paths do this explicitly when they succeed. `is_running` deliberately
+    /// does not, so a status check never silently disarms the safeguards.
     pub(super) fn try_reap_exit_status(&mut self) -> Result<Option<ExitStatus>, io::Error> {
-        match self.child.try_wait() {
-            Ok(Some(exit_status)) => {
-                self.must_not_be_terminated();
-                Ok(Some(exit_status))
-            }
-            Ok(None) => Ok(None),
-            Err(err) => Err(err),
-        }
+        self.child.try_wait()
     }
 
     /// Checks if the process is currently running.
@@ -221,6 +228,11 @@ where
     /// Returns [`RunningState::Running`] if the process is still running,
     /// [`RunningState::Terminated`] if it has exited, or [`RunningState::Uncertain`]
     /// if the state could not be determined.
+    ///
+    /// This is a pure status query: it does not disarm the drop-cleanup or panic guards even when
+    /// it observes that the process has exited. Use [`Self::wait_for_completion`],
+    /// [`Self::terminate`], or [`Self::kill`] to close the lifecycle, or call
+    /// [`Self::must_not_be_terminated`] explicitly to detach the handle.
     //noinspection RsSelfConvention
     pub fn is_running(&mut self) -> RunningState {
         match self.try_reap_exit_status() {
@@ -257,7 +269,7 @@ where
             let stderr = std::ptr::read(&raw const this.std_err_stream);
 
             std::ptr::drop_in_place(&raw mut this.name);
-            std::ptr::drop_in_place(&raw mut this.panic_on_drop);
+            std::ptr::drop_in_place(&raw mut this.drop_mode);
 
             (child, stdin, stdout, stderr)
         }
@@ -314,6 +326,33 @@ mod tests {
 
     mod is_running {
         use super::*;
+
+        #[tokio::test]
+        async fn does_not_disarm_drop_guards_when_process_has_exited() {
+            let mut process = Process::new(long_running_command(Duration::from_millis(50)))
+                .name(AutoName::program_only())
+                .stdout_and_stderr(|stream| {
+                    stream
+                        .broadcast()
+                        .best_effort_delivery()
+                        .no_replay()
+                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+                })
+                .spawn()
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Observe the exit through the query API. Even with the child reaped, the drop
+            // guards must remain armed because is_running is documented as a pure status query.
+            let _state = process.is_running();
+
+            assert_that!(process.is_drop_armed()).is_true();
+
+            // Detach explicitly so the test does not panic when `process` drops.
+            process.must_not_be_terminated();
+        }
 
         #[tokio::test]
         async fn reports_running_before_wait_and_terminated_after_wait() {

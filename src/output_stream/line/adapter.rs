@@ -34,8 +34,8 @@
 use super::options::{LineParsingOptions, assert_max_line_length_non_zero};
 use super::parser::LineParser;
 use crate::output_stream::Next;
-use crate::output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
 use crate::output_stream::event::Chunk;
+use crate::output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
 use std::borrow::Cow;
 use std::future::Future;
 
@@ -77,10 +77,7 @@ pub trait AsyncLineSink: Send + 'static {
 
     /// Asynchronously observes a single parsed line. Return [`Next::Break`] to stop further
     /// parsing.
-    fn on_line<'a>(
-        &'a mut self,
-        line: Cow<'a, str>,
-    ) -> impl Future<Output = Next> + Send + 'a;
+    fn on_line<'a>(&'a mut self, line: Cow<'a, str>) -> impl Future<Output = Next> + Send + 'a;
 
     /// Synchronous gap hook; default no-op. See [`LineSink::on_gap`].
     fn on_gap(&mut self) {}
@@ -212,8 +209,8 @@ mod tests {
     use super::*;
     use crate::NumBytesExt;
     use crate::output_stream::consumer::{spawn_consumer_async, spawn_consumer_sync};
-    use crate::output_stream::event::tests::event_receiver;
     use crate::output_stream::event::StreamEvent;
+    use crate::output_stream::event::tests::event_receiver;
     use assertr::prelude::*;
     use bytes::Bytes;
     use std::sync::{Arc, Mutex};

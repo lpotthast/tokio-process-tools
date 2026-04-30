@@ -20,11 +20,11 @@ use crate::output_stream::consumer::driver::consume_sync;
 use crate::output_stream::consumer::{spawn_consumer_async, spawn_consumer_sync};
 use crate::output_stream::event::StreamEvent;
 use crate::output_stream::line::adapter::LineAdapter;
-use crate::output_stream::visitors::factories::impl_consumer_factories;
-use crate::output_stream::visitors::wait::WaitForLineSink;
 use crate::output_stream::policy::{
     BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, Replay, ReplayEnabled,
 };
+use crate::output_stream::visitors::factories::impl_consumer_factories;
+use crate::output_stream::visitors::wait::WaitForLineSink;
 use crate::output_stream::{OutputStream, TrySubscribable};
 use crate::{
     AsyncStreamVisitor, Consumer, LineParsingOptions, NumBytes, StreamConsumerError, StreamVisitor,
@@ -378,9 +378,9 @@ where
     /// Waits for a line that matches the given predicate within `timeout`.
     ///
     /// The returned future resolves to
-    /// `Ok(`[`crate::WaitForLineResult::Matched`]`)` if a matching line is found,
-    /// `Ok(`[`crate::WaitForLineResult::StreamClosed`]`)` if the stream ends first, or
-    /// `Ok(`[`crate::WaitForLineResult::Timeout`]`)` if the timeout expires first.
+    /// `Ok(`[`WaitForLineResult::Matched`]`)` if a matching line is found,
+    /// `Ok(`[`WaitForLineResult::StreamClosed`]`)` if the stream ends first, or
+    /// `Ok(`[`WaitForLineResult::Timeout`]`)` if the timeout expires first.
     ///
     /// The stream subscription is acquired synchronously inside this method, *before* the
     /// returned future is polled, so output produced between this call and the first
