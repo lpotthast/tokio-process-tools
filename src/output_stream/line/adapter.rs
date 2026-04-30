@@ -258,6 +258,7 @@ mod tests {
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: LineOverflowBehavior::default(),
+                    buffer_compaction_threshold: None,
                 },
                 CollectingSink {
                     seen: Arc::new(Mutex::new(Vec::new())),
@@ -366,6 +367,7 @@ mod tests {
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: LineOverflowBehavior::default(),
+                    buffer_compaction_threshold: None,
                 },
                 CollectingAsyncSink {
                     seen: Arc::new(Mutex::new(Vec::new())),

@@ -170,6 +170,7 @@ mod tests {
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: LineOverflowBehavior::default(),
+                    buffer_compaction_threshold: None,
                 },
                 WaitForLineSink::new(|_line| true),
             );
@@ -186,6 +187,7 @@ mod tests {
                 LineParsingOptions {
                     max_line_length: 4.bytes(),
                     overflow_behavior: LineOverflowBehavior::DropAdditionalData,
+                    buffer_compaction_threshold: None,
                 },
             )
             .await;

@@ -48,7 +48,37 @@ pub struct LineParsingOptions {
     /// When lossy buffering drops chunks before they reach the parser, line-based consumers
     /// conservatively discard any partial line and resynchronizes at the next newline instead of
     /// joining bytes across the gap.
+    ///
+    /// Defaults to `LineOverflowBehavior::DropAdditionalData`.
     pub overflow_behavior: LineOverflowBehavior,
+
+    /// Optional cap on each parser's long-term-retained buffer capacity.
+    ///
+    /// The parser keeps two `BytesMut` buffers (the in-progress line and the most-recently emitted
+    /// line): each retains capacity for the parser's lifetime, growing to fit the largest line they
+    /// have ever held. For most workloads this is fine. The worst case is roughly
+    /// `2 × `[`max_line_length`](Self::max_line_length) memory used per parser.
+    ///
+    /// Set this to `Some(n)` when a stream has mostly small lines but occasional large outliers
+    /// (especially under [`NumBytes::MAX`] / "trusted unbounded" line parsing) and you want the
+    /// buffers to release their allocations after each outlier instead of staying at outlier-size
+    /// forever. At the start of each [`LineParser::next_line`](crate::LineParser::next_line) call,
+    /// any buffer whose capacity exceeds `n` is dropped and replaced with an empty buffer. The next
+    /// line re-grows it from zero.
+    ///
+    /// `None` (the default) preserves the "no compaction" behavior. Buffers stay at their largest
+    /// observed size. A sensible enabled value could be `1.5 × typical_line_size`. Setting it to
+    /// close to (or below) typical line sizes will trigger reallocation almost every line and slow
+    /// the parser unnecessarily. When your `max_line_length` is already small, you may ignore this
+    /// setting if max consumption is not an issue on your system.
+    ///
+    /// Compaction reduces the parser's *steady-state* memory after outliers; it does not change
+    /// the peak. Peak memory is bounded by [`max_line_length`](Self::max_line_length) regardless
+    /// of this setting. Compaction is also best-effort: a partially-buffered line that has not
+    /// yet finished may briefly retain over-threshold capacity until the line completes.
+    ///
+    /// Defaults to `None`.
+    pub buffer_compaction_threshold: Option<NumBytes>,
 }
 
 impl Default for LineParsingOptions {
@@ -56,6 +86,7 @@ impl Default for LineParsingOptions {
         Self {
             max_line_length: 16.kilobytes(),
             overflow_behavior: LineOverflowBehavior::default(),
+            buffer_compaction_threshold: None,
         }
     }
 }

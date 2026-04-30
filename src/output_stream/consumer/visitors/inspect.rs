@@ -171,6 +171,7 @@ mod tests {
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: crate::LineOverflowBehavior::default(),
+                    buffer_compaction_threshold: None,
                 },
                 InspectLineSink::new(|_line| Next::Continue),
             );
@@ -327,6 +328,7 @@ mod tests {
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: crate::LineOverflowBehavior::default(),
+                    buffer_compaction_threshold: None,
                 },
                 InspectLineSinkAsync::new(|_line| async { Next::Continue }),
             );

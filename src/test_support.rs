@@ -12,6 +12,7 @@ pub(crate) fn line_parsing_options() -> LineParsingOptions {
     LineParsingOptions::builder()
         .max_line_length(16.kilobytes())
         .overflow_behavior(LineOverflowBehavior::default())
+        .buffer_compaction_threshold(None)
         .build()
 }
 
