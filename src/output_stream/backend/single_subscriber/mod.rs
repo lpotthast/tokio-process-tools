@@ -5,7 +5,7 @@ use crate::output_stream::config::StreamConfig;
 use crate::output_stream::consumer::driver::consume_sync;
 use crate::output_stream::consumer::{spawn_consumer_async, spawn_consumer_sync};
 use crate::output_stream::event::StreamEvent;
-use crate::output_stream::line::LineAdapter;
+use crate::output_stream::line::adapter::LineAdapter;
 use crate::output_stream::visitors::factories::impl_consumer_factories;
 use crate::output_stream::visitors::wait::WaitForLineSink;
 use crate::output_stream::policy::{

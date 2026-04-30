@@ -1,10 +1,10 @@
-use crate::output_stream::line::LineSink;
+use crate::output_stream::line::adapter::LineSink;
 use crate::output_stream::Next;
 use std::borrow::Cow;
 
 /// [`LineSink`] that breaks the moment a predicate accepts a line and remembers whether it
 /// has matched yet. Compose with
-/// [`LineAdapter`](crate::output_stream::line::LineAdapter) to drive `wait_for_line`, or to
+/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) to drive `wait_for_line`, or to
 /// build your own custom predicate-driven consumer outside the built-in factory methods.
 pub struct WaitForLineSink<P> {
     predicate: P,
@@ -48,9 +48,9 @@ where
 mod tests {
     use super::*;
     use crate::output_stream::consumer::driver::consume_sync;
-    use crate::output_stream::line::LineAdapter;
+    use crate::output_stream::line::adapter::LineAdapter;
     use crate::output_stream::event::{Chunk, StreamEvent};
-    use crate::output_stream::line::LineParsingOptions;
+    use crate::output_stream::line::options::LineParsingOptions;
     use crate::{LineOverflowBehavior, NumBytesExt, StreamReadError, WaitForLineResult};
     use assertr::prelude::*;
     use bytes::Bytes;

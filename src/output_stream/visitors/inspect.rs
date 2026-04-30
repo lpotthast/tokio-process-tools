@@ -1,6 +1,6 @@
 use crate::output_stream::Next;
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::{AsyncLineSink, LineSink};
+use crate::output_stream::line::adapter::{AsyncLineSink, LineSink};
 use crate::output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
 use std::borrow::Cow;
 use std::future::Future;
@@ -57,7 +57,7 @@ where
 }
 
 /// [`LineSink`] wrapping a per-line closure. Compose with
-/// [`LineAdapter`](crate::output_stream::line::LineAdapter) to drive `inspect_lines`, or to
+/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) to drive `inspect_lines`, or to
 /// build your own custom inspect-lines consumer outside the built-in factory methods.
 pub struct InspectLineSink<F> {
     f: F,
@@ -87,7 +87,7 @@ where
 }
 
 /// [`AsyncLineSink`] wrapping a per-line async closure. Compose with
-/// [`LineAdapter`](crate::output_stream::line::LineAdapter) (its [`AsyncStreamVisitor`] impl
+/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) (its [`AsyncStreamVisitor`] impl
 /// is selected automatically when the inner sink is an [`AsyncLineSink`]) to drive
 /// `inspect_lines_async`. The `PhantomData<fn() -> Fut>` carries the future's type onto the
 /// struct so callers never name `Fut` explicitly.
@@ -130,9 +130,9 @@ mod tests {
     use crate::output_stream::consumer::Consumer;
     use crate::output_stream::consumer::driver::spawn_consumer_sync;
     use crate::output_stream::event::tests::event_receiver;
-    use crate::output_stream::line::LineAdapter;
+    use crate::output_stream::line::adapter::LineAdapter;
     use crate::output_stream::event::StreamEvent;
-    use crate::output_stream::line::LineParsingOptions;
+    use crate::output_stream::line::options::LineParsingOptions;
     use crate::{ConsumerCancelOutcome, ConsumerError, StreamReadError};
     use assertr::prelude::*;
     use bytes::Bytes;

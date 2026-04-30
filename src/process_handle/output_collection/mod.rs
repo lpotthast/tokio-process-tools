@@ -16,10 +16,10 @@ use crate::error::{
     WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitWithOutputError,
 };
 use crate::output_stream::consumer::{Consumer, spawn_consumer_sync};
-use crate::output_stream::line::LineAdapter;
+use crate::output_stream::line::adapter::LineAdapter;
 use crate::output_stream::visitors::collect::{CollectChunks, CollectLineSink};
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::LineParsingOptions;
+use crate::output_stream::line::options::LineParsingOptions;
 use crate::output_stream::{Next, Subscription, TrySubscribable};
 use crate::process_handle::WaitForCompletionOrTerminateOptions;
 use crate::process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};

@@ -95,7 +95,7 @@ macro_rules! impl_consumer_factories {
             f: impl FnMut(::std::borrow::Cow<'_, str>) -> $crate::Next + Send + 'static,
             options: $crate::LineParsingOptions,
         ) -> FactoryReturn<$crate::Consumer<()>> {
-            self.consume_with($crate::output_stream::line::LineAdapter::new(
+            self.consume_with($crate::output_stream::line::adapter::LineAdapter::new(
                 options,
                 $crate::output_stream::visitors::inspect::InspectLineSink::new(f),
             ))
@@ -121,7 +121,7 @@ macro_rules! impl_consumer_factories {
             Fut: ::std::future::Future<Output = $crate::Next> + Send + 'static,
         {
             self.consume_with_async(
-                $crate::output_stream::line::LineAdapter::new(
+                $crate::output_stream::line::adapter::LineAdapter::new(
                     options,
                     $crate::output_stream::visitors::inspect::InspectLineSinkAsync::new(f),
                 ),
@@ -185,7 +185,7 @@ macro_rules! impl_consumer_factories {
             collect: impl FnMut(::std::borrow::Cow<'_, str>, &mut S) -> $crate::Next + Send + 'static,
             options: $crate::LineParsingOptions,
         ) -> FactoryReturn<$crate::Consumer<S>> {
-            self.consume_with($crate::output_stream::line::LineAdapter::new(
+            self.consume_with($crate::output_stream::line::adapter::LineAdapter::new(
                 options,
                 $crate::output_stream::visitors::collect::CollectLineSink::new(
                     into, collect,
@@ -214,7 +214,7 @@ macro_rules! impl_consumer_factories {
             C: $crate::AsyncLineCollector<S>,
         {
             self.consume_with_async(
-                $crate::output_stream::line::LineAdapter::new(
+                $crate::output_stream::line::adapter::LineAdapter::new(
                     options,
                     $crate::output_stream::visitors::collect::CollectLineSinkAsync::new(
                         into, collect,
@@ -255,7 +255,7 @@ macro_rules! impl_consumer_factories {
             parsing_options: $crate::LineParsingOptions,
             collection_options: $crate::LineCollectionOptions,
         ) -> FactoryReturn<$crate::Consumer<$crate::CollectedLines>> {
-            self.consume_with($crate::output_stream::line::LineAdapter::new(
+            self.consume_with($crate::output_stream::line::adapter::LineAdapter::new(
                 parsing_options,
                 $crate::output_stream::visitors::collect::CollectLineSink::new(
                     $crate::CollectedLines::new(),
@@ -319,7 +319,7 @@ macro_rules! impl_consumer_factories {
             H: $crate::SinkWriteErrorHandler,
         {
             self.consume_with_async(
-                $crate::output_stream::line::LineAdapter::new(
+                $crate::output_stream::line::adapter::LineAdapter::new(
                     options,
                     $crate::output_stream::visitors::write::WriteLineSink::new(
                         $crate::output_stream::OutputStream::name(self),
@@ -387,7 +387,7 @@ macro_rules! impl_consumer_factories {
             H: $crate::SinkWriteErrorHandler,
         {
             self.consume_with_async(
-                $crate::output_stream::line::LineAdapter::new(
+                $crate::output_stream::line::adapter::LineAdapter::new(
                     options,
                     $crate::output_stream::visitors::write::WriteLineSink::new(
                         $crate::output_stream::OutputStream::name(self),

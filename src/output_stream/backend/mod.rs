@@ -2,7 +2,7 @@
 //! [`tokio::io::AsyncRead`] (not just process pipes).
 
 /// Multi-consumer broadcast output stream backend.
-pub mod broadcast;
+pub(crate) mod broadcast;
 
 /// Single-consumer output stream backend.
-pub mod single_subscriber;
+pub(crate) mod single_subscriber;

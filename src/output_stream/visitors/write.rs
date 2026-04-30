@@ -1,7 +1,7 @@
 use crate::output_stream::Next;
 use crate::output_stream::consumer::Sink;
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::AsyncLineSink;
+use crate::output_stream::line::adapter::AsyncLineSink;
 use crate::output_stream::visitor::AsyncStreamVisitor;
 use std::borrow::Cow;
 use std::io;
@@ -236,7 +236,7 @@ where
 
 /// [`AsyncLineSink`] that maps each parsed line through `mapper`, writes the result via
 /// `writer`, and routes failures through `error_handler`. Compose with
-/// [`LineAdapter`](crate::output_stream::line::LineAdapter) (its [`AsyncStreamVisitor`] impl
+/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) (its [`AsyncStreamVisitor`] impl
 /// is selected automatically when the inner sink is an [`AsyncLineSink`]) to drive
 /// `collect_lines_into_write` and friends, or to build your own custom write-lines consumer
 /// outside the built-in factory methods.
@@ -382,10 +382,10 @@ mod tests {
     use crate::output_stream::consumer::Consumer;
     use crate::output_stream::consumer::driver::spawn_consumer_async;
     use crate::output_stream::event::tests::event_receiver;
-    use crate::output_stream::line::LineAdapter;
+    use crate::output_stream::line::adapter::LineAdapter;
     use crate::output_stream::Subscription;
     use crate::output_stream::event::StreamEvent;
-    use crate::output_stream::line::LineParsingOptions;
+    use crate::output_stream::line::options::LineParsingOptions;
     use assertr::prelude::*;
     use bytes::Bytes;
     use std::cell::Cell;

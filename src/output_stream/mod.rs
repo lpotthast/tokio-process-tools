@@ -20,24 +20,24 @@
 pub(crate) mod consumer;
 
 /// Output stream backend implementations.
-pub mod backend;
+pub(crate) mod backend;
 
 /// Shared stream consumption configuration.
-pub mod config;
+pub(crate) mod config;
 
 pub(crate) mod event;
 
 /// Line parsing types and options.
-pub mod line;
+pub(crate) mod line;
 
 /// `NumBytes` newtype and convenience constructors used throughout the public API.
-pub mod num_bytes;
+pub(crate) mod num_bytes;
 
 /// Delivery and replay policy types shared by output stream backends.
-pub mod policy;
+pub(crate) mod policy;
 
-/// Visitor traits — the runtime-agnostic contract every stream observer implements.
-pub mod visitor;
+/// Visitor traits, the runtime-agnostic contract every stream observer implements.
+pub(crate) mod visitor;
 
 /// Built-in visitors and the convenience factory macro that instantiates them.
 pub(crate) mod visitors;
@@ -71,6 +71,11 @@ pub trait Subscription: Send + 'static {
 /// Output stream backend that can reject consumer subscriptions.
 pub trait TrySubscribable: OutputStream {
     /// Creates a new subscription for a consumer, or returns why the consumer cannot be started.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamConsumerError`] when the backend cannot start a new consumer, for
+    /// example because a single-subscriber backend already has an active consumer.
     fn try_subscribe(&self) -> Result<impl Subscription, StreamConsumerError>;
 }
 

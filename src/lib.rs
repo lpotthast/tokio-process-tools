@@ -27,7 +27,8 @@ pub use output_stream::config::{
     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, StreamConfig, StreamConfigBuilder,
 };
 pub use output_stream::consumer::{Consumer, ConsumerCancelOutcome, ConsumerError, Sink};
-pub use output_stream::line::{AsyncLineSink, LineAdapter, LineParser, LineSink};
+pub use output_stream::line::adapter::{AsyncLineSink, LineAdapter, LineSink};
+pub use output_stream::line::parser::LineParser;
 pub use output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
 pub use output_stream::visitors::collect::{
     AsyncChunkCollector, AsyncLineCollector, CollectLineSink, CollectLineSinkAsync,
@@ -40,14 +41,14 @@ pub use output_stream::visitors::write::{
     LineWriteMode, SinkWriteError, SinkWriteErrorAction, SinkWriteErrorHandler, SinkWriteOperation,
     WriteCollectionOptions, WriteLineSink,
 };
-pub use output_stream::event::Chunk;
-pub use output_stream::line::{LineOverflowBehavior, LineParsingOptions};
+pub use output_stream::event::{Chunk, StreamEvent};
+pub use output_stream::line::options::{LineOverflowBehavior, LineParsingOptions};
 pub use output_stream::num_bytes::{NumBytes, NumBytesExt};
 pub use output_stream::policy::{
     BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, ReliableDelivery, Replay,
     ReplayEnabled, ReplayRetention,
 };
-pub use output_stream::{Next, OutputStream};
+pub use output_stream::{Next, OutputStream, Subscription, TrySubscribable};
 pub use process::builder::Process;
 pub use process::name::{AutoName, AutoNameSettings, ProcessName};
 pub use process::stream_config::{ProcessStreamBuilder, ProcessStreamConfig};

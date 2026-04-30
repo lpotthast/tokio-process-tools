@@ -1,7 +1,7 @@
 use crate::output_stream::Next;
 use crate::output_stream::consumer::Sink;
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::{AsyncLineSink, LineSink};
+use crate::output_stream::line::adapter::{AsyncLineSink, LineSink};
 use crate::output_stream::num_bytes::NumBytes;
 use crate::output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
 use std::borrow::Cow;
@@ -342,7 +342,7 @@ where
 
 /// [`LineSink`] holding the user closure and a sink; `on_line` calls the closure with the
 /// line and a `&mut` borrow of the sink. Compose with
-/// [`LineAdapter`](crate::output_stream::line::LineAdapter) to drive `collect_lines`, or to
+/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) to drive `collect_lines`, or to
 /// build your own custom collect-lines consumer outside the built-in factory methods.
 pub struct CollectLineSink<T, F> {
     sink: T,
@@ -377,7 +377,7 @@ where
 }
 
 /// [`AsyncLineSink`] holding the user collector and a sink. Compose with
-/// [`LineAdapter`](crate::output_stream::line::LineAdapter) (its [`AsyncStreamVisitor`] impl
+/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) (its [`AsyncStreamVisitor`] impl
 /// is selected automatically when the inner sink is an [`AsyncLineSink`]) to drive
 /// `collect_lines_async`.
 pub struct CollectLineSinkAsync<T, C> {
@@ -418,10 +418,10 @@ mod tests {
     use super::*;
     use crate::output_stream::consumer::driver::{spawn_consumer_async, spawn_consumer_sync};
     use crate::output_stream::event::tests::event_receiver;
-    use crate::output_stream::line::LineAdapter;
+    use crate::output_stream::line::adapter::LineAdapter;
     use crate::ConsumerError;
     use crate::output_stream::event::StreamEvent;
-    use crate::output_stream::line::LineParsingOptions;
+    use crate::output_stream::line::options::LineParsingOptions;
     use crate::output_stream::num_bytes::NumBytesExt;
     use crate::{AsyncChunkCollector, AsyncLineCollector};
     use assertr::prelude::*;
