@@ -9,95 +9,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added `StreamConfig<D, R>` plus a typestate `StreamConfig::builder()` for selecting delivery,
-  replay, read chunk size, and maximum buffered chunks.
-- Added typed delivery and replay policy APIs: `BestEffortDelivery`, `ReliableDelivery`,
-  `NoReplay`, `ReplayEnabled`, `Delivery`, `Replay`, `DeliveryGuarantee`, and
-  `ReplayRetention`.
 - Added staged process stream configuration with `.stdout_and_stderr(...)`, `.stdout(...)`, and
   `.stderr(...)`. Stdout and stderr can now use different backends and delivery/replay policies.
 - Added `stream.broadcast()` and `stream.single_subscriber()` backend builders with
   `.best_effort_delivery()`, `.reliable_for_active_subscribers()`, `.no_replay()`,
   `.replay_last_chunks(...)`, `.replay_last_bytes(...)`, and `.replay_all()`.
+- Added `StreamConfig<D, R>` plus a typestate `StreamConfig::builder()` for selecting delivery,
+  replay, read chunk size, and maximum buffered chunks.
+- Added typed delivery and replay policy APIs: `BestEffortDelivery`, `ReliableDelivery`,
+  `NoReplay`, `ReplayEnabled`, `Delivery`, `Replay`, `DeliveryGuarantee`, and
+  `ReplayRetention`.
+- Added a `DiscardedOutputStream` backend, exposed through `ProcessStreamBuilder::discard()` and
+  the `DiscardedStreamConfig` type. Discarded slots route the matching child stdio to
+  `Stdio::null()`, so no pipe is allocated and no reader task is spawned.
+- Added public `StreamVisitor` and `AsyncStreamVisitor` traits and matching
+  `consume_with` / `consume_with_async` methods on both backends. The built-in collectors,
+  inspectors, writers, and line waiters are now thin wrappers over this same visitor API, so
+  custom visitors get the same lifecycle, cancellation, and abort semantics for free.
 - Added replay sealing APIs on replay-enabled streams and matching process handles:
   `seal_replay`, `is_replay_sealed`, `seal_stdout_replay`, `seal_stderr_replay`, and
   `seal_output_replay`.
-- Added `inspect_chunks_async` for asynchronously inspecting raw output chunks without storing
-  them.
-- Added `Consumer::abort()` for forceful cleanup of a background consumer task and
-  `Consumer::cancel(timeout)` for bounded cooperative-then-forceful cancellation. The cancel
-  outcome is reported via `ConsumerCancelOutcome` (`Cancelled(sink)` / `Aborted`), which exposes
-  `into_cancelled()` and `expect_cancelled(message)` for projecting the cooperative success path
-  to the sink directly.
-- Added `Consumer::is_finished()` for non-blocking task-state checks.
 - Added in-memory output collection types and options: `RawCollectionOptions`,
   `LineCollectionOptions`, `CollectedBytes`, `CollectedLines`, and
   `CollectionOverflowBehavior`. Collection options distinguish bounded untrusted output from
   trusted-unbounded output, and collected output exposes truncation metadata.
 - Added `LineOutputOptions`, `RawOutputOptions`, and
   `WaitForCompletionOrTerminateOptions` for explicit wait and output-collection configuration.
-- Added a required-field builder for `LineParsingOptions` and a builder for `AutoNameSettings`.
-- Added `DEFAULT_MAX_LINE_LENGTH` next to the existing `DEFAULT_READ_CHUNK_SIZE` and
-  `DEFAULT_MAX_BUFFERED_CHUNKS` constants so the 16 KB `LineParsingOptions::default()` value is
-  nameable from caller code.
 - Added `WriteCollectionOptions` and public sink write error handler types for configuring whether
   writer collectors stop or continue after individual sink write failures. The options type remains
   generic so custom handlers are statically dispatched and allocation-free.
-- Added `StreamReadError` so stream read failures can be surfaced by line waiters, collectors, and
-  inspectors.
-- Added `StreamConsumerError` so single-subscriber streams can reject concurrent consumers with a
-  typed error.
 - Added dedicated wait, output-collection, and termination diagnostics:
   `WaitOrTerminateError`, `WaitWithOutputError`, `TerminationAttemptError`,
   `TerminationAttemptPhase`, and `TerminationAttemptOperation`. `WaitWithOutputError` covers both
   `wait_for_completion_with_output*` and `wait_for_completion_with_output*_or_terminate` APIs;
   it carries a `WaitFailed(WaitError)` variant for the no-terminate family and a
   `WaitOrTerminateFailed(WaitOrTerminateError)` variant for the terminate-on-timeout family.
+- Added `StreamReadError` so stream read failures can be surfaced by line waiters, collectors, and
+  inspectors.
+- Added `StreamConsumerError` so single-subscriber streams can reject concurrent consumers with a
+  typed error.
+- Added `Consumer::abort()` for forceful cleanup of a background consumer task and
+  `Consumer::cancel(timeout)` for bounded cooperative-then-forceful cancellation. The outcome is
+  reported via `ConsumerCancelOutcome` (`Cancelled(sink)` / `Aborted`).
+- Added `Consumer::is_finished()` for non-blocking task-state checks.
+- Added `inspect_chunks_async` for asynchronously inspecting raw output chunks without storing
+  them.
 - Added `AutoName::program_only()`, `AutoName::program_with_args()`,
   `AutoName::program_with_env_and_args()`, and `AutoName::full()` as convenience constructors
   mirroring the built-in `AutoNameSettings` presets.
 - Added direct `.name(AutoNameSettings)` support for process names so callers can opt into
   combinations beyond the built-in naming presets.
+- Added a required-field builder for `LineParsingOptions` and a builder for `AutoNameSettings`.
+- Added `LineParsingOptions::buffer_compaction_threshold`, an optional cap on each parser's
+  long-term-retained buffer capacity. Useful for streams with mostly small lines and occasional
+  large outliers; defaults to `None`, which preserves the prior "no compaction" behavior.
+- Added `DEFAULT_MAX_LINE_LENGTH` next to the existing `DEFAULT_READ_CHUNK_SIZE` and
+  `DEFAULT_MAX_BUFFERED_CHUNKS` constants so the 16 KB `LineParsingOptions::default()` value is
+  nameable from caller code.
+- Re-exported `Chunk`, `StreamEvent`, `Subscription`, `TrySubscribable`, `LineParser`,
+  `LineAdapter`, `LineSink`, `AsyncLineSink`, `NumBytes`, and `NumBytesExt` at the crate root, so
+  custom visitors and stream observers can be written without reaching into the internal module
+  tree.
 
 ### Changed
 
-- Migrated termination diagnostic display formatting to `thiserror` derives without changing the
-  emitted messages.
-- Hardened `TerminateOnDrop`'s drop path: a missing or single-threaded tokio runtime now panics
-  with a message that names `TerminateOnDrop` and points at the multi-threaded-runtime
-  requirement, instead of bubbling up Tokio's internal panic message.
-- **Breaking:** Changed `ProcessHandle::is_running()` to be a side-effect-free status query.
-  Previously it implicitly disarmed the drop-cleanup and panic guards when it observed an exit;
-  now only the wait, terminate, and kill paths close the lifecycle.
-- **Breaking:** Removed `RunningState::as_bool` and the `From<RunningState> for bool`
-  conversion. Both collapsed `Uncertain(io::Error)` into `false`, silently discarding the error
-  case. Match on the enum, or use the new `RunningState::is_definitely_running()` predicate.
-- **Breaking:** Changed `Consumer::cancel()` from an unbounded cooperative cancel that returned
-  the sink directly to `Consumer::cancel(timeout)` returning `ConsumerCancelOutcome`. The new
-  method aborts the task if cooperative cancellation does not complete before `timeout`, so
-  cleanup cannot hang indefinitely.
 - **Breaking:** Changed `Process` into a staged builder: name the process with `.name(...)`,
   configure stdout and stderr with `.broadcast()` or `.single_subscriber()` stream builders, then
   call `.spawn()`.
-- **Breaking:** Changed direct `BroadcastOutputStream::from_stream` and
-  `SingleSubscriberOutputStream::from_stream` construction to accept `StreamConfig<D, R>`.
-- **Breaking:** Changed `BroadcastOutputStream` and `SingleSubscriberOutputStream` to preserve
-  typed delivery and replay markers as `BroadcastOutputStream<D, R>` and
-  `SingleSubscriberOutputStream<D, R>`.
 - **Breaking:** Changed `ProcessHandle<O>` to `ProcessHandle<Stdout, Stderr = Stdout>`, with
   `stdout()` and `stderr()` returning their independently typed streams.
 - **Breaking:** Changed `TerminateOnDrop<O>` to mirror the
   `ProcessHandle<Stdout, Stderr = Stdout>` generic shape.
-- **Breaking:** Renamed stream sizing from chunk size/channel capacity to read chunk size/maximum
-  buffered chunks, including `OutputStream::read_chunk_size()`,
-  `OutputStream::max_buffered_chunks()`, `DEFAULT_READ_CHUNK_SIZE`, and
-  `DEFAULT_MAX_BUFFERED_CHUNKS`.
+- **Breaking:** Changed `BroadcastOutputStream` and `SingleSubscriberOutputStream` to preserve
+  typed delivery and replay markers as `BroadcastOutputStream<D, R>` and
+  `SingleSubscriberOutputStream<D, R>`.
+- **Breaking:** Changed direct `BroadcastOutputStream::from_stream` and
+  `SingleSubscriberOutputStream::from_stream` construction to accept `StreamConfig<D, R>`.
 - **Breaking:** Replaced `Output` and `RawOutput` with
   `ProcessOutput<Stdout, Stderr = Stdout>`. Output-collecting wait helpers now return
   `ProcessOutput<CollectedLines>` or `ProcessOutput<CollectedBytes>`.
+- **Breaking:** Renamed `Collector` to `Consumer` and `CollectorError` to `ConsumerError`. The
+  unified `Consumer<T>` type replaces both the previous `Collector` and the old `Inspector`
+  wrapper, so every visitor-driven background task uses the same handle, lifecycle, and
+  cancellation semantics.
 - **Breaking:** Changed process wait and output-collection helpers to require explicit timeouts
   and return `WaitForCompletionResult` or `WaitForCompletionOrTerminateResult` so timeout expiry
   is a typed outcome instead of a wait error or ambiguous success.
+- **Breaking:** Changed `wait_for_completion_or_terminate` to distinguish natural completion from
+  timeout-triggered cleanup with `WaitForCompletionOrTerminateResult`, and changed
+  output-collecting wait helpers to return dedicated compound error types instead of overloading
+  `WaitError`.
 - **Breaking:** Removed unbounded public line waits and renamed the timed line wait API to
   `wait_for_line(timeout, predicate, options)`, returning a `LineWaiter` future whose output is
   `Result<WaitForLineResult, StreamReadError>`. The stream subscription or single-subscriber
@@ -105,6 +106,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Changed single-subscriber consumer methods to return
   `Result<_, StreamConsumerError>` when creating inspectors, collectors, and line waiters.
   Broadcast consumer methods remain infallible.
+- **Breaking:** Changed `send_interrupt_signal()`, `send_terminate_signal()`, and `kill()` to
+  return typed `TerminationError` diagnostics instead of raw `io::Error`.
+- **Breaking:** Replaced per-phase `TerminationError::TerminationFailed` diagnostic fields with
+  chronological `TerminationAttemptError` entries that preserve all recorded source errors as
+  `Send + Sync` values.
+- **Breaking:** Changed `collect_chunks_into_vec`, `collect_lines_into_vec`,
+  `wait_for_completion_with_output`, and `wait_for_completion_with_raw_output` to require explicit
+  collection options. Removed trusted-output-only variants; use `TrustedUnbounded` collection
+  options to preserve previous unbounded behavior.
+- **Breaking:** Changed `collect_chunks_into_write`, `collect_chunks_into_write_mapped`,
+  `collect_lines_into_write`, and `collect_lines_into_write_mapped` to require
+  `WriteCollectionOptions`; `WriteCollectionOptions::fail_fast()` stops on the first sink write
+  failure.
+- **Breaking:** Changed `ProcessHandle::is_running()` to be a side-effect-free status query.
+  Previously it implicitly disarmed the drop-cleanup and panic guards when it observed an exit;
+  now only the wait, terminate, and kill paths close the lifecycle.
+- **Breaking:** Changed `ProcessHandle::into_inner()` to return `(Child, Stdin, Stdout, Stderr)` so
+  callers who extract the inner process retain manual control of piped stdin instead of implicitly
+  closing it and sending EOF.
+- **Breaking:** Changed single-subscriber process spawning so delivery and replay must be selected
+  explicitly. `.no_replay()` starts the sole consumer at live output instead of buffered startup
+  output.
+- **Breaking:** Renamed stream sizing from chunk size/channel capacity to read chunk size/maximum
+  buffered chunks, including `OutputStream::read_chunk_size()`,
+  `OutputStream::max_buffered_chunks()`, `DEFAULT_READ_CHUNK_SIZE`, and
+  `DEFAULT_MAX_BUFFERED_CHUNKS`.
+- **Breaking:** Changed `Consumer::cancel()` from an unbounded cooperative cancel that returned
+  the sink directly to `Consumer::cancel(timeout)` returning `ConsumerCancelOutcome`. The new
+  method aborts the task if cooperative cancellation does not complete before `timeout`, so
+  cleanup cannot hang indefinitely.
 - **Breaking:** Changed normal stream consumers to subscribe from the earliest output currently
   available. Replay-enabled unsealed streams may provide retained past output; no-replay or sealed
   streams start future consumers at live output.
@@ -112,100 +143,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by a separate retained replay log. Slow active subscribers on `best_effort/replay` streams are
   bounded by their own live queue and receive a gap marker on overflow instead of pinning the
   shared replay buffer.
-- **Breaking:** Changed `wait_for_completion_or_terminate` to distinguish natural completion from
-  timeout-triggered cleanup with `WaitForCompletionOrTerminateResult`, and changed
-  output-collecting wait helpers to return dedicated compound error types instead of overloading
-  `WaitError`.
-- **Breaking:** Changed `send_interrupt_signal()`, `send_terminate_signal()`, and `kill()` to
-  return typed `TerminationError` diagnostics instead of raw `io::Error`.
-- **Breaking:** Replaced per-phase `TerminationError::TerminationFailed` diagnostic fields with
-  chronological `TerminationAttemptError` entries that preserve all recorded source errors as
-  `Send + Sync` values.
-- **Breaking:** Marked public error enums as non-exhaustive so future diagnostics can be added
-  without another source-breaking enum expansion.
-- **Breaking:** Changed `collect_chunks_into_vec`, `collect_lines_into_vec`,
-  `wait_for_completion_with_output`, and `wait_for_completion_with_raw_output` to require explicit
-  collection options. Removed trusted-output-only variants; use `TrustedUnbounded` collection
-  options to preserve previous unbounded behavior.
-- **Breaking:** Changed `ProcessHandle::into_inner()` to return `(Child, Stdin, Stdout, Stderr)` so
-  callers who extract the inner process retain manual control of piped stdin instead of implicitly
-  closing it and sending EOF.
-- **Breaking:** Changed `collect_chunks_into_write`, `collect_chunks_into_write_mapped`,
-  `collect_lines_into_write`, and `collect_lines_into_write_mapped` to require
-  `WriteCollectionOptions`; `WriteCollectionOptions::fail_fast()` stops on the first sink write
-  failure.
 - **Breaking:** Relaxed `Sink` to require only `Send`, allowing collectors and writer collectors
   to use sinks that are not `Debug` and cannot be shared concurrently.
-- **Breaking:** Changed single-subscriber process spawning so delivery and replay must be selected
-  explicitly. `.no_replay()` starts the sole consumer at live output instead of buffered startup
-  output.
-- Changed default automatic process names to include only the program name, avoiding accidental
-  logging of command arguments that may contain secrets.
-- Single-subscriber streams now allow one active consumer at a time instead of one consumer for the
-  entire stream lifetime. After a collector, inspector, or line waiter completes, is canceled, is
-  dropped, or times out, another consumer can attach. Concurrent consumers are rejected with
+- **Breaking:** Marked public error enums as non-exhaustive so future diagnostics can be added
+  without another source-breaking enum expansion.
+- Single-subscriber streams now allow one active consumer at a time instead of one consumer for
+  the entire stream lifetime. Once the active consumer completes, is canceled, is dropped, or
+  times out, another can attach. Concurrent consumers are rejected with
   `StreamConsumerError::ActiveConsumer`.
 - Replay-enabled single-subscriber streams retain configured replay history across sequential
   consumers, including output produced while no consumer is active. `.no_replay()` continues to
   discard output drained while no consumer is active.
+- Changed default automatic process names to include only the program name, avoiding accidental
+  logging of command arguments that may contain secrets.
+- Hardened `TerminateOnDrop`'s drop path: a missing or single-threaded tokio runtime now panics
+  with a message that names `TerminateOnDrop` and points at the multi-threaded-runtime
+  requirement, instead of bubbling up Tokio's internal panic message.
+- Migrated termination diagnostic display formatting to `thiserror` derives without changing the
+  emitted messages.
 - Reduced single-subscriber reader overhead by keeping best-effort and reliable delivery loops
   separate and avoiding replay bookkeeping for no-replay chunk and gap delivery.
 - Improved line-delivery throughput for ASCII output by fast-pathing line text conversion while
   preserving lossy handling for non-ASCII and invalid UTF-8 bytes.
-- Simplified the Criterion benchmark suite to focused chunk-delivery and line-delivery targets for
-  the single-subscriber and broadcast backends, added targeted replay-aware line-delivery cases,
-  added dedicated `just bench-smoke`, `just bench-chunks`, and `just bench-lines` commands, made
-  compile-only benchmark smoke the default workflow, and moved best-effort small-chunk overflow
-  stress out of the normal throughput matrix.
-- Extended `just verify` to run build and documentation checks in addition to format, clippy, and
-  tests.
 - Clarified README and backend documentation around backend selection, delivery policy, replay,
   and process naming.
+- Simplified the Criterion benchmark suite to focused chunk-delivery and line-delivery targets and
+  added dedicated `just bench-smoke`, `just bench-chunks`, and `just bench-lines` commands.
+- Extended `just verify` to run build and documentation checks in addition to format, clippy, and
+  tests.
 
 ### Fixed
 
-- **Breaking:** Fixed collector and inspector stream-read errors to rely on `StreamReadError` as
-  the single source of stream context, removing duplicate `stream_name` fields from
-  `CollectorError::StreamRead` and `InspectorError::StreamRead` and avoiding repeated Display
-  output.
-- Fixed `ProcessHandle::must_be_terminated()` so calling it on an already-armed handle is
-  idempotent instead of dropping the existing panic-on-drop guard and panicking immediately.
-- **Breaking:** Fixed `terminate()` so failed or canceled termination attempts no longer disarm the
-  drop cleanup and panic guards before the process has successfully terminated.
-- Fixed `send_interrupt_signal()` and `send_terminate_signal()` to reap children that exited
-  before signalling or during a failed signal attempt, avoiding stale PID/process-group targeting
-  and spurious signal failures.
-- Fixed `ProcessHandle::kill()` so a successful kill-and-wait disarms the drop cleanup and panic
-  guards, allowing the handle to be dropped safely afterward.
+- **Breaking:** Fixed timed `wait_for_completion_with_output*` and
+  `wait_for_completion_with_raw_output*` so the configured timeout now bounds both process
+  completion and stdout/stderr collection. Added `OutputCollectionTimeout` and
+  `OutputCollectionFailed` variants to the output wait error types (the latter carries the
+  process name), and stopped timed-out single-subscriber collectors from blocking later
+  consumers.
 - Fixed `wait_for_completion*()` helpers and `ProcessHandle::kill()` to close any still-open stdin
   handle before waiting for process exit, restoring Tokio-compatible deadlock avoidance after
   piped stdin ownership was split out of `Child`.
-- Rejected zero broadcast and single-subscriber maximum buffered chunk counts before spawning a
-  child process, avoiding Tokio channel-construction panics after process creation.
-- Preserved non-timeout wait errors from `wait_for_completion_or_terminate` while still attempting
-  cleanup termination after every wait failure.
+- **Breaking:** Fixed `terminate()` so failed or canceled termination attempts no longer disarm the
+  drop cleanup and panic guards before the process has successfully terminated.
+- Fixed `ProcessHandle::kill()` so a successful kill-and-wait disarms the drop cleanup and panic
+  guards, allowing the handle to be dropped safely afterward.
+- Fixed `ProcessHandle::must_be_terminated()` so calling it on an already-armed handle is
+  idempotent instead of dropping the existing panic-on-drop guard and panicking immediately.
 - Continued termination escalation when a graceful signal cannot be sent, and reported diagnostics
   from all attempted shutdown phases.
-- Fixed writer collectors so sink write errors are no longer silently suppressed unless explicitly
-  accepted by the configured write error handler.
-- Relaxed single-subscriber `inspect_chunks`, `collect_chunks`, and `collect_lines` callback bounds
-  to accept stateful `FnMut` closures.
-- Fixed Windows graceful interrupt delivery to use targeted `CTRL_BREAK_EVENT` for child process
-  groups and enabled the `Win32_System_Threading` feature required for process-group creation.
-- **Breaking:** Fixed timed `wait_for_completion_with_output*` and
-  `wait_for_completion_with_raw_output*` so configured timeouts bound both process completion and
-  stdout/stderr collection using the full effective wait-or-terminate budget, including inherited
-  output pipes held open by descendants and the fixed 3-second post-kill confirmation wait when
-  force-kill fallback is required. This adds `OutputCollectionTimeout` variants to the output wait
-  error types, surfaces real collector failures promptly even when the sibling stream remains
-  open, includes process names in `OutputCollectionFailed` errors, and keeps timed-out
-  single-subscriber collectors from blocking later consumers.
-- Fixed `Inspector::wait()` so dropping an in-flight wait future aborts the inspector task instead
-  of detaching it, releasing single-subscriber claims held by stuck async inspectors.
+- Preserved non-timeout wait errors from `wait_for_completion_or_terminate` while still attempting
+  cleanup termination after every wait failure.
+- Fixed `send_interrupt_signal()` and `send_terminate_signal()` to reap children that exited
+  before signalling or during a failed signal attempt, avoiding stale PID/process-group targeting
+  and spurious signal failures.
+- Fixed `Consumer::wait()` so dropping an in-flight wait future aborts the consumer task instead
+  of detaching it, releasing single-subscriber claims held by stuck async consumers.
 - Fixed dropped single-subscriber streams so active line waiters, collectors, and inspectors are
   unblocked instead of waiting forever.
 - Fixed best-effort single-subscriber streams to record EOF and read-error terminal events even
   when an active consumer queue is full.
+- Fixed writer collectors so sink write errors are no longer silently suppressed unless explicitly
+  accepted by the configured write error handler.
+- **Breaking:** Fixed consumer stream-read errors to rely on `StreamReadError` as the single
+  source of stream context (carrying the stream name once), instead of also carrying a duplicate
+  `stream_name` on the wrapping consumer error variant.
+- Rejected zero broadcast and single-subscriber maximum buffered chunk counts before spawning a
+  child process, avoiding Tokio channel-construction panics after process creation.
+- Relaxed single-subscriber `inspect_chunks`, `collect_chunks`, and `collect_lines` callback bounds
+  to accept stateful `FnMut` closures.
+- Fixed Windows graceful interrupt delivery to use targeted `CTRL_BREAK_EVENT` for child process
+  groups and enabled the `Win32_System_Threading` feature required for process-group creation.
 
 ### Removed
 
@@ -217,11 +224,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Removed the old `Process` stream-sizing and single-subscriber backpressure setter
   methods. Read chunk size, maximum buffered chunks, delivery, and replay are now configured on the
   per-stream builder.
-- **Breaking:** Removed `FromStreamOptions`, `DEFAULT_CHUNK_SIZE`, and `DEFAULT_CHANNEL_CAPACITY`;
-  direct stream construction now uses `StreamConfig`.
+- **Breaking:** Removed the `Inspector` and `InspectorError` types. The `inspect_*` factories now
+  return `Consumer<()>`; observe inspection completion via `Consumer::wait()` and cancel or abort
+  it the same way as any other consumer.
 - **Breaking:** Removed `BackpressureControl` and
   `SingleSubscriberOutputStream::backpressure_control()`. Single-subscriber buffering behavior is
   now represented directly by `DeliveryGuarantee`.
+- **Breaking:** Removed `FromStreamOptions`, `DEFAULT_CHUNK_SIZE`, and `DEFAULT_CHANNEL_CAPACITY`;
+  direct stream construction now uses `StreamConfig`.
+- **Breaking:** Removed `RunningState::as_bool` and the `From<RunningState> for bool` conversion.
+  Both collapsed `Uncertain(io::Error)` into `false`, silently discarding the error case. Match on
+  the enum, or use the new `RunningState::is_definitely_running()` predicate.
 - Removed the atomic-take dependency.
 
 ## [0.8.1] - 2026-04-11
