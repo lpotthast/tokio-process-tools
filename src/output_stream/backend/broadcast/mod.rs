@@ -16,37 +16,31 @@
 
 use crate::WaitForLineResult;
 use crate::output_stream::config::StreamConfig;
-use crate::output_stream::consumer::consumer::{spawn_consumer_async, spawn_consumer_sync};
-use crate::output_stream::consumer::line_waiter::LineWaiter;
+use crate::output_stream::consumer::{spawn_consumer_async, spawn_consumer_sync};
+use crate::output_stream::backend::factories::impl_consumer_factories;
 use crate::output_stream::consumer::visitor::consume_sync;
-use crate::output_stream::consumer::visitors::collect::{
-    CollectChunks, CollectChunksAsync, CollectLines, CollectLinesAsync,
-};
-use crate::output_stream::consumer::visitors::inspect::{
-    InspectChunks, InspectChunksAsync, InspectLines, InspectLinesAsync,
-};
-use crate::output_stream::consumer::visitors::wait::WaitForLine;
-use crate::output_stream::consumer::visitors::write::{WriteChunks, WriteLines};
+use crate::output_stream::line::LineAdapter;
+use crate::output_stream::consumer::visitors::wait::WaitForLineSink;
 use crate::output_stream::event::StreamEvent;
-use crate::output_stream::line::LineParserState;
 use crate::output_stream::policy::{
     BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, Replay, ReplayEnabled,
 };
 use crate::output_stream::{OutputStream, TrySubscribable};
 use crate::{
-    AsyncChunkCollector, AsyncLineCollector, AsyncStreamVisitor, Chunk, CollectedBytes,
-    CollectedLines, Consumer, LineCollectionOptions, LineParsingOptions, LineWriteMode, Next,
-    NumBytes, RawCollectionOptions, Sink, SinkWriteError, SinkWriteErrorHandler,
-    StreamConsumerError, StreamVisitor, WriteCollectionOptions,
+    AsyncStreamVisitor, Consumer, LineParsingOptions, NumBytes, StreamConsumerError, StreamVisitor,
 };
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::AsyncRead;
 #[cfg(test)]
 use tokio::sync::watch;
+
+/// Per-backend return-type alias used by the [`impl_consumer_factories!`] macro to keep the
+/// macro body backend-agnostic. Broadcast factories cannot fail, so the alias is the identity.
+type FactoryReturn<T> = T;
 
 mod fanout;
 mod fast;
@@ -379,334 +373,18 @@ where
         spawn_consumer_async(self.name(), self.subscribe_normal(), visitor)
     }
 
-    /// Inspects chunks of output from the stream without storing them.
-    ///
-    /// The provided closure is called for each chunk of data. Return [`Next::Continue`] to keep
-    /// processing or [`Next::Break`] to stop.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_chunks(&self, f: impl FnMut(Chunk) -> Next + Send + 'static) -> Consumer<()> {
-        self.consume_with(InspectChunks::builder().f(f).build())
-    }
-
-    /// Inspects chunks of output from the stream without storing them, using an async closure.
-    ///
-    /// The provided async closure is called for each chunk of data. Return [`Next::Continue`] to
-    /// keep processing or [`Next::Break`] to stop.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_chunks_async<Fut>(
-        &self,
-        f: impl FnMut(Chunk) -> Fut + Send + 'static,
-    ) -> Consumer<()>
-    where
-        Fut: Future<Output = Next> + Send + 'static,
-    {
-        self.consume_with_async(InspectChunksAsync::builder().f(f).build())
-    }
-
-    /// Inspects lines of output from the stream without storing them.
-    ///
-    /// The provided closure is called for each line. Return [`Next::Continue`] to keep
-    /// processing or [`Next::Break`] to stop.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `options.max_line_length` is zero.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_lines(
-        &self,
-        f: impl FnMut(Cow<'_, str>) -> Next + Send + 'static,
-        options: LineParsingOptions,
-    ) -> Consumer<()> {
-        self.consume_with(
-            InspectLines::builder()
-                .parser(LineParserState::new())
-                .options(options)
-                .f(f)
-                .build(),
-        )
-    }
-
-    /// Inspects lines of output from the stream without storing them, using an async closure.
-    ///
-    /// The provided async closure is called for each line. Return [`Next::Continue`] to keep
-    /// processing or [`Next::Break`] to stop.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `options.max_line_length` is zero.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn inspect_lines_async<Fut>(
-        &self,
-        f: impl FnMut(Cow<'_, str>) -> Fut + Send + 'static,
-        options: LineParsingOptions,
-    ) -> Consumer<()>
-    where
-        Fut: Future<Output = Next> + Send + 'static,
-    {
-        self.consume_with_async(
-            InspectLinesAsync::builder()
-                .parser(LineParserState::new())
-                .options(options)
-                .f(f)
-                .build(),
-        )
-    }
-
-    /// Collects chunks from the stream into a sink.
-    ///
-    /// The provided closure is called for each chunk, with mutable access to the sink.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks<S: Sink>(
-        &self,
-        into: S,
-        collect: impl FnMut(Chunk, &mut S) + Send + 'static,
-    ) -> Consumer<S> {
-        self.consume_with(CollectChunks::builder().sink(into).f(collect).build())
-    }
-
-    /// Collects chunks from the stream into a sink using an async collector.
-    ///
-    /// The provided async collector is called for each chunk, with mutable access to the sink.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_async<S, C>(&self, into: S, collect: C) -> Consumer<S>
-    where
-        S: Sink,
-        C: AsyncChunkCollector<S>,
-    {
-        self.consume_with_async(
-            CollectChunksAsync::builder()
-                .sink(into)
-                .collector(collect)
-                .build(),
-        )
-    }
-
-    /// Collects lines from the stream into a sink.
-    ///
-    /// The provided closure is called for each line, with mutable access to the sink. Return
-    /// [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `options.max_line_length` is zero.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines<S: Sink>(
-        &self,
-        into: S,
-        collect: impl FnMut(Cow<'_, str>, &mut S) -> Next + Send + 'static,
-        options: LineParsingOptions,
-    ) -> Consumer<S> {
-        self.consume_with(
-            CollectLines::builder()
-                .parser(LineParserState::new())
-                .options(options)
-                .sink(into)
-                .f(collect)
-                .build(),
-        )
-    }
-
-    /// Collects lines from the stream into a sink using an async collector.
-    ///
-    /// The provided async collector is called for each line, with mutable access to the sink.
-    /// Return [`Next::Continue`] to keep processing or [`Next::Break`] to stop.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_async<S, C>(
-        &self,
-        into: S,
-        collect: C,
-        options: LineParsingOptions,
-    ) -> Consumer<S>
-    where
-        S: Sink,
-        C: AsyncLineCollector<S>,
-    {
-        self.consume_with_async(
-            CollectLinesAsync::builder()
-                .parser(LineParserState::new())
-                .options(options)
-                .sink(into)
-                .collector(collect)
-                .build(),
-        )
-    }
-
-    /// Convenience method to collect chunks into a bounded byte vector.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_into_vec(
-        &self,
-        options: RawCollectionOptions,
-    ) -> Consumer<CollectedBytes> {
-        self.consume_with(
-            CollectChunks::builder()
-                .sink(CollectedBytes::new())
-                .f(move |chunk: Chunk, sink: &mut CollectedBytes| {
-                    sink.push_chunk(chunk.as_ref(), options);
-                })
-                .build(),
-        )
-    }
-
-    /// Convenience method to collect lines into a line buffer.
-    ///
-    /// `parsing_options.max_line_length` must be non-zero unless `collection_options` is
-    /// [`LineCollectionOptions::TrustedUnbounded`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `parsing_options.max_line_length` is zero and bounded collection is used.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_into_vec(
-        &self,
-        parsing_options: LineParsingOptions,
-        collection_options: LineCollectionOptions,
-    ) -> Consumer<CollectedLines> {
-        self.consume_with(
-            CollectLines::builder()
-                .parser(LineParserState::new())
-                .options(parsing_options)
-                .sink(CollectedLines::new())
-                .f(move |line: Cow<'_, str>, sink: &mut CollectedLines| {
-                    sink.push_line(line.into_owned(), collection_options);
-                    Next::Continue
-                })
-                .build(),
-        )
-    }
-
-    /// Collects chunks into an async writer.
-    ///
-    /// Sink write failures are handled according to `write_options`. Use
-    /// [`WriteCollectionOptions::fail_fast`] to stop collection and surface the
-    /// [`SinkWriteError`] as the inner `Err` of the resulting `Result<W, SinkWriteError>`,
-    /// [`WriteCollectionOptions::log_and_continue`] to log each failure and keep collecting, or
-    /// [`WriteCollectionOptions::with_error_handler`] to make a per-error continue-or-stop
-    /// decision.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_into_write<W, H>(
-        &self,
-        write: W,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Consumer<Result<W, SinkWriteError>>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        H: SinkWriteErrorHandler,
-    {
-        self.consume_with_async(
-            WriteChunks::builder()
-                .stream_name(self.name())
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper((|chunk: Chunk| chunk) as fn(Chunk) -> Chunk)
-                .error(None)
-                .build(),
-        )
-    }
-
-    /// Collects lines into an async writer.
-    ///
-    /// Parsed lines no longer include their trailing newline byte, so `mode` controls whether a
-    /// `\n` delimiter should be reintroduced for each emitted line.
-    ///
-    /// Sink write failures are handled according to `write_options` — see
-    /// [`collect_chunks_into_write`](Self::collect_chunks_into_write) for the failure-handling
-    /// options.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_into_write<W, H>(
-        &self,
-        write: W,
-        options: LineParsingOptions,
-        mode: LineWriteMode,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Consumer<Result<W, SinkWriteError>>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        H: SinkWriteErrorHandler,
-    {
-        self.consume_with_async(
-            WriteLines::builder()
-                .stream_name(self.name())
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper((|line: Cow<'_, str>| line.into_owned()) as fn(Cow<'_, str>) -> String)
-                .parser(LineParserState::new())
-                .options(options)
-                .mode(mode)
-                .error(None)
-                .build(),
-        )
-    }
-
-    /// Collects chunks into an async writer after mapping them with the provided function.
-    ///
-    /// Sink write failures are handled according to `write_options` — see
-    /// [`collect_chunks_into_write`](Self::collect_chunks_into_write) for the failure-handling
-    /// options.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_chunks_into_write_mapped<W, B, H>(
-        &self,
-        write: W,
-        mapper: impl Fn(Chunk) -> B + Send + Sync + 'static,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Consumer<Result<W, SinkWriteError>>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        B: AsRef<[u8]> + Send + 'static,
-        H: SinkWriteErrorHandler,
-    {
-        self.consume_with_async(
-            WriteChunks::builder()
-                .stream_name(self.name())
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper(mapper)
-                .error(None)
-                .build(),
-        )
-    }
-
-    /// Collects lines into an async writer after mapping them with the provided function.
-    ///
-    /// `mode` applies after `mapper`: choose [`LineWriteMode::AsIs`] when the mapped output
-    /// already contains delimiters, or [`LineWriteMode::AppendLf`] to append `\n` after each
-    /// mapped line.
-    ///
-    /// Sink write failures are handled according to `write_options` — see
-    /// [`collect_chunks_into_write`](Self::collect_chunks_into_write) for the failure-handling
-    /// options.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your callback is never called and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn collect_lines_into_write_mapped<W, B, H>(
-        &self,
-        write: W,
-        mapper: impl Fn(Cow<'_, str>) -> B + Send + Sync + 'static,
-        options: LineParsingOptions,
-        mode: LineWriteMode,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Consumer<Result<W, SinkWriteError>>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        B: AsRef<[u8]> + Send + 'static,
-        H: SinkWriteErrorHandler,
-    {
-        self.consume_with_async(
-            WriteLines::builder()
-                .stream_name(self.name())
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper(mapper)
-                .parser(LineParserState::new())
-                .options(options)
-                .mode(mode)
-                .error(None)
-                .build(),
-        )
-    }
+    impl_consumer_factories!();
 
     /// Waits for a line that matches the given predicate within `timeout`.
     ///
-    /// Returns `Ok(`[`crate::WaitForLineResult::Matched`]`)` if a matching line is found,
+    /// The returned future resolves to
+    /// `Ok(`[`crate::WaitForLineResult::Matched`]`)` if a matching line is found,
     /// `Ok(`[`crate::WaitForLineResult::StreamClosed`]`)` if the stream ends first, or
     /// `Ok(`[`crate::WaitForLineResult::Timeout`]`)` if the timeout expires first.
+    ///
+    /// The stream subscription is acquired synchronously inside this method, *before* the
+    /// returned future is polled, so output produced between this call and the first
+    /// `.await` cannot race ahead of the matcher.
     ///
     /// The waiter starts at the earliest output currently available to new consumers. With
     /// replay enabled and unsealed, that can include retained past output; otherwise it starts
@@ -723,21 +401,16 @@ where
     /// # Panics
     ///
     /// Panics if `options.max_line_length` is zero.
-    #[must_use]
     pub fn wait_for_line(
         &self,
         timeout: Duration,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
-    ) -> LineWaiter {
+    ) -> impl Future<Output = Result<WaitForLineResult, crate::StreamReadError>> + Send + 'static
+    {
         let subscription = self.subscribe_normal();
-        let visitor = WaitForLine::builder()
-            .parser(LineParserState::new())
-            .options(options)
-            .predicate(predicate)
-            .matched(false)
-            .build();
-        LineWaiter::new(async move {
+        let visitor = LineAdapter::new(options, WaitForLineSink::new(predicate));
+        async move {
             // Hold the sender on this stack frame so the receiver never fires while the future
             // is alive — the sender drops naturally when the future returns or is cancelled.
             let (_term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
@@ -749,7 +422,7 @@ where
                 Ok(Err(err)) => Err(err),
                 Err(_) => Ok(WaitForLineResult::Timeout),
             }
-        })
+        }
     }
 }
 

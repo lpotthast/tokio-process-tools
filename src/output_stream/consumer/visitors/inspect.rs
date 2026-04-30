@@ -1,7 +1,7 @@
+use crate::output_stream::line::{AsyncLineSink, LineSink};
 use super::super::visitor::{AsyncStreamVisitor, StreamVisitor};
 use crate::output_stream::Next;
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::{LineParserState, LineParsingOptions};
 use std::borrow::Cow;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -56,105 +56,82 @@ where
     fn into_output(self) -> Self::Output {}
 }
 
-#[derive(TypedBuilder)]
-pub(crate) struct InspectLines<F>
+/// [`LineSink`] wrapping a per-line closure. Compose with
+/// [`LineAdapter`](crate::output_stream::line::LineAdapter) to drive `inspect_lines`, or to
+/// build your own custom inspect-lines consumer outside the built-in factory methods.
+pub struct InspectLineSink<F> {
+    f: F,
+}
+
+impl<F> InspectLineSink<F>
 where
     F: FnMut(Cow<'_, str>) -> Next + Send + 'static,
 {
-    pub parser: LineParserState,
-    #[builder(setter(transform = |options: LineParsingOptions| {
-        assert_max_line_length_non_zero(&options);
-        options
-    }))]
-    pub options: LineParsingOptions,
-    pub f: F,
+    /// Creates a new sink that calls `f` once for each parsed line.
+    pub fn new(f: F) -> Self {
+        Self { f }
+    }
 }
 
-impl<F> StreamVisitor for InspectLines<F>
+impl<F> LineSink for InspectLineSink<F>
 where
     F: FnMut(Cow<'_, str>) -> Next + Send + 'static,
 {
     type Output = ();
 
-    fn on_chunk(&mut self, chunk: Chunk) -> Next {
-        self.parser
-            .visit_chunk(chunk.as_ref(), self.options, &mut self.f)
-    }
-
-    fn on_gap(&mut self) {
-        self.parser.on_gap();
-    }
-
-    fn on_eof(&mut self) {
-        let _ = self.parser.finish(&mut self.f);
+    fn on_line(&mut self, line: Cow<'_, str>) -> Next {
+        (self.f)(line)
     }
 
     fn into_output(self) -> Self::Output {}
 }
 
-#[derive(TypedBuilder)]
-pub(crate) struct InspectLinesAsync<F, Fut>
+/// [`AsyncLineSink`] wrapping a per-line async closure. Compose with
+/// [`LineAdapter`](crate::output_stream::line::LineAdapter) (its [`AsyncStreamVisitor`] impl
+/// is selected automatically when the inner sink is an [`AsyncLineSink`]) to drive
+/// `inspect_lines_async`. The `PhantomData<fn() -> Fut>` carries the future's type onto the
+/// struct so callers never name `Fut` explicitly.
+pub struct InspectLineSinkAsync<F, Fut> {
+    f: F,
+    _fut: PhantomData<fn() -> Fut>,
+}
+
+impl<F, Fut> InspectLineSinkAsync<F, Fut>
 where
     F: FnMut(Cow<'_, str>) -> Fut + Send + 'static,
     Fut: Future<Output = Next> + Send + 'static,
 {
-    pub parser: LineParserState,
-    #[builder(setter(transform = |options: LineParsingOptions| {
-        assert_max_line_length_non_zero(&options);
-        options
-    }))]
-    pub options: LineParsingOptions,
-    pub f: F,
-    /// See [`InspectChunksAsync::_fut`] — phantom marker so the `Fut` bound lives on the struct.
-    #[builder(default, setter(skip))]
-    pub _fut: PhantomData<fn() -> Fut>,
+    /// Creates a new sink that awaits `f` once for each parsed line.
+    pub fn new(f: F) -> Self {
+        Self {
+            f,
+            _fut: PhantomData,
+        }
+    }
 }
 
-impl<F, Fut> AsyncStreamVisitor for InspectLinesAsync<F, Fut>
+impl<F, Fut> AsyncLineSink for InspectLineSinkAsync<F, Fut>
 where
     F: FnMut(Cow<'_, str>) -> Fut + Send + 'static,
     Fut: Future<Output = Next> + Send + 'static,
 {
     type Output = ();
 
-    async fn on_chunk(&mut self, chunk: Chunk) -> Next {
-        for line in self.parser.owned_lines(chunk.as_ref(), self.options) {
-            if (self.f)(Cow::Owned(line)).await == Next::Break {
-                return Next::Break;
-            }
-        }
-        Next::Continue
-    }
-
-    fn on_gap(&mut self) {
-        self.parser.on_gap();
-    }
-
-    async fn on_eof(&mut self) {
-        if let Some(line) = self.parser.finish_owned() {
-            let _ = (self.f)(Cow::Owned(line)).await;
-        }
+    fn on_line<'a>(&'a mut self, line: Cow<'a, str>) -> impl Future<Output = Next> + Send + 'a {
+        (self.f)(line)
     }
 
     fn into_output(self) -> Self::Output {}
-}
-
-pub(super) fn assert_max_line_length_non_zero(options: &LineParsingOptions) {
-    assert!(
-        options.max_line_length.bytes() > 0,
-        "LineParsingOptions::max_line_length must be greater than zero. \
-         If you want effectively unbounded line parsing, pass `NumBytes::MAX` (or another \
-         large explicit value) — zero is never a valid configuration for line-consuming \
-         visitors."
-    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::consumer::{Consumer, spawn_consumer_sync};
+    use super::super::super::{Consumer, spawn_consumer_sync};
+    use crate::output_stream::line::LineAdapter;
     use super::super::super::test_support::event_receiver;
     use super::*;
     use crate::output_stream::event::StreamEvent;
+    use crate::output_stream::line::LineParsingOptions;
     use crate::{ConsumerCancelOutcome, ConsumerError, StreamReadError};
     use assertr::prelude::*;
     use bytes::Bytes;
@@ -190,14 +167,13 @@ mod tests {
         #[test]
         #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]
         fn panics_when_max_line_length_is_zero() {
-            let _visitor = InspectLines::builder()
-                .parser(LineParserState::new())
-                .options(LineParsingOptions {
+            let _visitor = LineAdapter::new(
+                LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: crate::LineOverflowBehavior::default(),
-                })
-                .f(|_line| Next::Continue)
-                .build();
+                },
+                InspectLineSink::new(|_line| Next::Continue),
+            );
         }
 
         #[tokio::test]
@@ -210,11 +186,10 @@ mod tests {
                     StreamEvent::ReadError(error),
                 ])
                 .await,
-                InspectLines::builder()
-                    .parser(LineParserState::new())
-                    .options(LineParsingOptions::default())
-                    .f(|_line| Next::Continue)
-                    .build(),
+                LineAdapter::new(
+                    LineParsingOptions::default(),
+                    InspectLineSink::new(|_line| Next::Continue),
+                ),
             );
 
             match inspector.wait().await {
@@ -243,14 +218,13 @@ mod tests {
                     StreamEvent::Eof,
                 ])
                 .await,
-                InspectLines::builder()
-                    .parser(LineParserState::new())
-                    .options(LineParsingOptions::default())
-                    .f(move |line| {
+                LineAdapter::new(
+                    LineParsingOptions::default(),
+                    InspectLineSink::new(move |line| {
                         seen_in_task.lock().unwrap().push(line.into_owned());
                         Next::Continue
-                    })
-                    .build(),
+                    }),
+                ),
             );
 
             inspector.wait().await.unwrap();
@@ -298,7 +272,7 @@ mod tests {
     }
 
     mod inspect_chunks_async {
-        use super::super::super::super::consumer::spawn_consumer_async;
+        use super::super::super::super::spawn_consumer_async;
         use super::*;
 
         #[tokio::test]
@@ -342,21 +316,20 @@ mod tests {
     }
 
     mod inspect_lines_async {
-        use super::super::super::super::consumer::spawn_consumer_async;
+        use super::super::super::super::spawn_consumer_async;
         use super::*;
         use crate::NumBytesExt;
 
         #[test]
         #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]
         fn panics_when_max_line_length_is_zero() {
-            let _visitor = InspectLinesAsync::builder()
-                .parser(LineParserState::new())
-                .options(LineParsingOptions {
+            let _visitor = LineAdapter::new(
+                LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: crate::LineOverflowBehavior::default(),
-                })
-                .f(|_line| async { Next::Continue })
-                .build();
+                },
+                InspectLineSinkAsync::new(|_line| async { Next::Continue }),
+            );
         }
 
         #[tokio::test]
@@ -370,18 +343,17 @@ mod tests {
                     StreamEvent::Eof,
                 ])
                 .await,
-                InspectLinesAsync::builder()
-                    .parser(LineParserState::new())
-                    .options(LineParsingOptions::default())
-                    .f(move |line| {
+                LineAdapter::new(
+                    LineParsingOptions::default(),
+                    InspectLineSinkAsync::new(move |line| {
                         let seen = Arc::clone(&seen_in_task);
                         let line = line.into_owned();
                         async move {
                             seen.lock().unwrap().push(line);
                             Next::Continue
                         }
-                    })
-                    .build(),
+                    }),
+                ),
             );
 
             inspector.wait().await.unwrap();

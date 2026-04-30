@@ -1,9 +1,8 @@
-use super::super::consumer::Sink;
+use super::super::Sink;
+use crate::output_stream::line::{AsyncLineSink, LineSink};
 use super::super::visitor::{AsyncStreamVisitor, StreamVisitor};
-use super::inspect::assert_max_line_length_non_zero;
 use crate::output_stream::Next;
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::{LineParserState, LineParsingOptions};
 use crate::output_stream::num_bytes::NumBytes;
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -341,47 +340,35 @@ where
     }
 }
 
-#[derive(TypedBuilder)]
-pub(crate) struct CollectLines<T, F>
+/// [`LineSink`] holding the user closure and a sink; `on_line` calls the closure with the
+/// line and a `&mut` borrow of the sink. Compose with
+/// [`LineAdapter`](crate::output_stream::line::LineAdapter) to drive `collect_lines`, or to
+/// build your own custom collect-lines consumer outside the built-in factory methods.
+pub struct CollectLineSink<T, F> {
+    sink: T,
+    f: F,
+}
+
+impl<T, F> CollectLineSink<T, F>
 where
     T: Sink,
     F: FnMut(Cow<'_, str>, &mut T) -> Next + Send + 'static,
 {
-    pub parser: LineParserState,
-    #[builder(setter(transform = |options: LineParsingOptions| {
-        assert_max_line_length_non_zero(&options);
-        options
-    }))]
-    pub options: LineParsingOptions,
-    pub sink: T,
-    pub f: F,
+    /// Creates a new sink that calls `f` with each parsed line and a `&mut` borrow of `sink`.
+    pub fn new(sink: T, f: F) -> Self {
+        Self { sink, f }
+    }
 }
 
-impl<T, F> StreamVisitor for CollectLines<T, F>
+impl<T, F> LineSink for CollectLineSink<T, F>
 where
     T: Sink,
     F: FnMut(Cow<'_, str>, &mut T) -> Next + Send + 'static,
 {
     type Output = T;
 
-    fn on_chunk(&mut self, chunk: Chunk) -> Next {
-        let Self {
-            parser,
-            options,
-            sink,
-            f,
-        } = self;
-        parser.visit_chunk(chunk.as_ref(), *options, |line| f(line, sink))
-    }
-
-    fn on_gap(&mut self) {
-        self.parser.on_gap();
-    }
-
-    fn on_eof(&mut self) {
-        if let Some(line) = self.parser.finish_owned() {
-            let _ = (self.f)(Cow::Owned(line), &mut self.sink);
-        }
+    fn on_line(&mut self, line: Cow<'_, str>) -> Next {
+        (self.f)(line, &mut self.sink)
     }
 
     fn into_output(self) -> Self::Output {
@@ -389,55 +376,36 @@ where
     }
 }
 
-#[derive(TypedBuilder)]
-pub(crate) struct CollectLinesAsync<T, C>
+/// [`AsyncLineSink`] holding the user collector and a sink. Compose with
+/// [`LineAdapter`](crate::output_stream::line::LineAdapter) (its [`AsyncStreamVisitor`] impl
+/// is selected automatically when the inner sink is an [`AsyncLineSink`]) to drive
+/// `collect_lines_async`.
+pub struct CollectLineSinkAsync<T, C> {
+    sink: T,
+    collector: C,
+}
+
+impl<T, C> CollectLineSinkAsync<T, C>
 where
     T: Sink,
     C: AsyncLineCollector<T>,
 {
-    pub parser: LineParserState,
-    #[builder(setter(transform = |options: LineParsingOptions| {
-        assert_max_line_length_non_zero(&options);
-        options
-    }))]
-    pub options: LineParsingOptions,
-    pub sink: T,
-    pub collector: C,
+    /// Creates a new sink that awaits `collector` with each parsed line and a `&mut` borrow of
+    /// `sink`.
+    pub fn new(sink: T, collector: C) -> Self {
+        Self { sink, collector }
+    }
 }
 
-impl<T, C> AsyncStreamVisitor for CollectLinesAsync<T, C>
+impl<T, C> AsyncLineSink for CollectLineSinkAsync<T, C>
 where
     T: Sink,
     C: AsyncLineCollector<T>,
 {
     type Output = T;
 
-    async fn on_chunk(&mut self, chunk: Chunk) -> Next {
-        let Self {
-            parser,
-            options,
-            sink,
-            collector,
-        } = self;
-        for line in parser.owned_lines(chunk.as_ref(), *options) {
-            if collector.collect(Cow::Owned(line), sink).await == Next::Break {
-                return Next::Break;
-            }
-        }
-        Next::Continue
-    }
-
-    fn on_gap(&mut self) {
-        self.parser.on_gap();
-    }
-
-    async fn on_eof(&mut self) {
-        if let Some(line) = self.parser.finish_owned() {
-            let _ = self
-                .collector
-                .collect(Cow::Owned(line), &mut self.sink)
-                .await;
-        }
+    fn on_line<'a>(&'a mut self, line: Cow<'a, str>) -> impl Future<Output = Next> + Send + 'a {
+        self.collector.collect(line, &mut self.sink)
     }
 
     fn into_output(self) -> Self::Output {
@@ -447,11 +415,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::consumer::{spawn_consumer_async, spawn_consumer_sync};
+    use super::super::super::{spawn_consumer_async, spawn_consumer_sync};
+    use crate::output_stream::line::LineAdapter;
     use super::super::super::test_support::event_receiver;
     use super::*;
     use crate::ConsumerError;
     use crate::output_stream::event::StreamEvent;
+    use crate::output_stream::line::LineParsingOptions;
     use crate::output_stream::num_bytes::NumBytesExt;
     use crate::{AsyncChunkCollector, AsyncLineCollector};
     use assertr::prelude::*;
@@ -943,15 +913,16 @@ mod tests {
                 StreamEvent::ReadError(error),
             ])
             .await,
-            CollectLines::builder()
-                .parser(LineParserState::new())
-                .options(LineParsingOptions::default())
-                .sink(Vec::<String>::new())
-                .f(|line, lines: &mut Vec<String>| {
-                    lines.push(line.into_owned());
-                    Next::Continue
-                })
-                .build(),
+            LineAdapter::new(
+                LineParsingOptions::default(),
+                CollectLineSink::new(
+                    Vec::<String>::new(),
+                    |line, lines: &mut Vec<String>| {
+                        lines.push(line.into_owned());
+                        Next::Continue
+                    },
+                ),
+            ),
         );
 
         match collector.wait().await {
@@ -978,15 +949,16 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            CollectLines::builder()
-                .parser(LineParserState::new())
-                .options(LineParsingOptions::default())
-                .sink(Vec::<String>::new())
-                .f(|line, lines: &mut Vec<String>| {
-                    lines.push(line.into_owned());
-                    Next::Continue
-                })
-                .build(),
+            LineAdapter::new(
+                LineParsingOptions::default(),
+                CollectLineSink::new(
+                    Vec::<String>::new(),
+                    |line, lines: &mut Vec<String>| {
+                        lines.push(line.into_owned());
+                        Next::Continue
+                    },
+                ),
+            ),
         );
 
         let lines = collector.wait().await.unwrap();
@@ -1064,16 +1036,17 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            CollectLines::builder()
-                .parser(LineParserState::new())
-                .options(LineParsingOptions::default())
-                .sink(Vec::new())
-                .f(move |line: Cow<'_, str>, indexed_lines: &mut Vec<String>| {
-                    line_index += 1;
-                    indexed_lines.push(format!("{line_index}:{line}"));
-                    Next::Continue
-                })
-                .build(),
+            LineAdapter::new(
+                LineParsingOptions::default(),
+                CollectLineSink::new(
+                    Vec::new(),
+                    move |line: Cow<'_, str>, indexed_lines: &mut Vec<String>| {
+                        line_index += 1;
+                        indexed_lines.push(format!("{line_index}:{line}"));
+                        Next::Continue
+                    },
+                ),
+            ),
         );
 
         let indexed_lines = collector.wait().await.unwrap();
@@ -1107,12 +1080,10 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            CollectLinesAsync::builder()
-                .parser(LineParserState::new())
-                .options(LineParsingOptions::default())
-                .sink(Vec::new())
-                .collector(BreakOnLine)
-                .build(),
+            LineAdapter::new(
+                LineParsingOptions::default(),
+                CollectLineSinkAsync::new(Vec::new(), BreakOnLine),
+            ),
         );
 
         let seen = collector.wait().await.unwrap();

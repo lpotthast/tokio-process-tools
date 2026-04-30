@@ -26,16 +26,19 @@ pub use output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
 pub use output_stream::config::{
     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, StreamConfig, StreamConfigBuilder,
 };
-pub use output_stream::consumer::consumer::{Consumer, ConsumerCancelOutcome, ConsumerError, Sink};
-pub use output_stream::consumer::line_waiter::LineWaiter;
+pub use output_stream::consumer::{Consumer, ConsumerCancelOutcome, ConsumerError, Sink};
+pub use output_stream::line::{AsyncLineSink, LineAdapter, LineParser, LineSink};
 pub use output_stream::consumer::visitor::{AsyncStreamVisitor, StreamVisitor};
 pub use output_stream::consumer::visitors::collect::{
     AsyncChunkCollector, AsyncLineCollector, CollectedBytes, CollectedLines,
-    CollectionOverflowBehavior, LineCollectionOptions, RawCollectionOptions,
+    CollectionOverflowBehavior, CollectLineSink, CollectLineSinkAsync, LineCollectionOptions,
+    RawCollectionOptions,
 };
+pub use output_stream::consumer::visitors::inspect::{InspectLineSink, InspectLineSinkAsync};
+pub use output_stream::consumer::visitors::wait::WaitForLineSink;
 pub use output_stream::consumer::visitors::write::{
     LineWriteMode, SinkWriteError, SinkWriteErrorAction, SinkWriteErrorHandler, SinkWriteOperation,
-    WriteCollectionOptions,
+    WriteCollectionOptions, WriteLineSink,
 };
 pub use output_stream::event::Chunk;
 pub use output_stream::line::{LineOverflowBehavior, LineParsingOptions};

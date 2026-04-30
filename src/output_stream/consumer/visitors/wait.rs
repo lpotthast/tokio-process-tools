@@ -1,68 +1,42 @@
-use super::super::visitor::StreamVisitor;
-use super::inspect::assert_max_line_length_non_zero;
+use crate::output_stream::line::LineSink;
 use crate::output_stream::Next;
-use crate::output_stream::event::Chunk;
-use crate::output_stream::line::{LineParserState, LineParsingOptions};
 use std::borrow::Cow;
-use typed_builder::TypedBuilder;
 
-#[derive(TypedBuilder)]
-pub(crate) struct WaitForLine<P>
+/// [`LineSink`] that breaks the moment a predicate accepts a line and remembers whether it
+/// has matched yet. Compose with
+/// [`LineAdapter`](crate::output_stream::line::LineAdapter) to drive `wait_for_line`, or to
+/// build your own custom predicate-driven consumer outside the built-in factory methods.
+pub struct WaitForLineSink<P> {
+    predicate: P,
+    matched: bool,
+}
+
+impl<P> WaitForLineSink<P>
 where
     P: Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
 {
-    pub parser: LineParserState,
-    #[builder(setter(transform = |options: LineParsingOptions| {
-        assert_max_line_length_non_zero(&options);
-        options
-    }))]
-    pub options: LineParsingOptions,
-    pub predicate: P,
-    pub matched: bool,
+    /// Creates a new sink that breaks the parser the first time `predicate` returns `true`.
+    pub fn new(predicate: P) -> Self {
+        Self {
+            predicate,
+            matched: false,
+        }
+    }
 }
 
-impl<P> StreamVisitor for WaitForLine<P>
+impl<P> LineSink for WaitForLineSink<P>
 where
     P: Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
 {
     type Output = bool;
 
-    fn on_chunk(&mut self, chunk: Chunk) -> Next {
-        let Self {
-            parser,
-            options,
-            predicate,
-            matched,
-        } = self;
-        parser.visit_chunk(chunk.as_ref(), *options, |line| {
-            if predicate(line) {
-                *matched = true;
-                Next::Break
-            } else {
-                Next::Continue
-            }
-        })
-    }
-
-    fn on_gap(&mut self) {
-        self.parser.on_gap();
-    }
-
-    fn on_eof(&mut self) {
-        let Self {
-            parser,
-            predicate,
-            matched,
-            ..
-        } = self;
-        let _ = parser.finish(|line| {
-            if predicate(line) {
-                *matched = true;
-                Next::Break
-            } else {
-                Next::Continue
-            }
-        });
+    fn on_line(&mut self, line: Cow<'_, str>) -> Next {
+        if (self.predicate)(line) {
+            self.matched = true;
+            Next::Break
+        } else {
+            Next::Continue
+        }
     }
 
     fn into_output(self) -> Self::Output {
@@ -72,9 +46,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::output_stream::line::LineAdapter;
     use super::super::super::visitor::consume_sync;
     use super::*;
     use crate::output_stream::event::{Chunk, StreamEvent};
+    use crate::output_stream::line::LineParsingOptions;
     use crate::{LineOverflowBehavior, NumBytesExt, StreamReadError, WaitForLineResult};
     use assertr::prelude::*;
     use bytes::Bytes;
@@ -82,10 +58,10 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
 
-    /// Drive a `WaitForLine` visitor over the supplied events and translate the visitor's
-    /// `bool` output into [`WaitForLineResult`]. Mirrors what the deleted `wait_for_line`
-    /// factory used to do; lives in tests because production code now drives the visitor
-    /// straight from the backend method.
+    /// Drive a `WaitForLineSink` over the supplied events and translate the visitor's `bool`
+    /// output into [`WaitForLineResult`]. Mirrors what the deleted `wait_for_line` factory
+    /// used to do; lives in tests because production code now drives the visitor straight from
+    /// the backend method.
     async fn drive_wait_for_line(
         events: Vec<StreamEvent>,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
@@ -98,12 +74,7 @@ mod tests {
         drop(tx);
 
         let (_term_sig_tx, term_sig_rx) = oneshot::channel::<()>();
-        let visitor = WaitForLine::builder()
-            .parser(LineParserState::new())
-            .options(options)
-            .predicate(predicate)
-            .matched(false)
-            .build();
+        let visitor = LineAdapter::new(options, WaitForLineSink::new(predicate));
         let matched = consume_sync(rx, visitor, term_sig_rx).await?;
         if matched {
             Ok(WaitForLineResult::Matched)
@@ -195,15 +166,13 @@ mod tests {
         #[test]
         #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]
         fn panics_when_max_line_length_is_zero() {
-            let _visitor = WaitForLine::builder()
-                .parser(LineParserState::new())
-                .options(LineParsingOptions {
+            let _visitor = LineAdapter::new(
+                LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: LineOverflowBehavior::default(),
-                })
-                .predicate(|_line| true)
-                .matched(false)
-                .build();
+                },
+                WaitForLineSink::new(|_line| true),
+            );
         }
 
         #[tokio::test]
@@ -234,12 +203,10 @@ mod tests {
         async fn times_out_with_timeout_error() {
             let (_tx, rx) = mpsc::channel::<StreamEvent>(1);
             let (_term_sig_tx, term_sig_rx) = oneshot::channel::<()>();
-            let visitor = WaitForLine::builder()
-                .parser(LineParserState::new())
-                .options(LineParsingOptions::default())
-                .predicate(|line| line == "ready")
-                .matched(false)
-                .build();
+            let visitor = LineAdapter::new(
+                LineParsingOptions::default(),
+                WaitForLineSink::new(|line| line == "ready"),
+            );
             let timeout = tokio::time::timeout(
                 Duration::from_millis(25),
                 consume_sync(rx, visitor, term_sig_rx),

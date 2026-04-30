@@ -1,9 +1,8 @@
-use super::super::consumer::Sink;
+use super::super::Sink;
+use crate::output_stream::line::AsyncLineSink;
 use super::super::visitor::AsyncStreamVisitor;
-use super::inspect::assert_max_line_length_non_zero;
 use crate::output_stream::Next;
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::{LineParserState, LineParsingOptions};
 use std::borrow::Cow;
 use std::io;
 use tokio::io::AsyncWriteExt;
@@ -235,29 +234,56 @@ where
     }
 }
 
-#[derive(TypedBuilder)]
-pub(crate) struct WriteLines<W, H, F, B>
+/// [`AsyncLineSink`] that maps each parsed line through `mapper`, writes the result via
+/// `writer`, and routes failures through `error_handler`. Compose with
+/// [`LineAdapter`](crate::output_stream::line::LineAdapter) (its [`AsyncStreamVisitor`] impl
+/// is selected automatically when the inner sink is an [`AsyncLineSink`]) to drive
+/// `collect_lines_into_write` and friends, or to build your own custom write-lines consumer
+/// outside the built-in factory methods.
+pub struct WriteLineSink<W, H, F, B>
 where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
     B: AsRef<[u8]> + Send + 'static,
     F: Fn(Cow<'_, str>) -> B + Send + Sync + 'static,
 {
-    pub stream_name: &'static str,
-    pub writer: W,
-    pub error_handler: H,
-    pub mapper: F,
-    pub parser: LineParserState,
-    #[builder(setter(transform = |options: LineParsingOptions| {
-        assert_max_line_length_non_zero(&options);
-        options
-    }))]
-    pub options: LineParsingOptions,
-    pub mode: LineWriteMode,
-    pub error: Option<SinkWriteError>,
+    stream_name: &'static str,
+    writer: W,
+    error_handler: H,
+    mapper: F,
+    mode: LineWriteMode,
+    error: Option<SinkWriteError>,
 }
 
-impl<W, H, F, B> AsyncStreamVisitor for WriteLines<W, H, F, B>
+impl<W, H, F, B> WriteLineSink<W, H, F, B>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+    B: AsRef<[u8]> + Send + 'static,
+    F: Fn(Cow<'_, str>) -> B + Send + Sync + 'static,
+{
+    /// Creates a new sink that maps each parsed line through `mapper`, writes the result to
+    /// `writer` with the requested `mode`, and routes failures through `error_handler`.
+    /// `stream_name` labels the stream in any [`SinkWriteError`] this sink emits.
+    pub fn new(
+        stream_name: &'static str,
+        writer: W,
+        error_handler: H,
+        mapper: F,
+        mode: LineWriteMode,
+    ) -> Self {
+        Self {
+            stream_name,
+            writer,
+            error_handler,
+            mapper,
+            mode,
+            error: None,
+        }
+    }
+}
+
+impl<W, H, F, B> AsyncLineSink for WriteLineSink<W, H, F, B>
 where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
@@ -266,52 +292,22 @@ where
 {
     type Output = Result<W, SinkWriteError>;
 
-    async fn on_chunk(&mut self, chunk: Chunk) -> Next {
-        let Self {
-            stream_name,
-            writer,
-            error_handler,
-            mapper,
-            parser,
-            options,
-            mode,
-            error,
-        } = self;
-        for line in parser.owned_lines(chunk.as_ref(), *options) {
-            let mapped_output = mapper(Cow::Owned(line));
-            if let Err(err) = write_line(
-                stream_name,
-                writer,
-                error_handler,
-                mapped_output.as_ref(),
-                *mode,
-            )
-            .await
-            {
-                *error = Some(err);
-                return Next::Break;
-            }
-        }
-        Next::Continue
-    }
-
-    fn on_gap(&mut self) {
-        self.parser.on_gap();
-    }
-
-    async fn on_eof(&mut self) {
-        if let Some(line) = self.parser.finish_owned() {
-            let mapped_output = (self.mapper)(Cow::Owned(line));
-            if let Err(err) = write_line(
-                self.stream_name,
-                &mut self.writer,
-                &mut self.error_handler,
-                mapped_output.as_ref(),
-                self.mode,
-            )
-            .await
-            {
+    async fn on_line<'a>(&'a mut self, line: Cow<'a, str>) -> Next {
+        let mapped_output = (self.mapper)(line);
+        let bytes = mapped_output.as_ref();
+        match write_line(
+            self.stream_name,
+            &mut self.writer,
+            &mut self.error_handler,
+            bytes,
+            self.mode,
+        )
+        .await
+        {
+            Ok(()) => Next::Continue,
+            Err(err) => {
                 self.error = Some(err);
+                Next::Break
             }
         }
     }
@@ -382,11 +378,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::consumer::{Consumer, spawn_consumer_async};
+    use super::super::super::{Consumer, spawn_consumer_async};
+    use crate::output_stream::line::LineAdapter;
     use super::super::super::test_support::event_receiver;
     use super::*;
     use crate::output_stream::Subscription;
     use crate::output_stream::event::StreamEvent;
+    use crate::output_stream::line::LineParsingOptions;
     use assertr::prelude::*;
     use bytes::Bytes;
     use std::cell::Cell;
@@ -397,8 +395,8 @@ mod tests {
     use tokio::io::AsyncWrite;
 
     // Test-only helpers replacing the deleted factory functions. They build the visitor via
-    // the typed builder and spawn a consumer task — the same shape every test wants without
-    // each test repeating the builder boilerplate.
+    // its constructor and spawn a consumer task — the same shape every test wants without
+    // each test repeating the boilerplate.
     fn collect_chunks_into_write<S, W, H>(
         stream_name: &'static str,
         subscription: S,
@@ -466,16 +464,16 @@ mod tests {
         spawn_consumer_async(
             stream_name,
             subscription,
-            WriteLines::builder()
-                .stream_name(stream_name)
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper((|line: Cow<'_, str>| line.into_owned()) as fn(Cow<'_, str>) -> String)
-                .parser(LineParserState::new())
-                .options(options)
-                .mode(mode)
-                .error(None)
-                .build(),
+            LineAdapter::new(
+                options,
+                WriteLineSink::new(
+                    stream_name,
+                    write,
+                    write_options.into_error_handler(),
+                    (|line: Cow<'_, str>| line.into_owned()) as fn(Cow<'_, str>) -> String,
+                    mode,
+                ),
+            ),
         )
     }
 
@@ -498,16 +496,16 @@ mod tests {
         spawn_consumer_async(
             stream_name,
             subscription,
-            WriteLines::builder()
-                .stream_name(stream_name)
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper(mapper)
-                .parser(LineParserState::new())
-                .options(options)
-                .mode(mode)
-                .error(None)
-                .build(),
+            LineAdapter::new(
+                options,
+                WriteLineSink::new(
+                    stream_name,
+                    write,
+                    write_options.into_error_handler(),
+                    mapper,
+                    mode,
+                ),
+            ),
         )
     }
 

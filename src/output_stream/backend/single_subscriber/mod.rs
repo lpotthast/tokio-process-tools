@@ -2,29 +2,19 @@
 
 use crate::WaitForLineResult;
 use crate::output_stream::config::StreamConfig;
-use crate::output_stream::consumer::consumer::{spawn_consumer_async, spawn_consumer_sync};
-use crate::output_stream::consumer::line_waiter::LineWaiter;
+use crate::output_stream::consumer::{spawn_consumer_async, spawn_consumer_sync};
+use crate::output_stream::backend::factories::impl_consumer_factories;
 use crate::output_stream::consumer::visitor::consume_sync;
-use crate::output_stream::consumer::visitors::collect::{
-    CollectChunks, CollectChunksAsync, CollectLines, CollectLinesAsync,
-};
-use crate::output_stream::consumer::visitors::inspect::{
-    InspectChunks, InspectChunksAsync, InspectLines, InspectLinesAsync,
-};
-use crate::output_stream::consumer::visitors::wait::WaitForLine;
-use crate::output_stream::consumer::visitors::write::{WriteChunks, WriteLines};
+use crate::output_stream::line::LineAdapter;
+use crate::output_stream::consumer::visitors::wait::WaitForLineSink;
 use crate::output_stream::event::StreamEvent;
-use crate::output_stream::line::LineParserState;
 use crate::output_stream::policy::{
     BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, Replay, ReplayEnabled,
     ReplayRetention,
 };
 use crate::output_stream::{OutputStream, Subscription, TrySubscribable};
 use crate::{
-    AsyncChunkCollector, AsyncLineCollector, AsyncStreamVisitor, Chunk, CollectedBytes,
-    CollectedLines, Consumer, LineCollectionOptions, LineParsingOptions, LineWriteMode, Next,
-    NumBytes, RawCollectionOptions, Sink, SinkWriteError, SinkWriteErrorHandler,
-    StreamConsumerError, StreamVisitor, WriteCollectionOptions,
+    AsyncStreamVisitor, Consumer, LineParsingOptions, NumBytes, StreamConsumerError, StreamVisitor,
 };
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -32,9 +22,14 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// Per-backend return-type alias used by the [`impl_consumer_factories!`] macro to keep the
+/// macro body backend-agnostic. Single-subscriber factories may fail when a consumer is
+/// already active, so each factory return is wrapped in `Result<_, StreamConsumerError>`.
+type FactoryReturn<T> = Result<T, StreamConsumerError>;
 
 mod reader;
 mod state;
@@ -305,335 +300,7 @@ where
         ))
     }
 
-    /// Tries to inspect chunks of output from the stream without storing them.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn inspect_chunks(
-        &self,
-        f: impl FnMut(Chunk) -> Next + Send + 'static,
-    ) -> Result<Consumer<()>, StreamConsumerError> {
-        self.consume_with(InspectChunks::builder().f(f).build())
-    }
-
-    /// Tries to inspect chunks of output from the stream without storing them, using an async
-    /// closure.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn inspect_chunks_async<Fut>(
-        &self,
-        f: impl FnMut(Chunk) -> Fut + Send + 'static,
-    ) -> Result<Consumer<()>, StreamConsumerError>
-    where
-        Fut: Future<Output = Next> + Send + 'static,
-    {
-        self.consume_with_async(InspectChunksAsync::builder().f(f).build())
-    }
-
-    /// Tries to inspect lines of output from the stream without storing them.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `options.max_line_length` is zero.
-    pub fn inspect_lines(
-        &self,
-        f: impl FnMut(Cow<'_, str>) -> Next + Send + 'static,
-        options: LineParsingOptions,
-    ) -> Result<Consumer<()>, StreamConsumerError> {
-        self.consume_with(
-            InspectLines::builder()
-                .parser(LineParserState::new())
-                .options(options)
-                .f(f)
-                .build(),
-        )
-    }
-
-    /// Tries to inspect lines of output from the stream without storing them, using an async
-    /// closure.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `options.max_line_length` is zero.
-    pub fn inspect_lines_async<Fut>(
-        &self,
-        f: impl FnMut(Cow<'_, str>) -> Fut + Send + 'static,
-        options: LineParsingOptions,
-    ) -> Result<Consumer<()>, StreamConsumerError>
-    where
-        Fut: Future<Output = Next> + Send + 'static,
-    {
-        self.consume_with_async(
-            InspectLinesAsync::builder()
-                .parser(LineParserState::new())
-                .options(options)
-                .f(f)
-                .build(),
-        )
-    }
-
-    /// Tries to collect chunks from the stream into a sink.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn collect_chunks<S: Sink>(
-        &self,
-        into: S,
-        collect: impl FnMut(Chunk, &mut S) + Send + 'static,
-    ) -> Result<Consumer<S>, StreamConsumerError> {
-        self.consume_with(CollectChunks::builder().sink(into).f(collect).build())
-    }
-
-    /// Tries to collect chunks from the stream into a sink using an async collector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn collect_chunks_async<S, C>(
-        &self,
-        into: S,
-        collect: C,
-    ) -> Result<Consumer<S>, StreamConsumerError>
-    where
-        S: Sink,
-        C: AsyncChunkCollector<S>,
-    {
-        self.consume_with_async(
-            CollectChunksAsync::builder()
-                .sink(into)
-                .collector(collect)
-                .build(),
-        )
-    }
-
-    /// Tries to collect lines from the stream into a sink.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `options.max_line_length` is zero.
-    pub fn collect_lines<S: Sink>(
-        &self,
-        into: S,
-        collect: impl FnMut(Cow<'_, str>, &mut S) -> Next + Send + 'static,
-        options: LineParsingOptions,
-    ) -> Result<Consumer<S>, StreamConsumerError> {
-        self.consume_with(
-            CollectLines::builder()
-                .parser(LineParserState::new())
-                .options(options)
-                .sink(into)
-                .f(collect)
-                .build(),
-        )
-    }
-
-    /// Tries to collect lines from the stream into a sink using an async collector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn collect_lines_async<S, C>(
-        &self,
-        into: S,
-        collect: C,
-        options: LineParsingOptions,
-    ) -> Result<Consumer<S>, StreamConsumerError>
-    where
-        S: Sink,
-        C: AsyncLineCollector<S>,
-    {
-        self.consume_with_async(
-            CollectLinesAsync::builder()
-                .parser(LineParserState::new())
-                .options(options)
-                .sink(into)
-                .collector(collect)
-                .build(),
-        )
-    }
-
-    /// Tries to collect chunks into a bounded byte vector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn collect_chunks_into_vec(
-        &self,
-        options: RawCollectionOptions,
-    ) -> Result<Consumer<CollectedBytes>, StreamConsumerError> {
-        self.consume_with(
-            CollectChunks::builder()
-                .sink(CollectedBytes::new())
-                .f(move |chunk: Chunk, sink: &mut CollectedBytes| {
-                    sink.push_chunk(chunk.as_ref(), options);
-                })
-                .build(),
-        )
-    }
-
-    /// Tries to collect lines into a line buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `parsing_options.max_line_length` is zero and bounded collection is used.
-    pub fn collect_lines_into_vec(
-        &self,
-        parsing_options: LineParsingOptions,
-        collection_options: LineCollectionOptions,
-    ) -> Result<Consumer<CollectedLines>, StreamConsumerError> {
-        self.consume_with(
-            CollectLines::builder()
-                .parser(LineParserState::new())
-                .options(parsing_options)
-                .sink(CollectedLines::new())
-                .f(move |line: Cow<'_, str>, sink: &mut CollectedLines| {
-                    sink.push_line(line.into_owned(), collection_options);
-                    Next::Continue
-                })
-                .build(),
-        )
-    }
-
-    /// Tries to collect chunks into an async writer.
-    ///
-    /// Sink write failures are handled according to `write_options`. Use
-    /// [`WriteCollectionOptions::fail_fast`] to surface the [`SinkWriteError`] as the inner
-    /// `Err` of the resulting `Result<W, SinkWriteError>`,
-    /// [`WriteCollectionOptions::log_and_continue`] to log each failure and keep collecting, or
-    /// [`WriteCollectionOptions::with_error_handler`] to make a per-error continue-or-stop
-    /// decision.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn collect_chunks_into_write<W, H>(
-        &self,
-        write: W,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Result<Consumer<Result<W, SinkWriteError>>, StreamConsumerError>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        H: SinkWriteErrorHandler,
-    {
-        self.consume_with_async(
-            WriteChunks::builder()
-                .stream_name(self.name())
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper((|chunk: Chunk| chunk) as fn(Chunk) -> Chunk)
-                .error(None)
-                .build(),
-        )
-    }
-
-    /// Tries to collect lines into an async writer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn collect_lines_into_write<W, H>(
-        &self,
-        write: W,
-        options: LineParsingOptions,
-        mode: LineWriteMode,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Result<Consumer<Result<W, SinkWriteError>>, StreamConsumerError>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        H: SinkWriteErrorHandler,
-    {
-        self.consume_with_async(
-            WriteLines::builder()
-                .stream_name(self.name())
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper((|line: Cow<'_, str>| line.into_owned()) as fn(Cow<'_, str>) -> String)
-                .parser(LineParserState::new())
-                .options(options)
-                .mode(mode)
-                .error(None)
-                .build(),
-        )
-    }
-
-    /// Tries to collect chunks into an async writer after mapping them.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn collect_chunks_into_write_mapped<W, B, H>(
-        &self,
-        write: W,
-        mapper: impl Fn(Chunk) -> B + Send + Sync + 'static,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Result<Consumer<Result<W, SinkWriteError>>, StreamConsumerError>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        B: AsRef<[u8]> + Send + 'static,
-        H: SinkWriteErrorHandler,
-    {
-        self.consume_with_async(
-            WriteChunks::builder()
-                .stream_name(self.name())
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper(mapper)
-                .error(None)
-                .build(),
-        )
-    }
-
-    /// Tries to collect lines into an async writer after mapping them.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn collect_lines_into_write_mapped<W, B, H>(
-        &self,
-        write: W,
-        mapper: impl Fn(Cow<'_, str>) -> B + Send + Sync + 'static,
-        options: LineParsingOptions,
-        mode: LineWriteMode,
-        write_options: WriteCollectionOptions<H>,
-    ) -> Result<Consumer<Result<W, SinkWriteError>>, StreamConsumerError>
-    where
-        W: Sink + AsyncWriteExt + Unpin,
-        B: AsRef<[u8]> + Send + 'static,
-        H: SinkWriteErrorHandler,
-    {
-        self.consume_with_async(
-            WriteLines::builder()
-                .stream_name(self.name())
-                .writer(write)
-                .error_handler(write_options.into_error_handler())
-                .mapper(mapper)
-                .parser(LineParserState::new())
-                .options(options)
-                .mode(mode)
-                .error(None)
-                .build(),
-        )
-    }
+    impl_consumer_factories!();
 
     /// Tries to wait for a line that matches the given predicate within `timeout`.
     ///
@@ -649,15 +316,13 @@ where
         timeout: Duration,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
         options: LineParsingOptions,
-    ) -> Result<LineWaiter, StreamConsumerError> {
+    ) -> Result<
+        impl Future<Output = Result<WaitForLineResult, crate::StreamReadError>> + Send + 'static,
+        StreamConsumerError,
+    > {
         let subscription = self.take_subscription()?;
-        let visitor = WaitForLine::builder()
-            .parser(LineParserState::new())
-            .options(options)
-            .predicate(predicate)
-            .matched(false)
-            .build();
-        Ok(LineWaiter::new(async move {
+        let visitor = LineAdapter::new(options, WaitForLineSink::new(predicate));
+        Ok(async move {
             let (_term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
             match tokio::time::timeout(timeout, consume_sync(subscription, visitor, term_sig_rx))
                 .await
@@ -667,7 +332,7 @@ where
                 Ok(Err(err)) => Err(err),
                 Err(_) => Ok(WaitForLineResult::Timeout),
             }
-        }))
+        })
     }
 }
 

@@ -15,10 +15,11 @@ use super::ProcessHandle;
 use crate::error::{
     WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitWithOutputError,
 };
-use crate::output_stream::consumer::consumer::{Consumer, spawn_consumer_sync};
-use crate::output_stream::consumer::visitors::collect::{CollectChunks, CollectLines};
+use crate::output_stream::consumer::{Consumer, spawn_consumer_sync};
+use crate::output_stream::line::LineAdapter;
+use crate::output_stream::consumer::visitors::collect::{CollectChunks, CollectLineSink};
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::{LineParserState, LineParsingOptions};
+use crate::output_stream::line::LineParsingOptions;
 use crate::output_stream::{Next, Subscription, TrySubscribable};
 use crate::process_handle::WaitForCompletionOrTerminateOptions;
 use crate::process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
@@ -40,15 +41,16 @@ where
     spawn_consumer_sync(
         stream_name,
         subscription,
-        CollectLines::builder()
-            .parser(LineParserState::new())
-            .options(parsing_options)
-            .sink(CollectedLines::new())
-            .f(move |line: Cow<'_, str>, sink: &mut CollectedLines| {
-                sink.push_line(line.into_owned(), collection_options);
-                Next::Continue
-            })
-            .build(),
+        LineAdapter::new(
+            parsing_options,
+            CollectLineSink::new(
+                CollectedLines::new(),
+                move |line: Cow<'_, str>, sink: &mut CollectedLines| {
+                    sink.push_line(line.into_owned(), collection_options);
+                    Next::Continue
+                },
+            ),
+        ),
     )
 }
 
