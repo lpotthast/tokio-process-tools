@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-05-04
+
+### Added
+
+- Added a fluent typestate builder for `GracefulTimeouts`. `GracefulTimeouts::builder().unix((interrupt, terminate))
+  .windows(graceful).build()` produces a `GracefulTimeouts` without cfg gates at the call site: the setter for the
+  platform that does not match the current target accepts its arguments without using them. The literal-struct
+  construction stays available for code that intentionally tunes Unix and Windows independently. The new
+  `GracefulTimeoutsBuilder<State>` type and a free `both(d) -> (Duration, Duration)` helper for the common
+  "both Unix phases share a value" case are re-exported from the crate root.
+
 ## [0.10.0] - 2026-05-04
 
 ### Added
@@ -599,7 +610,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added process state helpers such as `id()` and `is_running()`.
 - Added `collect_into_*` helpers on `OutputStream`.
 
-[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.10.1...HEAD
+
+[0.10.1]: https://github.com/lpotthast/tokio-process-tools/compare/v0.10.0...v0.10.1
 
 [0.10.0]: https://github.com/lpotthast/tokio-process-tools/compare/v0.9.2...v0.10.0
 

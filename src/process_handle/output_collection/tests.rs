@@ -6,7 +6,7 @@ use crate::{
     AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
     GracefulTimeouts, LineCollectionOptions, LineOutputOptions, NumBytesExt, RawCollectionOptions,
     RawOutputOptions, StreamConsumerError, WaitForCompletionOrTerminateOptions,
-    WaitWithOutputError,
+    WaitWithOutputError, both,
 };
 use assertr::prelude::*;
 use std::time::Duration;
@@ -718,15 +718,10 @@ mod wait_for_completion_with_output_or_terminate {
         // Tight graceful timeouts on purpose: the descendant `sleep 0.5` keeps stdout open for
         // 500 ms, so the operation deadline must be much shorter than that to actually fire.
         let wait_timeout = Duration::from_millis(100);
-        #[cfg(unix)]
-        let graceful_timeouts = GracefulTimeouts {
-            interrupt_timeout: Duration::from_millis(1),
-            terminate_timeout: Duration::from_millis(1),
-        };
-        #[cfg(windows)]
-        let graceful_timeouts = GracefulTimeouts {
-            graceful_timeout: Duration::from_millis(2),
-        };
+        let graceful_timeouts = GracefulTimeouts::builder()
+            .unix(both(Duration::from_millis(1)))
+            .windows(Duration::from_millis(2))
+            .build();
         let operation_timeout = wait_timeout + graceful_timeouts.total();
         let result = tokio::time::timeout(
             Duration::from_secs(1),

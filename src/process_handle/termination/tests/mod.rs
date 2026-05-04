@@ -10,6 +10,7 @@ use crate::{
 use assertr::prelude::*;
 
 mod error_types;
+mod graceful_timeouts_builder;
 mod kill;
 mod preflight_reap;
 mod signal_failures;

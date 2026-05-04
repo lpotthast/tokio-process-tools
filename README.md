@@ -67,7 +67,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.10.0"
+tokio-process-tools = "0.10.1"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
 ```
 
@@ -344,17 +344,10 @@ async fn main() {
 
     process.seal_output_replay();
 
-    #[cfg(unix)]
-    let timeouts = GracefulTimeouts {
-        interrupt_timeout: Duration::from_secs(3),
-        terminate_timeout: Duration::from_secs(5),
-    };
-    #[cfg(windows)]
-    let timeouts = GracefulTimeouts {
-        graceful_timeout: Duration::from_secs(8),
-    };
-
-    let _ = process.terminate(timeouts).await;
+    let _ = process.terminate(GracefulTimeouts::builder()
+        .unix((Duration::from_secs(3), Duration::from_secs(5)))
+        .windows(Duration::from_secs(8))
+        .build()).await;
 }
 ```
 
@@ -511,20 +504,13 @@ async fn main() {
         .spawn()
         .expect("failed to spawn command");
 
-    #[cfg(unix)]
-    let graceful_timeouts = GracefulTimeouts {
-        interrupt_timeout: Duration::from_secs(3),
-        terminate_timeout: Duration::from_secs(5),
-    };
-    #[cfg(windows)]
-    let graceful_timeouts = GracefulTimeouts {
-        graceful_timeout: Duration::from_secs(8),
-    };
-
     match process
         .wait_for_completion_or_terminate(WaitForCompletionOrTerminateOptions {
             wait_timeout: Duration::from_secs(30),
-            graceful_timeouts,
+            graceful_timeouts: GracefulTimeouts::builder()
+                .unix((Duration::from_secs(3), Duration::from_secs(5)))
+                .windows(Duration::from_secs(8))
+                .build(),
         })
         .await
     {
@@ -639,26 +625,6 @@ because the underlying graceful-shutdown model is platform-conditional:
   `SIGINT` -> `SIGTERM` -> `SIGKILL` escalation.
 - On Windows it carries a single `graceful_timeout`, matching the 2-phase
   `CTRL_BREAK_EVENT` -> `TerminateProcess` shutdown.
-
-Cross-platform callers construct the value under cfg gates and then pass it to the
-cross-platform `terminate(...)` and `wait_for_completion_or_terminate(...)` signatures:
-
-```rust,ignore
-use std::time::Duration;
-use tokio_process_tools::GracefulTimeouts;
-
-#[cfg(unix)]
-let timeouts = GracefulTimeouts {
-    interrupt_timeout: Duration::from_secs(3),
-    terminate_timeout: Duration::from_secs(5),
-};
-#[cfg(windows)]
-let timeouts = GracefulTimeouts {
-    graceful_timeout: Duration::from_secs(8),
-};
-
-process.terminate(timeouts).await?;
-```
 
 Each user-supplied graceful timeout bounds the post-signal wait of its phase:
 
@@ -816,15 +782,10 @@ use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
-    #[cfg(unix)]
-    let timeouts = GracefulTimeouts {
-        interrupt_timeout: Duration::from_secs(3),
-        terminate_timeout: Duration::from_secs(5),
-    };
-    #[cfg(windows)]
-    let timeouts = GracefulTimeouts {
-        graceful_timeout: Duration::from_secs(8),
-    };
+    let timeouts = GracefulTimeouts::builder()
+        .unix((Duration::from_secs(3), Duration::from_secs(5)))
+        .windows(Duration::from_secs(8))
+        .build();
 
     let _process = Process::new(Command::new("some-command"))
         .name(AutoName::program_only())

@@ -6,6 +6,8 @@ use crate::output_stream::OutputStream;
 use std::borrow::Cow;
 use std::error::Error;
 use std::io;
+#[cfg(any(unix, windows))]
+use std::marker::PhantomData;
 use std::process::ExitStatus;
 use std::time::Duration;
 
@@ -43,11 +45,40 @@ const KILL_LABEL: &str = "kill";
 /// Per-platform graceful-shutdown timeout budget passed to [`ProcessHandle::terminate`] and
 /// related APIs.
 ///
-/// The shape mirrors the platform's actual graceful-shutdown model. Cross-platform code
-/// constructs the value under cfg gates and then passes it to the cross-platform `terminate(...)`
-/// signature:
+/// The shape mirrors the platform's actual graceful-shutdown model. On Unix the type carries
+/// two separate timeout, one per graceful phase (`SIGINT` then `SIGTERM`). On Windows it carries
+/// a single timeout for the single graceful phase (`CTRL_BREAK_EVENT`)  on that platform.
 ///
-/// ```rust,ignore
+/// # Cross-platform construction
+///
+/// Use [`GracefulTimeouts::builder`] to write a single cross-platform construction expression.
+/// The setter for the platform that does not match the current target accepts its arguments
+/// without using them, so no cfg gates are needed at the call site:
+///
+/// ```rust
+/// use std::time::Duration;
+/// use tokio_process_tools::{GracefulTimeouts, both};
+///
+/// let timeouts = GracefulTimeouts::builder()
+///     .unix((Duration::from_secs(3), Duration::from_secs(5)))
+///     .windows(Duration::from_secs(8))
+///     .build();
+///
+/// // For the common case where both Unix phases share a value:
+/// let timeouts = GracefulTimeouts::builder()
+///     .unix(both(Duration::from_secs(3)))
+///     .windows(Duration::from_secs(8))
+///     .build();
+///
+/// process.terminate(timeouts).await?;
+/// ```
+///
+/// # Platform-specific construction
+///
+/// Code that intentionally tunes Unix and Windows independently can also construct the value
+/// directly with cfg gates:
+///
+/// ```rust
 /// use std::time::Duration;
 /// use tokio_process_tools::GracefulTimeouts;
 ///
@@ -60,15 +91,9 @@ const KILL_LABEL: &str = "kill";
 /// let timeouts = GracefulTimeouts {
 ///     graceful_timeout: Duration::from_secs(8),
 /// };
-///
-/// process.terminate(timeouts).await?;
 /// ```
 ///
-/// On Unix the type carries two separate budgets, one per graceful phase
-/// (`SIGINT` then `SIGTERM`). On Windows it carries a single budget because
-/// `GenerateConsoleCtrlEvent` can only target a child's process group with `CTRL_BREAK_EVENT`;
-/// sending the same event a second time cannot do more than the first send already did, so the
-/// Windows `terminate(...)` runs exactly one graceful step.
+/// # Platform availability
 ///
 /// This type is only available on Unix and Windows because the underlying graceful-shutdown
 /// signals only exist there. On other Tokio-supported targets the spawn, wait,
@@ -93,6 +118,29 @@ pub struct GracefulTimeouts {
 
 #[cfg(any(unix, windows))]
 impl GracefulTimeouts {
+    /// Start a fluent specification of a `GracefulTimeouts` value.
+    ///
+    /// Call [`unix`](GracefulTimeoutsBuilder::unix), then
+    /// [`windows`](GracefulTimeoutsBuilder::windows), then
+    /// [`build`](GracefulTimeoutsBuilder::build). The setter for the platform that does not
+    /// match the current target accepts its arguments without using them, which lets
+    /// cross-platform code construct the value without cfg gates.
+    ///
+    /// See the [type-level documentation](GracefulTimeouts#cross-platform-construction) for an
+    /// example.
+    #[must_use]
+    pub fn builder() -> GracefulTimeoutsBuilder<UnixUnset> {
+        GracefulTimeoutsBuilder {
+            #[cfg(unix)]
+            interrupt_timeout: Duration::ZERO,
+            #[cfg(unix)]
+            terminate_timeout: Duration::ZERO,
+            #[cfg(windows)]
+            graceful_timeout: Duration::ZERO,
+            _state: PhantomData,
+        }
+    }
+
     /// Combined graceful-shutdown budget, used for downstream output-collection deadlines.
     pub(crate) fn total(self) -> Duration {
         #[cfg(unix)]
@@ -105,6 +153,114 @@ impl GracefulTimeouts {
             self.graceful_timeout
         }
     }
+}
+
+/// Typestate marker indicating that the Unix-side budgets have not been provided yet.
+#[cfg(any(unix, windows))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct UnixUnset;
+
+/// Typestate marker indicating that the Unix-side budgets have been provided but the
+/// Windows-side budget has not.
+#[cfg(any(unix, windows))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct UnixSet;
+
+/// Typestate marker indicating that both the Unix-side and Windows-side budgets have been
+/// provided. A builder in this state can be finished with
+/// [`build`](GracefulTimeoutsBuilder::build).
+#[cfg(any(unix, windows))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct BothSet;
+
+/// Typestate builder for [`GracefulTimeouts`]. Created via [`GracefulTimeouts::builder`].
+///
+/// Both [`unix`](Self::unix) and [`windows`](Self::windows) must be called (in that order)
+/// before [`build`](Self::build) becomes available. The setter for the platform that does not
+/// match the current target accepts its arguments without using them, so cross-platform code
+/// can build a value without cfg gates.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Copy)]
+pub struct GracefulTimeoutsBuilder<State> {
+    #[cfg(unix)]
+    interrupt_timeout: Duration,
+    #[cfg(unix)]
+    terminate_timeout: Duration,
+    #[cfg(windows)]
+    graceful_timeout: Duration,
+    _state: PhantomData<fn() -> State>,
+}
+
+#[cfg(any(unix, windows))]
+impl GracefulTimeoutsBuilder<UnixUnset> {
+    /// Set the Unix-side budgets as a `(interrupt_timeout, terminate_timeout)` tuple.
+    ///
+    /// Use [`both`] for the common case where both phases share the same value.
+    ///
+    /// On non-Unix targets the tuple is accepted but unused.
+    #[must_use]
+    pub fn unix(self, timeouts: (Duration, Duration)) -> GracefulTimeoutsBuilder<UnixSet> {
+        #[cfg(not(unix))]
+        let _ = timeouts;
+        GracefulTimeoutsBuilder {
+            #[cfg(unix)]
+            interrupt_timeout: timeouts.0,
+            #[cfg(unix)]
+            terminate_timeout: timeouts.1,
+            #[cfg(windows)]
+            graceful_timeout: self.graceful_timeout,
+            _state: PhantomData,
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl GracefulTimeoutsBuilder<UnixSet> {
+    /// Set the Windows-side graceful budget.
+    ///
+    /// On non-Windows targets the value is accepted but unused.
+    #[must_use]
+    pub fn windows(self, graceful_timeout: Duration) -> GracefulTimeoutsBuilder<BothSet> {
+        #[cfg(not(windows))]
+        let _ = graceful_timeout;
+        GracefulTimeoutsBuilder {
+            #[cfg(unix)]
+            interrupt_timeout: self.interrupt_timeout,
+            #[cfg(unix)]
+            terminate_timeout: self.terminate_timeout,
+            #[cfg(windows)]
+            graceful_timeout,
+            _state: PhantomData,
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl GracefulTimeoutsBuilder<BothSet> {
+    /// Finish the builder, producing a [`GracefulTimeouts`] populated from the
+    /// platform-relevant inputs.
+    #[must_use]
+    pub fn build(self) -> GracefulTimeouts {
+        GracefulTimeouts {
+            #[cfg(unix)]
+            interrupt_timeout: self.interrupt_timeout,
+            #[cfg(unix)]
+            terminate_timeout: self.terminate_timeout,
+            #[cfg(windows)]
+            graceful_timeout: self.graceful_timeout,
+        }
+    }
+}
+
+/// Returns `(d, d)`. Convenience for [`GracefulTimeoutsBuilder::unix`] when both Unix phases
+/// share a value.
+#[cfg(any(unix, windows))]
+#[must_use]
+pub const fn both(d: Duration) -> (Duration, Duration) {
+    (d, d)
 }
 
 #[cfg(any(unix, windows))]

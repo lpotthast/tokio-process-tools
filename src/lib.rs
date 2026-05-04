@@ -62,7 +62,9 @@ pub use process_handle::WaitForCompletionOrTerminateOptions;
 pub use process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
 pub use process_handle::output_collection::output::ProcessOutput;
 #[cfg(any(unix, windows))]
-pub use process_handle::termination::GracefulTimeouts;
+pub use process_handle::termination::{
+    BothSet, GracefulTimeouts, GracefulTimeoutsBuilder, UnixSet, UnixUnset, both,
+};
 pub use process_handle::{ProcessHandle, RunningState, Stdin};
 #[cfg(any(unix, windows))]
 pub use terminate_on_drop::TerminateOnDrop;

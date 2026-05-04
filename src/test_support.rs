@@ -1,9 +1,9 @@
-#[cfg(any(unix, windows))]
-use crate::GracefulTimeouts;
 use crate::{
     CollectionOverflowBehavior, LineCollectionOptions, LineOutputOptions, LineOverflowBehavior,
     LineParsingOptions, NumBytesExt, RawCollectionOptions, RawOutputOptions,
 };
+#[cfg(any(unix, windows))]
+use crate::{GracefulTimeouts, both};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -13,37 +13,19 @@ use tokio::io::{AsyncRead, ReadBuf};
 /// Per-platform `GracefulTimeouts` value with a sensible 1s graceful budget per phase.
 #[cfg(any(unix, windows))]
 pub(crate) fn default_graceful_timeouts() -> GracefulTimeouts {
-    #[cfg(unix)]
-    {
-        GracefulTimeouts {
-            interrupt_timeout: Duration::from_secs(1),
-            terminate_timeout: Duration::from_secs(1),
-        }
-    }
-    #[cfg(windows)]
-    {
-        GracefulTimeouts {
-            graceful_timeout: Duration::from_secs(2),
-        }
-    }
+    GracefulTimeouts::builder()
+        .unix(both(Duration::from_secs(1)))
+        .windows(Duration::from_secs(2))
+        .build()
 }
 
 /// Per-platform `GracefulTimeouts` value with a short 50 ms graceful budget per phase.
 #[cfg(any(unix, windows))]
 pub(crate) fn short_graceful_timeouts() -> GracefulTimeouts {
-    #[cfg(unix)]
-    {
-        GracefulTimeouts {
-            interrupt_timeout: Duration::from_millis(50),
-            terminate_timeout: Duration::from_millis(50),
-        }
-    }
-    #[cfg(windows)]
-    {
-        GracefulTimeouts {
-            graceful_timeout: Duration::from_millis(100),
-        }
-    }
+    GracefulTimeouts::builder()
+        .unix(both(Duration::from_millis(50)))
+        .windows(Duration::from_millis(100))
+        .build()
 }
 
 pub(crate) fn line_parsing_options() -> LineParsingOptions {
