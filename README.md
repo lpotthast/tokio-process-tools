@@ -1,5 +1,11 @@
 # tokio-process-tools
 
+[![Crates.io](https://img.shields.io/crates/v/tokio-process-tools.svg)](https://crates.io/crates/tokio-process-tools)
+[![Docs.rs](https://docs.rs/tokio-process-tools/badge.svg)](https://docs.rs/tokio-process-tools)
+[![CI](https://github.com/lpotthast/tokio-process-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/lpotthast/tokio-process-tools/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89.0-blue.svg)](https://github.com/lpotthast/tokio-process-tools/blob/main/Cargo.toml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/tokio-process-tools.svg)](#license)
+
 A correctness-focused async subprocess library for Tokio. It wraps `tokio::process::Command` and exposes explicit
 controls over resource limits, output consumption, process termination, and cleanup.
 
@@ -61,7 +67,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.9.1"
+tokio-process-tools = "0.9.2"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
 ```
 
