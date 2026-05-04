@@ -69,8 +69,6 @@ const KILL_LABEL: &str = "kill";
 ///     .unix(both(Duration::from_secs(3)))
 ///     .windows(Duration::from_secs(8))
 ///     .build();
-///
-/// process.terminate(timeouts).await?;
 /// ```
 ///
 /// # Platform-specific construction
