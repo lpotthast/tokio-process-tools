@@ -114,10 +114,24 @@ pub struct TerminationAttemptError {
 pub enum TerminationAttemptPhase {
     /// Initial process status check before any termination signal is sent.
     Preflight,
+
     /// Graceful interrupt phase.
+    ///
+    /// Only emitted on Unix, where this is the `SIGINT` step that begins the graceful escalation.
+    /// Windows has no targetable `SIGINT` analogue: `GenerateConsoleCtrlEvent` cannot deliver
+    /// `CTRL_C_EVENT` to a single child group, and `CTRL_BREAK_EVENT` is harsher than a Unix
+    /// interrupt, so Windows skips this phase and goes straight to [`Self::Terminate`].
     Interrupt,
+
     /// Graceful terminate phase.
+    ///
+    /// On Unix this is the `SIGTERM` step that follows the `SIGINT` phase. On Windows this
+    /// represents the single `CTRL_BREAK_EVENT` graceful step (the only console control event
+    /// `GenerateConsoleCtrlEvent` can target at a nonzero process group); it sits in this phase
+    /// rather than [`Self::Interrupt`] because `CTRL_BREAK_EVENT` is closer in severity to
+    /// `SIGTERM` than to `SIGINT`.
     Terminate,
+
     /// Forceful kill phase.
     Kill,
 }

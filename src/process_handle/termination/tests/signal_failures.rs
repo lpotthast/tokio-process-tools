@@ -6,10 +6,22 @@ async fn send_signal_returns_typed_error_when_child_is_still_running_after_signa
     let mut signal_attempts = 0;
     let mut reap_attempts = 0;
 
+    #[cfg(unix)]
+    let (phase, label, expected_phase) = (
+        GracefulTerminationPhase::Interrupt,
+        "SIGINT",
+        TerminationAttemptPhase::Interrupt,
+    );
+    #[cfg(windows)]
+    let (phase, label, expected_phase) = (
+        GracefulTerminationPhase::Terminate,
+        "CTRL_BREAK_EVENT",
+        TerminationAttemptPhase::Terminate,
+    );
     let error = process
         .send_signal_with_reaper(
-            GracefulTerminationPhase::Interrupt,
-            signal::INTERRUPT_SIGNAL_NAME,
+            phase,
+            label,
             |_| {
                 signal_attempts += 1;
                 Err(io::Error::new(
@@ -29,9 +41,9 @@ async fn send_signal_returns_typed_error_when_child_is_still_running_after_signa
     assert_that!(error.attempt_errors().len()).is_equal_to(1);
     assert_attempt_error(
         &error.attempt_errors()[0],
-        TerminationAttemptPhase::Interrupt,
+        expected_phase,
         TerminationAttemptOperation::SendSignal,
-        Some(signal::INTERRUPT_SIGNAL_NAME),
+        Some(label),
         io::ErrorKind::PermissionDenied,
         "injected signal failure",
     );
@@ -42,6 +54,7 @@ async fn send_signal_returns_typed_error_when_child_is_still_running_after_signa
     process.kill().await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn send_signal_reports_signal_and_reap_failures_in_order() {
     let mut process = spawn_long_running_process();
@@ -50,7 +63,7 @@ async fn send_signal_reports_signal_and_reap_failures_in_order() {
     let error = process
         .send_signal_with_reaper(
             GracefulTerminationPhase::Terminate,
-            signal::TERMINATE_SIGNAL_NAME,
+            "SIGTERM",
             |_| {
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -75,7 +88,7 @@ async fn send_signal_reports_signal_and_reap_failures_in_order() {
         &error.attempt_errors()[0],
         TerminationAttemptPhase::Terminate,
         TerminationAttemptOperation::SendSignal,
-        Some(signal::TERMINATE_SIGNAL_NAME),
+        Some("SIGTERM"),
         io::ErrorKind::PermissionDenied,
         "injected signal failure",
     );
@@ -83,7 +96,7 @@ async fn send_signal_reports_signal_and_reap_failures_in_order() {
         &error.attempt_errors()[1],
         TerminationAttemptPhase::Terminate,
         TerminationAttemptOperation::CheckStatus,
-        Some(signal::TERMINATE_SIGNAL_NAME),
+        Some("SIGTERM"),
         io::ErrorKind::Other,
         "injected status failure",
     );

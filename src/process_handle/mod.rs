@@ -4,11 +4,12 @@ mod drop_guard;
 pub(crate) mod output_collection;
 mod replay;
 mod spawn;
-mod termination;
+pub(crate) mod termination;
 mod wait;
 
 use crate::output_stream::OutputStream;
 use crate::panic_on_drop::PanicOnDrop;
+use crate::process_handle::termination::GracefulTimeouts;
 use std::borrow::Cow;
 use std::io;
 use std::mem::ManuallyDrop;
@@ -18,16 +19,21 @@ use tokio::process::Child;
 use tokio::process::ChildStdin;
 
 /// Options for waiting until a process exits, terminating it if waiting fails.
+///
+/// `graceful_timeouts` is a [`GracefulTimeouts`] value, whose shape itself differs per platform
+/// (two timeouts on Unix, one on Windows). Cross-platform callers construct it under cfg gates;
+/// the wait-or-terminate signature stays the same on every supported OS.
+///
+/// This type is only available on Unix and Windows because the underlying `terminate(...)`
+/// machinery is gated to those platforms.
+#[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaitForCompletionOrTerminateOptions {
     /// Maximum time to wait before attempting termination.
     pub wait_timeout: Duration,
 
-    /// Maximum time to wait after sending the interrupt signal.
-    pub interrupt_timeout: Duration,
-
-    /// Maximum time to wait after sending the terminate signal.
-    pub terminate_timeout: Duration,
+    /// Per-platform graceful-shutdown timeout budget. See [`GracefulTimeouts`].
+    pub graceful_timeouts: GracefulTimeouts,
 }
 
 /// Represents the `stdin` stream of a child process.

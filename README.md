@@ -344,9 +344,17 @@ async fn main() {
 
     process.seal_output_replay();
 
-    let _ = process
-        .terminate(Duration::from_secs(3), Duration::from_secs(5))
-        .await;
+    #[cfg(unix)]
+    let timeouts = GracefulTimeouts {
+        interrupt_timeout: Duration::from_secs(3),
+        terminate_timeout: Duration::from_secs(5),
+    };
+    #[cfg(windows)]
+    let timeouts = GracefulTimeouts {
+        graceful_timeout: Duration::from_secs(8),
+    };
+
+    let _ = process.terminate(timeouts).await;
 }
 ```
 
@@ -503,11 +511,20 @@ async fn main() {
         .spawn()
         .expect("failed to spawn command");
 
+    #[cfg(unix)]
+    let graceful_timeouts = GracefulTimeouts {
+        interrupt_timeout: Duration::from_secs(3),
+        terminate_timeout: Duration::from_secs(5),
+    };
+    #[cfg(windows)]
+    let graceful_timeouts = GracefulTimeouts {
+        graceful_timeout: Duration::from_secs(8),
+    };
+
     match process
         .wait_for_completion_or_terminate(WaitForCompletionOrTerminateOptions {
             wait_timeout: Duration::from_secs(30),
-            interrupt_timeout: Duration::from_secs(3),
-            terminate_timeout: Duration::from_secs(5),
+            graceful_timeouts,
         })
         .await
     {
@@ -614,20 +631,58 @@ path was taken, `into_output` always runs, so `Consumer::wait()` and `cancel()` 
 
 ### Termination timeouts
 
-`terminate(interrupt_timeout, terminate_timeout)` bounds the post-signal wait of each graceful phase:
+`terminate(...)` always takes a single [`GracefulTimeouts`] argument; the signature is identical
+on every supported platform. `GracefulTimeouts` itself carries platform-conditional fields,
+because the underlying graceful-shutdown model is platform-conditional:
 
-| Scenario per phase                        | Time spent in this phase                |                                                                              
-|-------------------------------------------|-----------------------------------------|                                                                              
-| Signal send succeeds, child exits         | ≤ user timeout (typically much less)    |                                                                              
-| Signal send succeeds, child does NOT exit | exactly user timeout, then escalate     |                                                                              
+- On Unix it carries `interrupt_timeout` and `terminate_timeout`, matching the 3-phase
+  `SIGINT` -> `SIGTERM` -> `SIGKILL` escalation.
+- On Windows it carries a single `graceful_timeout`, matching the 2-phase
+  `CTRL_BREAK_EVENT` -> `TerminateProcess` shutdown.
+
+Cross-platform callers construct the value under cfg gates and then pass it to the
+cross-platform `terminate(...)` and `wait_for_completion_or_terminate(...)` signatures:
+
+```rust,ignore
+use std::time::Duration;
+use tokio_process_tools::GracefulTimeouts;
+
+#[cfg(unix)]
+let timeouts = GracefulTimeouts {
+    interrupt_timeout: Duration::from_secs(3),
+    terminate_timeout: Duration::from_secs(5),
+};
+#[cfg(windows)]
+let timeouts = GracefulTimeouts {
+    graceful_timeout: Duration::from_secs(8),
+};
+
+process.terminate(timeouts).await?;
+```
+
+Each user-supplied graceful timeout bounds the post-signal wait of its phase:
+
+| Scenario per phase                        | Time spent in this phase                |
+|-------------------------------------------|-----------------------------------------|
+| Signal send succeeds, child exits         | ≤ user timeout (typically much less)    |
+| Signal send succeeds, child does NOT exit | exactly user timeout, then escalate     |
 | Signal send fails                         | up to 100 ms fixed grace, then escalate |
 
 The 100 ms grace covers the small window where the child has already exited but Tokio's SIGCHLD reaper has not yet
 observed it (`EPERM` on macOS, `ESRCH` on Linux against a not-yet-reaped process group). It replaces - never adds to -
 the user timeout for a failed phase. Real permission denials still surface as a `TerminationError`.
 
-`Duration::from_secs(0)` disables the post-signal wait entirely and effectively forces every call into `SIGKILL`.
-Prefer small but non-zero values (e.g. 100 ms to a few seconds).
+`Duration::from_secs(0)` disables the post-signal wait for that phase. The graceful signal is still sent; the call
+just collapses to "send the signal, do not wait, escalate immediately". On Unix that means each zero-duration phase
+sends its signal (`SIGINT`, then `SIGTERM`) and rolls straight on to the next, eventually arriving at `SIGKILL`. On
+Windows there is only the one phase, so a zero `graceful_timeout` reduces `terminate(...)` to "send
+`CTRL_BREAK_EVENT`, then immediately `TerminateProcess`". Prefer small but non-zero values (e.g. 100 ms to a few
+seconds) so well-behaved children can actually run their handlers.
+
+The termination machinery `terminate(...)`, `terminate_on_drop(...)`, `wait_for_completion_or_terminate(...)`,
+`WaitForCompletionOrTerminateOptions` and `GracefulTimeouts` is only available on Unix and Windows. On other targets
+the spawn, wait, output-collection APIs and kill remain available. Graceful-termination control is not made available
+until platform specific signals were implemented.
 
 ### When termination fails
 
@@ -686,12 +741,12 @@ newline after a gap means "the next line continues the previous one"; treat each
 
 ### Manual process control
 
-When the wait-and-cleanup helpers do not fit, drive shutdown by hand: `send_interrupt_signal()`,
-`send_terminate_signal()`, `terminate()` (escalation up to kill), and `kill()` (immediate). Each returns a typed
-`TerminationError` describing which step failed. The signal-send methods are idempotent against a child that has
-already exited: they reap the status and return `Ok(())` without sending a signal at a possibly-recycled PID.
-`seal_stdout_replay()`, `seal_stderr_replay()`, and `seal_output_replay()` end replay retention on one stream or
-both.
+When the wait-and-cleanup helpers do not fit, drive shutdown by hand: `send_interrupt_signal()` and
+`send_terminate_signal()` on Unix, `send_ctrl_break_signal()` on Windows, `terminate()` (escalation up to kill), and
+`kill()` (immediate). Each returns a typed `TerminationError` describing which step failed. The signal-send methods
+are idempotent against a child that has already exited: they reap the status and return `Ok(())` without sending a
+signal at a possibly-recycled PID. `seal_stdout_replay()`, `seal_stderr_replay()`, and `seal_output_replay()` end
+replay retention on one stream or both.
 
 ## Process management
 
@@ -751,7 +806,8 @@ cleanup and then **panics**. The panic is deliberate: a silent leak of a child p
 loud panic in tests, and most "I forgot to wait" bugs would otherwise survive into production.
 
 For long-lived processes that follow a service's own lifecycle, opting in to `.terminate_on_drop(...)` swaps the panic
-for an async termination attempt during drop:
+for an async termination attempt during drop. The signature mirrors `terminate(...)`: two timeouts on Unix, one on
+Windows.
 
 ```rust,no_run
 use std::time::Duration;
@@ -760,6 +816,16 @@ use tokio_process_tools::*;
 
 #[tokio::main]
 async fn main() {
+    #[cfg(unix)]
+    let timeouts = GracefulTimeouts {
+        interrupt_timeout: Duration::from_secs(3),
+        terminate_timeout: Duration::from_secs(5),
+    };
+    #[cfg(windows)]
+    let timeouts = GracefulTimeouts {
+        graceful_timeout: Duration::from_secs(8),
+    };
+
     let _process = Process::new(Command::new("some-command"))
         .name(AutoName::program_only())
         .stdout_and_stderr(|stream| {
@@ -772,7 +838,7 @@ async fn main() {
         })
         .spawn()
         .unwrap()
-        .terminate_on_drop(Duration::from_secs(3), Duration::from_secs(5));
+        .terminate_on_drop(timeouts);
 }
 ```
 
@@ -797,30 +863,55 @@ all four.
 
 ## Platform support
 
-The termination escalation is per-platform but follows the same idea: try the gentle signal first (so the child can
-flush, close sockets, persist state), then a stronger signal, then unconditional kill. Pick the timeouts you pass to
-`terminate()` and the `_or_terminate` helpers based on how long your child legitimately needs at each step. Each step
-targets the child's process group rather than its PID alone, so grandchildren are signaled with the leader; see
-[Subprocess trees](#subprocess-trees) for the spawn-time setup that makes this work.
+The termination escalation is per-platform. Both platforms try a graceful step first (so the child can flush, close
+sockets, persist state) and only escalate to an unconditional kill if the child stays alive. Pick the timeouts you
+pass to `terminate()` and the `_or_terminate` helpers based on how long your child legitimately needs at each step.
+Each step targets the child's process group rather than its PID alone, so grandchildren are signaled with the
+leader; see [Subprocess trees](#subprocess-trees) for the spawn-time setup that makes this work.
 
-- **Linux/macOS:** `SIGINT` → `SIGTERM` → `SIGKILL`, all delivered to the child's process group via `killpg`.
-- **Windows:** `CTRL_BREAK_EVENT` to the console process group → `TerminateProcess` on the leader as the kill fallback.
+- **Linux/macOS:** 3-phase escalation. `SIGINT` → `SIGTERM` → `SIGKILL`, all delivered to the child's process group
+  via `killpg`. The two distinct graceful signals matter for real children: idiomatic async Rust binaries use
+  `tokio::signal::ctrl_c()` (which on Unix listens only for `SIGINT`), and Python child processes turn `SIGINT` into
+  a `KeyboardInterrupt` exception that runs `try/finally` cleanup, while `SIGTERM` falls through to the runtime's
+  default handler. `GracefulTimeouts` therefore exposes two `Duration`s on Unix
+  (`interrupt_timeout`, `terminate_timeout`).
+- **Windows:** 2-phase shutdown. `CTRL_BREAK_EVENT` to the console process group → `TerminateProcess` on the leader
+  as the kill fallback. Exactly one `CTRL_BREAK_EVENT` is sent. `GracefulTimeouts` therefore exposes a single
+  `graceful_timeout` on Windows.
+- **Other platforms:** the spawn, wait, output-collection, and `kill(...)` APIs remain available - `kill(...)`
+  forwards to Tokio's `Child::start_kill()` and works on every Tokio-supported target. Only the graceful-termination
+  machinery (`terminate(...)`, `terminate_on_drop(...)`, `wait_for_completion_or_terminate(...)`,
+  `WaitForCompletionOrTerminateOptions`, `GracefulTimeouts`, and `send_*_signal(...)`) is gated out, because there is
+  no OS primitive to deliver a graceful signal against. Best-effort cleanup on drop still goes through
+  `Child::start_kill()` too, so unawaited handles do not leak the child.
 
-The Windows path uses `CTRL_BREAK_EVENT` rather than `CTRL_C_EVENT` because Windows does not allow targeting
-`CTRL_C_EVENT` at a nonzero child process group. A child that only handles Ctrl+C will not respond to either signal,
-and needs its own graceful shutdown channel (stdin, IPC, or a command protocol).
+The Windows path uses `CTRL_BREAK_EVENT` rather than `CTRL_C_EVENT` because `GenerateConsoleCtrlEvent` accepts only
+`CTRL_BREAK_EVENT` for nonzero process groups. `CTRL_C_EVENT` requires `dwProcessGroupId = 0`, which broadcasts to
+the entire console (including this parent process), so it is not usable for targeting a single child group. There is
+no separate `SIGINT` vs. `SIGTERM` distinction on Windows, so the manual signal-send surface is split per platform:
+`send_interrupt_signal()` and `send_terminate_signal()` exist only on Unix, and Windows exposes a single
+`send_ctrl_break_signal()`. The library never delivers two graceful events back to back during `terminate()`.
 
-Signal sends (`send_interrupt_signal`, `send_terminate_signal`, and the equivalent steps inside `terminate()`) check
-for an already-exited child first and return `Ok(())` without sending a signal in that case, so calling them after the
-child has died is harmless rather than racy.
+> **Windows interop note.** `tokio::signal::ctrl_c()` on Windows registers only for `CTRL_C_EVENT`; it does not catch
+> `CTRL_BREAK_EVENT`. A child Rust binary that listens only on the cross-platform `tokio::signal::ctrl_c()` will not
+> respond to this library's graceful step on Windows and will be terminated forcefully after `graceful_timeout`. To
+> interoperate, such a child should additionally listen on `tokio::signal::windows::ctrl_break()` (or use another
+> shutdown channel like a stdin sentinel, IPC, or a command protocol).
+
+A child that handles neither signal at all on either platform still needs its own graceful shutdown channel (stdin,
+IPC, or a command protocol) to participate in cooperative shutdown.
+
+Signal sends (`send_interrupt_signal` and `send_terminate_signal` on Unix, `send_ctrl_break_signal` on Windows, and
+the equivalent steps inside `terminate()`) check for an already-exited child first and return `Ok(())` without sending
+a signal in that case, so calling them after the child has died is harmless rather than racy.
 
 ## Subprocess trees
 
 Every spawned child is set up as the leader of its own process group, so termination signals reach the whole subtree
 rather than only the child the library spawned. If your child fork-execs further processes (an `npm start` that
 launches `node`, a shell wrapper that launches the real binary, a build tool that fans out workers), the grandchildren
-inherit the group and are signaled along with the leader by `send_interrupt_signal()`, `send_terminate_signal()`,
-`terminate()`, and `kill()`.
+inherit the group and are signaled along with the leader by `send_interrupt_signal()` / `send_terminate_signal()` on
+Unix, `send_ctrl_break_signal()` on Windows, `terminate()`, and `kill()`.
 
 - **Linux/macOS:** the child is spawned with `process_group(0)`, making its PID equal to its PGID. `SIGINT`, `SIGTERM`,
   and `SIGKILL` are delivered with `killpg`, which targets the whole group.

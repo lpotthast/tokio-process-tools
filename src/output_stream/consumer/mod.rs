@@ -217,13 +217,12 @@ impl<S: Sink> Consumer<S> {
     /// on a consumer after termination is fine:
     ///
     /// ```rust, no_run
-    /// # async fn test() {
     /// # use std::time::Duration;
     /// # use tokio_process_tools::{
     /// #     AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
-    /// #     LineCollectionOptions, LineParsingOptions, NumBytesExt, Process,
+    /// #     GracefulTimeouts, LineCollectionOptions, LineParsingOptions, NumBytesExt, Process,
     /// # };
-    ///
+    /// # async fn test() {
     /// # let cmd = tokio::process::Command::new("ls");
     /// let mut process = Process::new(cmd)
     ///     .name(AutoName::program_only())
@@ -245,7 +244,14 @@ impl<S: Sink> Consumer<S> {
     ///         overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
     ///     },
     /// );
-    /// process.terminate(Duration::from_secs(1), Duration::from_secs(1)).await.unwrap();
+    /// # #[cfg(unix)]
+    /// let timeouts = GracefulTimeouts {
+    ///     interrupt_timeout: Duration::from_secs(1),
+    ///     terminate_timeout: Duration::from_secs(1),
+    /// };
+    /// # #[cfg(windows)]
+    /// # let timeouts = GracefulTimeouts { graceful_timeout: Duration::from_secs(2) };
+    /// process.terminate(timeouts).await.unwrap();
     /// let collected = consumer.wait().await.unwrap(); // This will return immediately.
     /// # }
     /// ```

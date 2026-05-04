@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(unix)]
 #[tokio::test]
 async fn preflight_status_error_does_not_stop_termination_escalation() {
     use std::sync::Arc;
@@ -13,8 +14,10 @@ async fn preflight_status_error_does_not_stop_termination_escalation() {
 
     let outcome = process
         .terminate_inner_with_preflight_reaper(
-            Duration::from_millis(10),
-            Duration::from_millis(10),
+            GracefulTimeouts {
+                interrupt_timeout: Duration::from_millis(10),
+                terminate_timeout: Duration::from_millis(10),
+            },
             |_| Err(io::Error::other("injected preflight status failure")),
             move |_| {
                 interrupt_attempted_in_sender.store(true, Ordering::SeqCst);
@@ -34,6 +37,36 @@ async fn preflight_status_error_does_not_stop_termination_escalation() {
     assert_that!(process.is_drop_disarmed()).is_true();
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn preflight_status_error_does_not_stop_termination_escalation() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut process = spawn_long_running_process();
+    let graceful_attempted = Arc::new(AtomicBool::new(false));
+    let graceful_attempted_in_sender = Arc::clone(&graceful_attempted);
+
+    let outcome = process
+        .terminate_inner_with_preflight_reaper(
+            GracefulTimeouts {
+                graceful_timeout: Duration::from_millis(10),
+            },
+            |_| Err(io::Error::other("injected preflight status failure")),
+            move |_| {
+                graceful_attempted_in_sender.store(true, Ordering::SeqCst);
+                Err(io::Error::other("injected graceful signal failure"))
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_that!(graceful_attempted.load(Ordering::SeqCst)).is_true();
+    assert_that!(outcome.exit_status.success()).is_false();
+    assert_that!(process.is_drop_disarmed()).is_true();
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn send_interrupt_signal_reaps_already_exited_child_before_signalling() {
     let mut process = spawn_immediately_exiting_process();
@@ -48,6 +81,7 @@ async fn send_interrupt_signal_reaps_already_exited_child_before_signalling() {
     assert_that!(process.is_drop_disarmed()).is_true();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn send_terminate_signal_reaps_already_exited_child_before_signalling() {
     let mut process = spawn_immediately_exiting_process();
@@ -62,15 +96,34 @@ async fn send_terminate_signal_reaps_already_exited_child_before_signalling() {
     assert_that!(process.is_drop_disarmed()).is_true();
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn send_ctrl_break_signal_reaps_already_exited_child_before_signalling() {
+    let mut process = spawn_immediately_exiting_process();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_that!(process.id()).is_some();
+
+    process.send_ctrl_break_signal().unwrap();
+
+    assert_that!(process.id()).is_none();
+    assert_that!(process.is_drop_disarmed()).is_true();
+}
+
 #[tokio::test]
 async fn send_signal_reaps_exit_observed_after_signal_failure() {
     let mut process = spawn_long_running_process();
     let mut signal_attempts = 0;
     let mut reap_attempts = 0;
 
+    #[cfg(unix)]
+    let (phase, label) = (GracefulTerminationPhase::Interrupt, "SIGINT");
+    #[cfg(windows)]
+    let (phase, label) = (GracefulTerminationPhase::Terminate, "CTRL_BREAK_EVENT");
     let result = process.send_signal_with_reaper(
-        GracefulTerminationPhase::Interrupt,
-        signal::INTERRUPT_SIGNAL_NAME,
+        phase,
+        label,
         |_| {
             signal_attempts += 1;
             Err(io::Error::new(

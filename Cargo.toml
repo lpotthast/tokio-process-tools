@@ -1,6 +1,6 @@
 [package]
 name = "tokio-process-tools"
-version = "0.9.2"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.89.0"
 repository = "https://github.com/lpotthast/tokio-process-tools"
@@ -11,11 +11,11 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 authors = ["Lukas Potthast <privat@lukas-potthast.de>"]
 exclude = [
+    "/.github",
     "/.idea",
     "/.claude",
-    "/AGENTS.md",
+    "/CLAUDE.md",
     "/Justfile",
-    "/TODO.md",
 ]
 
 [dependencies]

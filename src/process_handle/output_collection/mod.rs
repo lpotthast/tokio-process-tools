@@ -7,20 +7,21 @@ pub(crate) mod output;
 #[cfg(test)]
 mod tests;
 
-use self::drain::{
-    wait_for_completion_or_terminate_with_collectors, wait_for_completion_with_collectors,
-};
+#[cfg(any(unix, windows))]
+use self::drain::wait_for_completion_or_terminate_with_collectors;
+use self::drain::wait_for_completion_with_collectors;
 use self::output::ProcessOutput;
 use super::ProcessHandle;
-use crate::error::{
-    WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitWithOutputError,
-};
+#[cfg(any(unix, windows))]
+use crate::error::WaitForCompletionOrTerminateResult;
+use crate::error::{WaitForCompletionResult, WaitWithOutputError};
 use crate::output_stream::consumer::{Consumer, spawn_consumer_sync};
 use crate::output_stream::event::Chunk;
 use crate::output_stream::line::adapter::LineAdapter;
 use crate::output_stream::line::options::LineParsingOptions;
 use crate::output_stream::visitors::collect::{CollectChunks, CollectLineSink};
 use crate::output_stream::{Next, Subscription, TrySubscribable};
+#[cfg(any(unix, windows))]
 use crate::process_handle::WaitForCompletionOrTerminateOptions;
 use crate::process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
 use crate::{CollectedBytes, CollectedLines, LineCollectionOptions, RawCollectionOptions};
@@ -211,15 +212,16 @@ where
     ///
     /// Any still-open stdin handle is closed before the initial terminal wait begins, matching
     /// [`tokio::process::Child::wait`].
-    /// Output collection is bounded by
-    /// `wait_timeout + interrupt_timeout + terminate_timeout`, plus a fixed 3-second post-kill
-    /// confirmation wait when force-kill fallback is required.
+    /// Output collection is bounded by `wait_timeout` plus the per-platform graceful budget
+    /// (`interrupt_timeout + terminate_timeout` on Unix, `graceful_timeout` on Windows), plus a
+    /// fixed 3-second post-kill confirmation wait when force-kill fallback is required.
     ///
     /// # Errors
     ///
     /// Returns [`WaitWithOutputError`] if waiting, termination, or output
     /// collection fails. Timeout-triggered cleanup success is returned as
     /// [`WaitForCompletionOrTerminateResult::TerminatedAfterTimeout`].
+    #[cfg(any(unix, windows))]
     pub async fn wait_for_completion_with_output_or_terminate(
         &mut self,
         options: WaitForCompletionOrTerminateOptions,
@@ -267,8 +269,7 @@ where
         let result = wait_for_completion_or_terminate_with_collectors(
             self,
             options.wait_timeout,
-            options.interrupt_timeout,
-            options.terminate_timeout,
+            options.graceful_timeouts,
             out_collector,
             err_collector,
         )
@@ -286,15 +287,16 @@ where
     ///
     /// Any still-open stdin handle is closed before the initial terminal wait begins, matching
     /// [`tokio::process::Child::wait`].
-    /// Output collection is bounded by
-    /// `wait_timeout + interrupt_timeout + terminate_timeout`, plus a fixed 3-second post-kill
-    /// confirmation wait when force-kill fallback is required.
+    /// Output collection is bounded by `wait_timeout` plus the per-platform graceful budget
+    /// (`interrupt_timeout + terminate_timeout` on Unix, `graceful_timeout` on Windows), plus a
+    /// fixed 3-second post-kill confirmation wait when force-kill fallback is required.
     ///
     /// # Errors
     ///
     /// Returns [`WaitWithOutputError`] if waiting, termination, or output
     /// collection fails. Timeout-triggered cleanup success is returned as
     /// [`WaitForCompletionOrTerminateResult::TerminatedAfterTimeout`].
+    #[cfg(any(unix, windows))]
     pub async fn wait_for_completion_with_raw_output_or_terminate(
         &mut self,
         options: WaitForCompletionOrTerminateOptions,
@@ -339,8 +341,7 @@ where
         let result = wait_for_completion_or_terminate_with_collectors(
             self,
             options.wait_timeout,
-            options.interrupt_timeout,
-            options.terminate_timeout,
+            options.graceful_timeouts,
             out_collector,
             err_collector,
         )

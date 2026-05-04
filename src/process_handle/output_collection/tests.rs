@@ -1,11 +1,12 @@
 use crate::test_support::{
-    ScriptedOutput, line_collection_options, line_output_options, line_parsing_options,
-    raw_output_options,
+    ScriptedOutput, default_graceful_timeouts, line_collection_options, line_output_options,
+    line_parsing_options, raw_output_options,
 };
 use crate::{
     AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
-    LineCollectionOptions, LineOutputOptions, NumBytesExt, RawCollectionOptions, RawOutputOptions,
-    StreamConsumerError, WaitForCompletionOrTerminateOptions, WaitWithOutputError,
+    GracefulTimeouts, LineCollectionOptions, LineOutputOptions, NumBytesExt, RawCollectionOptions,
+    RawOutputOptions, StreamConsumerError, WaitForCompletionOrTerminateOptions,
+    WaitWithOutputError,
 };
 use assertr::prelude::*;
 use std::time::Duration;
@@ -14,8 +15,7 @@ use tokio::io::AsyncWriteExt;
 fn wait_or_terminate_options(wait_timeout: Duration) -> WaitForCompletionOrTerminateOptions {
     WaitForCompletionOrTerminateOptions {
         wait_timeout,
-        interrupt_timeout: Duration::from_secs(1),
-        terminate_timeout: Duration::from_secs(1),
+        graceful_timeouts: default_graceful_timeouts(),
     }
 }
 
@@ -715,17 +715,25 @@ mod wait_for_completion_with_output_or_terminate {
             .spawn()
             .unwrap();
 
+        // Tight graceful timeouts on purpose: the descendant `sleep 0.5` keeps stdout open for
+        // 500 ms, so the operation deadline must be much shorter than that to actually fire.
         let wait_timeout = Duration::from_millis(100);
-        let interrupt_timeout = Duration::from_millis(1);
-        let terminate_timeout = Duration::from_millis(1);
-        let operation_timeout = wait_timeout + interrupt_timeout + terminate_timeout;
+        #[cfg(unix)]
+        let graceful_timeouts = GracefulTimeouts {
+            interrupt_timeout: Duration::from_millis(1),
+            terminate_timeout: Duration::from_millis(1),
+        };
+        #[cfg(windows)]
+        let graceful_timeouts = GracefulTimeouts {
+            graceful_timeout: Duration::from_millis(2),
+        };
+        let operation_timeout = wait_timeout + graceful_timeouts.total();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             process.wait_for_completion_with_output_or_terminate(
                 WaitForCompletionOrTerminateOptions {
                     wait_timeout,
-                    interrupt_timeout,
-                    terminate_timeout,
+                    graceful_timeouts,
                 },
                 line_output_options(),
             ),
@@ -767,15 +775,16 @@ mod wait_for_completion_with_output_or_terminate {
         .unwrap();
 
         let wait_timeout = Duration::from_millis(25);
-        let interrupt_timeout = Duration::from_millis(25);
-        let terminate_timeout = Duration::from_millis(25);
+        let graceful_timeouts = GracefulTimeouts {
+            interrupt_timeout: Duration::from_millis(25),
+            terminate_timeout: Duration::from_millis(25),
+        };
         let output = tokio::time::timeout(
             Duration::from_secs(5),
             process.wait_for_completion_with_output_or_terminate(
                 WaitForCompletionOrTerminateOptions {
                     wait_timeout,
-                    interrupt_timeout,
-                    terminate_timeout,
+                    graceful_timeouts,
                 },
                 line_output_options(),
             ),

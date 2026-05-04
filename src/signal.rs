@@ -13,6 +13,9 @@
 /// - **Windows:** passes `CREATE_NEW_PROCESS_GROUP`, so `GenerateConsoleCtrlEvent` with the
 ///   child's PID as the process-group ID delivers `CTRL_BREAK_EVENT` to every process in the
 ///   group.
+/// - **Other platforms:** no-op. The crate's termination APIs are gated to Unix and Windows, so
+///   spawning still works on other platforms but the resulting child is not set up for
+///   group-targeted signal delivery.
 pub(crate) fn prepare_command_for_signalling(
     command: &mut tokio::process::Command,
 ) -> &mut tokio::process::Command {
@@ -33,109 +36,67 @@ pub(crate) fn prepare_command_for_signalling(
     }
 }
 
-#[cfg(unix)]
-pub(crate) const INTERRUPT_SIGNAL_NAME: &str = "SIGINT";
-#[cfg(windows)]
-pub(crate) const INTERRUPT_SIGNAL_NAME: &str = "CTRL_BREAK_EVENT";
-#[cfg(all(not(windows), not(unix)))]
-pub(crate) const INTERRUPT_SIGNAL_NAME: &str = "interrupt";
-
-#[cfg(unix)]
-pub(crate) const TERMINATE_SIGNAL_NAME: &str = "SIGTERM";
-#[cfg(windows)]
-pub(crate) const TERMINATE_SIGNAL_NAME: &str = "CTRL_BREAK_EVENT";
-#[cfg(all(not(windows), not(unix)))]
-pub(crate) const TERMINATE_SIGNAL_NAME: &str = "terminate";
-
-#[cfg(unix)]
-pub(crate) const KILL_SIGNAL_NAME: &str = "SIGKILL";
-#[cfg(windows)]
-pub(crate) const KILL_SIGNAL_NAME: &str = "TerminateProcess";
-#[cfg(all(not(windows), not(unix)))]
-pub(crate) const KILL_SIGNAL_NAME: &str = "kill";
-
-/// Ask the `child` (and every process in its process group) to terminate gracefully.
-/// This signal is typically sent to a process by its controlling terminal when a user wishes to
-/// interrupt the process, initiated by pressing `Ctrl+C`.
+/// Send `SIGINT` to the child's process group via `killpg`.
 ///
-/// - on `cfg(unix)`: Sends a `SIGINT` to the child's process group via `killpg`. Spawns set up
-///   the child as the leader of a new process group (see [`prepare_command_for_signalling`]),
-///   so the signal reaches any grandchildren the child has forked.
-/// - on `cfg(windows)`: Sends a `CTRL_BREAK_EVENT` to the child's console process group.
-/// - raises a panic on any other platform!
-///
-/// Windows cannot target `CTRL_C_EVENT` at a nonzero process group. Since this crate creates a
-/// process group for each child on Windows, `CTRL_BREAK_EVENT` is the targetable graceful
-/// interrupt event.
+/// `SIGINT` is the dedicated user-interrupt signal, distinct from the `SIGTERM` delivered by
+/// [`send_terminate`]. Spawns set up the child as the leader of a new process group (see
+/// [`prepare_command_for_signalling`]), so the signal reaches any grandchildren the child has
+/// forked.
 ///
 /// This is a raw signal sender over `tokio::process::Child`. Callers that can reap process state
 /// should do so before using it.
+#[cfg(unix)]
 pub(crate) fn send_interrupt(child: &tokio::process::Child) -> std::io::Result<()> {
     let Some(pid) = child.id() else {
         // Returns `None` if child was already "polled to completion".
         return Ok(());
     };
-
-    #[cfg(unix)]
-    {
-        send_to_process_group(pid, nix::sys::signal::Signal::SIGINT)
-    }
-
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
-        use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
-
-        let success = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
-        if success == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    #[cfg(all(not(windows), not(unix)))]
-    {
-        panic!("Cannot send interrupt signal to process. Platform is unsupported.")
-    }
+    send_to_process_group(pid, nix::sys::signal::Signal::SIGINT)
 }
 
-/// Ask the `child` (and every process in its process group) to terminate. Nearly identical to
-/// `send_interrupt`. This signal is typically sent to a process when the operating system
-/// requests a termination.
+/// Send `SIGTERM` to the child's process group via `killpg`.
 ///
-/// - on `cfg(unix)`: Sends a `SIGTERM` to the child's process group via `killpg`.
-/// - on `cfg(windows)`: Sends a `CTRL_BREAK_EVENT` to the child's console process group.
-/// - raises a panic on any other platform!
+/// `SIGTERM` is the conventional "asked to terminate" signal sent by service supervisors and the
+/// operating system at shutdown. Spawns set up the child as the leader of a new process group
+/// (see [`prepare_command_for_signalling`]), so the signal reaches any grandchildren the child
+/// has forked.
 ///
 /// This is a raw signal sender over `tokio::process::Child`. Callers that can reap process state
 /// should do so before using it.
+#[cfg(unix)]
 pub(crate) fn send_terminate(child: &tokio::process::Child) -> std::io::Result<()> {
     let Some(pid) = child.id() else {
         // Returns `None` if child was already "polled to completion".
         return Ok(());
     };
+    send_to_process_group(pid, nix::sys::signal::Signal::SIGTERM)
+}
 
-    #[cfg(unix)]
-    {
-        send_to_process_group(pid, nix::sys::signal::Signal::SIGTERM)
+/// Deliver `CTRL_BREAK_EVENT` to the child's console process group via
+/// `GenerateConsoleCtrlEvent`.
+///
+/// `CTRL_BREAK_EVENT` is the only console control event that can be targeted at a nonzero process
+/// group: `CTRL_C_EVENT` requires `dwProcessGroupId = 0` and would be broadcast to every process
+/// sharing the calling console (including the parent), so it is not usable to terminate a single
+/// child group. There is therefore no separate analogue for `SIGINT` vs. `SIGTERM` on Windows.
+///
+/// This is a raw signal sender over `tokio::process::Child`. Callers that can reap process state
+/// should do so before using it.
+#[cfg(windows)]
+pub(crate) fn send_ctrl_break(child: &tokio::process::Child) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
+    use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
+
+    let Some(pid) = child.id() else {
+        // Returns `None` if child was already "polled to completion".
+        return Ok(());
+    };
+
+    let success = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
+    if success == 0 {
+        return Err(std::io::Error::last_os_error());
     }
-
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
-        use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
-
-        let success = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
-        if success == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    #[cfg(all(not(windows), not(unix)))]
-    {
-        panic!("Cannot send termination signal to process. Platform is unsupported.")
-    }
+    Ok(())
 }
 
 /// Sends `signal` to every process in the child's process group on Unix.

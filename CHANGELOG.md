@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.10.0] - 2026-05-04
+
+### Added
+
+- Added `GracefulTimeouts`, a per-platform graceful-shutdown timeout budget passed to every graceful-termination entry
+  point. The signature of `terminate(...)`, `terminate_on_drop(...)`, and the field shape of
+  `WaitForCompletionOrTerminateOptions` are identical on every supported OS; only the fields inside `GracefulTimeouts`
+  differ per platform:
+    - **Unix:** `interrupt_timeout` and `terminate_timeout`, matching the 3-phase `SIGINT` -> `SIGTERM` -> `SIGKILL`
+      escalation.
+    - **Windows:** a single `graceful_timeout`, matching the 2-phase `CTRL_BREAK_EVENT` -> `TerminateProcess` shutdown.
+
+  Cross-platform callers construct `GracefulTimeouts` under `#[cfg(unix)]` / `#[cfg(windows)]` gates and then pass it
+  into the cross-platform call sites unchanged.
+
+### Changed
+
+- **Breaking:** Changed `ProcessHandle::terminate` from
+  `terminate(interrupt_timeout: Duration, terminate_timeout: Duration)` to `terminate(timeouts: GracefulTimeouts)`. The
+  new single-argument signature is identical on Unix and Windows; the per-platform timeout model lives inside
+  `GracefulTimeouts`.
+- **Breaking:** Changed `ProcessHandle::terminate_on_drop` from
+  `terminate_on_drop(graceful_termination_timeout: Duration, forceful_termination_timeout: Duration)` to
+  `terminate_on_drop(timeouts: GracefulTimeouts)`. The previous parameter names were also misleading: the second timeout
+  was never the forceful-kill wait (which is a fixed internal constant), it was the second graceful phase.
+- **Breaking:** Changed `WaitForCompletionOrTerminateOptions` from carrying flat `wait_timeout`, `interrupt_timeout`,
+  and `terminate_timeout` fields to carrying `wait_timeout` and a single `graceful_timeouts: GracefulTimeouts` field.
+- **Breaking:** Gated the graceful-termination surface (`terminate(...)`, `terminate_on_drop(...)`,
+  `wait_for_completion_or_terminate(...)`, `WaitForCompletionOrTerminateOptions`, `GracefulTimeouts`, and the
+  `send_*_signal(...)` methods) to `#[cfg(any(unix, windows))]`, because the underlying graceful-shutdown signals only
+  exist there. The spawn, wait, output-collection, and `kill(...)` APIs remain available on every Tokio-supported
+  target, and best-effort cleanup on drop continues to go through `Child::start_kill()`.
+- **Breaking:** Split the manual signal-send surface per platform. `send_interrupt_signal()` and
+  `send_terminate_signal()` are now Unix-only (sending `SIGINT` and `SIGTERM` respectively), and Windows exposes a
+  dedicated `send_ctrl_break_signal()` that delivers `CTRL_BREAK_EVENT`. Previously both Unix-named methods existed on
+  Windows as aliases for the same `CTRL_BREAK_EVENT` send because `GenerateConsoleCtrlEvent` only accepts
+  `CTRL_BREAK_EVENT` for nonzero process groups. The new split makes the platform-specific signal model explicit and
+  removes the misleading shared name.
+
+### Fixed
+
+- Windows `terminate(...)` now sends exactly one `CTRL_BREAK_EVENT` per call. Previously the 3-phase scaffolding sent
+  the same event twice (once per graceful phase), which could not do more than the first send already did because
+  `GenerateConsoleCtrlEvent` accepts only `CTRL_BREAK_EVENT` for nonzero process groups.
+
+### Documentation
+
+- Documented the per-platform `terminate(...)` model and the reasoning behind the cfg-gated `GracefulTimeouts` shape.
+- Added a Windows interop note: `tokio::signal::ctrl_c()` on Windows registers only for `CTRL_C_EVENT` and does not
+  catch `CTRL_BREAK_EVENT`. A child Rust binary that listens only on the cross-platform `tokio::signal::ctrl_c()` will
+  not respond to this library's graceful termination step on Windows. It needs `tokio::signal::windows::ctrl_break()`
+  (or another shutdown channel) for graceful interop.
+
 ## [0.9.2] - 2026-05-04
 
 ### Documentation
@@ -544,7 +599,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added process state helpers such as `id()` and `is_running()`.
 - Added `collect_into_*` helpers on `OutputStream`.
 
-[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.10.0...HEAD
+
+[0.10.0]: https://github.com/lpotthast/tokio-process-tools/compare/v0.9.2...v0.10.0
 
 [0.9.2]: https://github.com/lpotthast/tokio-process-tools/compare/v0.9.1...v0.9.2
 

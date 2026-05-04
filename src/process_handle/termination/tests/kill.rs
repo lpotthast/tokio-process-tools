@@ -129,7 +129,11 @@ async fn kill_reports_start_kill_failure_as_termination_error() {
         &error.attempt_errors()[0],
         TerminationAttemptPhase::Kill,
         TerminationAttemptOperation::SendSignal,
-        Some(signal::KILL_SIGNAL_NAME),
+        Some(if cfg!(unix) {
+            "SIGKILL"
+        } else {
+            "TerminateProcess"
+        }),
         io::ErrorKind::PermissionDenied,
         "injected kill failure",
     );

@@ -1,7 +1,7 @@
 use crate::process_handle::ProcessHandle;
+use crate::process_handle::termination::GracefulTimeouts;
 use crate::{OutputStream, async_drop};
 use std::ops::{Deref, DerefMut};
-use std::time::Duration;
 
 /// A wrapper that automatically terminates a process when dropped.
 ///
@@ -31,8 +31,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct TerminateOnDrop<Stdout: OutputStream, Stderr: OutputStream = Stdout> {
     pub(crate) process_handle: ProcessHandle<Stdout, Stderr>,
-    pub(crate) interrupt_timeout: Duration,
-    pub(crate) terminate_timeout: Duration,
+    pub(crate) timeouts: GracefulTimeouts,
 }
 
 impl<Stdout, Stderr> Deref for TerminateOnDrop<Stdout, Stderr>
@@ -86,11 +85,7 @@ where
             }
 
             tracing::debug!(process = %self.process_handle.name, "Terminating process");
-            match self
-                .process_handle
-                .terminate(self.interrupt_timeout, self.terminate_timeout)
-                .await
-            {
+            match self.process_handle.terminate(self.timeouts).await {
                 Ok(exit_status) => {
                     tracing::debug!(
                         process = %self.process_handle.name,

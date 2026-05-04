@@ -1,3 +1,5 @@
+#[cfg(any(unix, windows))]
+use crate::GracefulTimeouts;
 use crate::{
     CollectionOverflowBehavior, LineCollectionOptions, LineOutputOptions, LineOverflowBehavior,
     LineParsingOptions, NumBytesExt, RawCollectionOptions, RawOutputOptions,
@@ -7,6 +9,42 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
+
+/// Per-platform `GracefulTimeouts` value with a sensible 1s graceful budget per phase.
+#[cfg(any(unix, windows))]
+pub(crate) fn default_graceful_timeouts() -> GracefulTimeouts {
+    #[cfg(unix)]
+    {
+        GracefulTimeouts {
+            interrupt_timeout: Duration::from_secs(1),
+            terminate_timeout: Duration::from_secs(1),
+        }
+    }
+    #[cfg(windows)]
+    {
+        GracefulTimeouts {
+            graceful_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+/// Per-platform `GracefulTimeouts` value with a short 50 ms graceful budget per phase.
+#[cfg(any(unix, windows))]
+pub(crate) fn short_graceful_timeouts() -> GracefulTimeouts {
+    #[cfg(unix)]
+    {
+        GracefulTimeouts {
+            interrupt_timeout: Duration::from_millis(50),
+            terminate_timeout: Duration::from_millis(50),
+        }
+    }
+    #[cfg(windows)]
+    {
+        GracefulTimeouts {
+            graceful_timeout: Duration::from_millis(100),
+        }
+    }
+}
 
 pub(crate) fn line_parsing_options() -> LineParsingOptions {
     LineParsingOptions::builder()
@@ -297,89 +335,4 @@ impl AsyncRead for ReadErrorAfterBytes {
             "injected read failure",
         )))
     }
-}
-
-/// Exit code emitted by [`CTRL_BREAK_HELPER_SOURCE`] when the helper observes a `CTRL_BREAK_EVENT`.
-#[cfg(windows)]
-pub(crate) const CTRL_BREAK_HELPER_EXIT_CODE: i32 = 77;
-
-/// Rust source for a Windows helper that prints `ready`, waits for a console-targeted
-/// `CTRL_BREAK_EVENT`, prints `ctrl-break`, and exits with [`CTRL_BREAK_HELPER_EXIT_CODE`].
-#[cfg(windows)]
-pub(crate) const CTRL_BREAK_HELPER_SOURCE: &str = r#"
-use std::io::Write;
-use std::sync::OnceLock;
-use std::sync::mpsc::{sync_channel, SyncSender};
-
-const CTRL_BREAK_EVENT: u32 = 1;
-const TRUE: i32 = 1;
-const FALSE: i32 = 0;
-
-static SIGNAL: OnceLock<SyncSender<()>> = OnceLock::new();
-
-type HandlerRoutine = Option<unsafe extern "system" fn(u32) -> i32>;
-
-#[link(name = "Kernel32")]
-unsafe extern "system" {
-    fn SetConsoleCtrlHandler(handler_routine: HandlerRoutine, add: i32) -> i32;
-}
-
-unsafe extern "system" fn handle_control_event(ctrl_type: u32) -> i32 {
-    if ctrl_type == CTRL_BREAK_EVENT {
-        if let Some(sender) = SIGNAL.get() {
-            let _ = sender.try_send(());
-        }
-        TRUE
-    } else {
-        FALSE
-    }
-}
-
-fn main() {
-    let (sender, receiver) = sync_channel(1);
-    SIGNAL.set(sender).expect("ctrl-break signal already initialised");
-
-    let registered = unsafe { SetConsoleCtrlHandler(Some(handle_control_event), TRUE) };
-    if registered == FALSE {
-        eprintln!("handler-registration-failed");
-        std::process::exit(2);
-    }
-
-    println!("ready");
-    std::io::stdout().flush().unwrap();
-
-    receiver.recv().expect("ctrl-break signal channel closed");
-
-    println!("ctrl-break");
-    std::io::stdout().flush().unwrap();
-    std::process::exit(77);
-}
-"#;
-
-#[cfg(windows)]
-pub(crate) fn compile_ctrl_break_helper(dir: &std::path::Path) -> std::path::PathBuf {
-    use assertr::prelude::*;
-
-    let source_path = dir.join("ctrl_break_helper.rs");
-    let exe_path = dir.join("ctrl_break_helper.exe");
-    std::fs::write(&source_path, CTRL_BREAK_HELPER_SOURCE).unwrap();
-
-    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let output = std::process::Command::new(rustc)
-        .arg("--edition=2024")
-        .arg(&source_path)
-        .arg("-o")
-        .arg(&exe_path)
-        .output()
-        .unwrap();
-
-    assert_that!(output.status.success())
-        .with_detail_message(format!(
-            "failed to compile ctrl-break helper\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        ))
-        .is_true();
-
-    exe_path
 }

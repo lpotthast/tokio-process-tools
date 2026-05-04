@@ -11,6 +11,7 @@ mod process_handle;
 #[cfg(test)]
 mod send_sync_proof;
 mod signal;
+#[cfg(any(unix, windows))]
 mod terminate_on_drop;
 #[cfg(test)]
 mod test_support;
@@ -56,8 +57,12 @@ pub use process::name::{AutoName, AutoNameSettings, ProcessName};
 pub use process::stream_config::{
     DiscardedStreamConfig, ProcessStreamBuilder, ProcessStreamConfig,
 };
+#[cfg(any(unix, windows))]
 pub use process_handle::WaitForCompletionOrTerminateOptions;
 pub use process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
 pub use process_handle::output_collection::output::ProcessOutput;
+#[cfg(any(unix, windows))]
+pub use process_handle::termination::GracefulTimeouts;
 pub use process_handle::{ProcessHandle, RunningState, Stdin};
+#[cfg(any(unix, windows))]
 pub use terminate_on_drop::TerminateOnDrop;

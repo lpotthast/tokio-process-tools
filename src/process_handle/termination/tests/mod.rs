@@ -1,6 +1,9 @@
 use super::*;
+use crate::error::TerminationError;
 use crate::output_stream::backend::broadcast::BroadcastOutputStream;
-use crate::test_support::{ScriptedOutput, long_running_command};
+use crate::test_support::{
+    ScriptedOutput, default_graceful_timeouts, long_running_command, short_graceful_timeouts,
+};
 use crate::{
     BestEffortDelivery, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NoReplay, NumBytesExt,
 };
@@ -11,8 +14,6 @@ mod kill;
 mod preflight_reap;
 mod signal_failures;
 mod terminate;
-#[cfg(windows)]
-mod windows;
 
 pub(super) fn immediately_exiting_command() -> tokio::process::Command {
     ScriptedOutput::builder().build()

@@ -1,9 +1,11 @@
-use crate::error::{
-    WaitForCompletionOrTerminateResult, WaitForCompletionResult, WaitWithOutputError,
-};
+#[cfg(any(unix, windows))]
+use crate::error::WaitForCompletionOrTerminateResult;
+use crate::error::{WaitForCompletionResult, WaitWithOutputError};
 use crate::output_stream::OutputStream;
 use crate::output_stream::consumer::{Consumer, ConsumerError, Sink};
 use crate::process_handle::ProcessHandle;
+#[cfg(any(unix, windows))]
+use crate::process_handle::termination::GracefulTimeouts;
 use std::future::{Future, poll_fn};
 use std::process::ExitStatus;
 use std::task::Poll;
@@ -203,6 +205,7 @@ where
     Ok(WaitForCompletionResult::Completed((status, stdout, stderr)))
 }
 
+#[cfg(any(unix, windows))]
 pub(super) async fn wait_for_completion_or_terminate_with_collectors<
     Stdout,
     Stderr,
@@ -211,8 +214,7 @@ pub(super) async fn wait_for_completion_or_terminate_with_collectors<
 >(
     handle: &mut ProcessHandle<Stdout, Stderr>,
     wait_timeout: Duration,
-    interrupt_timeout: Duration,
-    terminate_timeout: Duration,
+    timeouts: GracefulTimeouts,
     stdout_collector: Consumer<StdoutSink>,
     stderr_collector: Consumer<StderrSink>,
 ) -> Result<
@@ -227,11 +229,7 @@ where
 {
     let started_at = Instant::now();
     let outcome = handle
-        .wait_for_completion_or_terminate_inner_detailed(
-            wait_timeout,
-            interrupt_timeout,
-            terminate_timeout,
-        )
+        .wait_for_completion_or_terminate_inner_detailed(wait_timeout, timeouts)
         .await?;
     let deadline =
         OperationDeadline::from_started_at(started_at, outcome.output_collection_timeout_budget);

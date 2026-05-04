@@ -4,17 +4,14 @@ use super::*;
 async fn terminate_future_can_be_spawned_on_tokio_task() {
     let mut process = spawn_long_running_process();
 
-    let result = tokio::spawn(async move {
-        process
-            .terminate(Duration::from_secs(1), Duration::from_secs(1))
-            .await
-    })
-    .await
-    .unwrap();
+    let result = tokio::spawn(async move { process.terminate(default_graceful_timeouts()).await })
+        .await
+        .unwrap();
 
     assert_that!(result).is_ok();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn terminate_falls_back_to_kill_when_graceful_signal_sends_fail() {
     use std::sync::Arc;
@@ -43,12 +40,36 @@ async fn terminate_falls_back_to_kill_when_graceful_signal_sends_fail() {
     assert_that!(process.is_drop_disarmed()).is_true();
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn terminate_falls_back_to_kill_when_graceful_signal_send_fails() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut process = spawn_long_running_process();
+    let graceful_attempted = Arc::new(AtomicBool::new(false));
+    let graceful_attempted_in_sender = Arc::clone(&graceful_attempted);
+
+    let outcome = process
+        .terminate_inner_detailed(Duration::from_millis(10), move |_| {
+            graceful_attempted_in_sender.store(true, Ordering::SeqCst);
+            Err(io::Error::other("injected graceful signal failure"))
+        })
+        .await
+        .unwrap();
+
+    assert_that!(graceful_attempted.load(Ordering::SeqCst)).is_true();
+    assert_that!(outcome.exit_status.success()).is_false();
+    assert_that!(outcome.output_collection_timeout_extension).is_equal_to(FORCE_KILL_WAIT_TIMEOUT);
+    assert_that!(process.is_drop_disarmed()).is_true();
+}
+
 #[tokio::test]
 async fn terminate_detailed_reports_no_output_extension_when_graceful_phase_succeeds() {
     let mut process = spawn_long_running_process();
 
     let outcome = process
-        .terminate_detailed(Duration::from_secs(1), Duration::from_secs(1))
+        .terminate_detailed(default_graceful_timeouts())
         .await
         .unwrap();
 
@@ -57,6 +78,7 @@ async fn terminate_detailed_reports_no_output_extension_when_graceful_phase_succ
     assert_that!(process.is_drop_disarmed()).is_true();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn canceled_terminate_keeps_drop_guards_armed() {
     let mut process = spawn_long_running_process();
@@ -78,6 +100,23 @@ async fn canceled_terminate_keeps_drop_guards_armed() {
     process.kill().await.unwrap();
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn canceled_terminate_keeps_drop_guards_armed() {
+    let mut process = spawn_long_running_process();
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(50),
+        process.terminate_inner(Duration::from_secs(10), |_| Ok(())),
+    )
+    .await;
+
+    assert_that!(result.is_err()).is_true();
+    assert_that!(process.is_drop_armed()).is_true();
+
+    process.kill().await.unwrap();
+}
+
 #[tokio::test]
 async fn failed_terminate_result_keeps_drop_guards_armed() {
     let mut process = spawn_long_running_process();
@@ -88,7 +127,11 @@ async fn failed_terminate_result_keeps_drop_guards_armed() {
             attempt_errors: vec![TerminationAttemptError {
                 phase: TerminationAttemptPhase::Kill,
                 operation: TerminationAttemptOperation::SendSignal,
-                signal_name: Some(signal::KILL_SIGNAL_NAME),
+                signal_name: Some(if cfg!(unix) {
+                    "SIGKILL"
+                } else {
+                    "TerminateProcess"
+                }),
                 source: Box::new(io::Error::other("synthetic termination failure")),
             }],
         },
@@ -116,10 +159,7 @@ async fn terminate_stops_process() {
         .spawn()
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let exit_status = handle
-        .terminate(Duration::from_secs(1), Duration::from_secs(1))
-        .await
-        .unwrap();
+    let exit_status = handle.terminate(default_graceful_timeouts()).await.unwrap();
     let terminated_at = jiff::Zoned::now();
 
     let ran_for = started_at.duration_until(&terminated_at);
@@ -136,30 +176,51 @@ async fn terminate_returns_normal_exit_when_process_already_exited() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let exit_status = handle
-        .terminate(Duration::from_millis(50), Duration::from_millis(50))
-        .await
-        .unwrap();
+    let exit_status = handle.terminate(short_graceful_timeouts()).await.unwrap();
 
     assert_that!(exit_status.success()).is_true();
 }
 
 /// Regression test for the "signal send fails while the child has already exited" race.
 ///
-/// Forces the preflight probe to miss the exit (`Ok(None)`) and both graceful signal sends to
+/// Forces the preflight probe to miss the exit (`Ok(None)`) and the graceful signal sends to
 /// fail. Without the bounded-wait recovery, this falls through to the kill phase and exits via
-/// SIGKILL. With it, the 100 ms grace observes the natural exit and reports success.
+/// SIGKILL/`TerminateProcess`. With it, the 100 ms grace observes the natural exit and reports
+/// success.
+#[cfg(unix)]
 #[tokio::test]
 async fn terminate_succeeds_when_signal_send_fails_against_recently_exited_child() {
     let mut handle = spawn_immediately_exiting_process();
 
     let outcome = handle
         .terminate_inner_with_preflight_reaper(
-            Duration::from_millis(50),
-            Duration::from_millis(50),
+            GracefulTimeouts {
+                interrupt_timeout: Duration::from_millis(50),
+                terminate_timeout: Duration::from_millis(50),
+            },
             |_| Ok(None),
             |_| Err(io::Error::other("injected interrupt signal-send failure")),
             |_| Err(io::Error::other("injected terminate signal-send failure")),
+        )
+        .await
+        .unwrap();
+
+    assert_that!(outcome.exit_status.success()).is_true();
+    assert_that!(handle.is_drop_disarmed()).is_true();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn terminate_succeeds_when_signal_send_fails_against_recently_exited_child() {
+    let mut handle = spawn_immediately_exiting_process();
+
+    let outcome = handle
+        .terminate_inner_with_preflight_reaper(
+            GracefulTimeouts {
+                graceful_timeout: Duration::from_millis(100),
+            },
+            |_| Ok(None),
+            |_| Err(io::Error::other("injected graceful signal-send failure")),
         )
         .await
         .unwrap();

@@ -1,8 +1,10 @@
+#[cfg(any(unix, windows))]
+use super::termination::GracefulTimeouts;
 use super::{DropMode, ProcessHandle};
 use crate::output_stream::OutputStream;
 use crate::panic_on_drop::PanicOnDrop;
+#[cfg(any(unix, windows))]
 use crate::terminate_on_drop::TerminateOnDrop;
-use std::time::Duration;
 
 impl<Stdout, Stderr> Drop for ProcessHandle<Stdout, Stderr>
 where
@@ -109,20 +111,19 @@ where
     /// Wrap this process handle in a `TerminateOnDrop` instance, terminating the controlled process
     /// automatically when this handle is dropped.
     ///
+    /// `timeouts` carries the same per-platform graceful budget as [`Self::terminate`]; see
+    /// [`GracefulTimeouts`] for how to construct it.
+    ///
     /// **SAFETY: This only works when your code is running in a multithreaded tokio runtime!**
     ///
     /// Prefer manual termination of the process or awaiting it and relying on the (automatically
     /// configured) `must_be_terminated` logic, raising a panic when a process was neither awaited
     /// nor terminated before being dropped.
-    pub fn terminate_on_drop(
-        self,
-        graceful_termination_timeout: Duration,
-        forceful_termination_timeout: Duration,
-    ) -> TerminateOnDrop<Stdout, Stderr> {
+    #[cfg(any(unix, windows))]
+    pub fn terminate_on_drop(self, timeouts: GracefulTimeouts) -> TerminateOnDrop<Stdout, Stderr> {
         TerminateOnDrop {
             process_handle: self,
-            interrupt_timeout: graceful_termination_timeout,
-            terminate_timeout: forceful_termination_timeout,
+            timeouts,
         }
     }
 }
@@ -137,6 +138,9 @@ fn drop_kill(child: &mut tokio::process::Child) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        // Tokio's `Child::start_kill` works on every platform, so the Drop best-effort cleanup
+        // remains available even on targets where the rest of the termination machinery is gated
+        // out (anything that is neither `cfg(unix)` nor `cfg(windows)`).
         child.start_kill()
     }
 }
@@ -158,6 +162,7 @@ mod tests {
         DEFAULT_READ_CHUNK_SIZE, NoReplay,
     };
     use assertr::prelude::*;
+    use std::time::Duration;
 
     fn spawn_long_running_process()
     -> ProcessHandle<BroadcastOutputStream<BestEffortDelivery, NoReplay>> {
