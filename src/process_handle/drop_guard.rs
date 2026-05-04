@@ -83,6 +83,10 @@ where
     ///
     /// Use plain [`tokio::process::Command`] directly when you need a child process that can
     /// outlive the original handle without depending on captured stdio pipes.
+    ///
+    /// Also, the right opt-out after [`terminate`](Self::terminate) returns an unrecoverable error
+    /// and the caller chooses to accept the failure instead of retrying or escalating to
+    /// [`kill`](Self::kill).
     pub fn must_not_be_terminated(&mut self) {
         // Defuse the panic guard before swapping the variant so the dropped `PanicOnDrop` does
         // not fire when the old `Armed` value is dropped by the assignment.

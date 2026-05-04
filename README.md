@@ -61,7 +61,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.9.0"
+tokio-process-tools = "0.9.1"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
 ```
 
@@ -605,6 +605,30 @@ A few lifecycle quirks worth knowing. `on_gap()` is synchronous in both traits b
 data to await on. `on_eof()` is skipped when `on_chunk` returned `Next::Break`, on the assumption that an
 early-break visitor already has its result; cancellation and abort skip `on_eof` for the same reason. Whichever exit
 path was taken, `into_output` always runs, so `Consumer::wait()` and `cancel()` always have a value to yield.
+
+### Termination timeouts
+
+`terminate(interrupt_timeout, terminate_timeout)` bounds the post-signal wait of each graceful phase:
+
+| Scenario per phase                        | Time spent in this phase                |                                                                              
+|-------------------------------------------|-----------------------------------------|                                                                              
+| Signal send succeeds, child exits         | ≤ user timeout (typically much less)    |                                                                              
+| Signal send succeeds, child does NOT exit | exactly user timeout, then escalate     |                                                                              
+| Signal send fails                         | up to 100 ms fixed grace, then escalate |
+
+The 100 ms grace covers the small window where the child has already exited but Tokio's SIGCHLD reaper has not yet
+observed it (`EPERM` on macOS, `ESRCH` on Linux against a not-yet-reaped process group). It replaces - never adds to -
+the user timeout for a failed phase. Real permission denials still surface as a `TerminationError`.
+
+`Duration::from_secs(0)` disables the post-signal wait entirely and effectively forces every call into `SIGKILL`.
+Prefer small but non-zero values (e.g. 100 ms to a few seconds).
+
+### When termination fails
+
+If `terminate()` returns `Err`, the panic-on-drop guard stays armed: the library cannot verify cleanup from the
+outside, so dropping would leak a process. Recover by retrying `terminate()`, escalating to `kill()`, calling
+`must_not_be_terminated()` to accept the failure, or propagating the error and letting the panic-on-drop surface the
+leak.
 
 ## Further APIs
 

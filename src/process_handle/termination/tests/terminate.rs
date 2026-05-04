@@ -143,3 +143,27 @@ async fn terminate_returns_normal_exit_when_process_already_exited() {
 
     assert_that!(exit_status.success()).is_true();
 }
+
+/// Regression test for the "signal send fails while the child has already exited" race.
+///
+/// Forces the preflight probe to miss the exit (`Ok(None)`) and both graceful signal sends to
+/// fail. Without the bounded-wait recovery, this falls through to the kill phase and exits via
+/// SIGKILL. With it, the 100 ms grace observes the natural exit and reports success.
+#[tokio::test]
+async fn terminate_succeeds_when_signal_send_fails_against_recently_exited_child() {
+    let mut handle = spawn_immediately_exiting_process();
+
+    let outcome = handle
+        .terminate_inner_with_preflight_reaper(
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            |_| Ok(None),
+            |_| Err(io::Error::other("injected interrupt signal-send failure")),
+            |_| Err(io::Error::other("injected terminate signal-send failure")),
+        )
+        .await
+        .unwrap();
+
+    assert_that!(outcome.exit_status.success()).is_true();
+    assert_that!(handle.is_drop_disarmed()).is_true();
+}

@@ -40,9 +40,9 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "assertr"
-version = "0.5.7"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "931ac837a2e94e51d159ddb9611bd472c750601670721da5dc2f19e762994538"
+checksum = "030dc45f79b3d68fba33b17792e1c634a3bb876a417f279ffbca69b6f27e3722"
 dependencies = [
  "futures",
  "indoc",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "tokio-process-tools"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "assertr",
  "bytes",

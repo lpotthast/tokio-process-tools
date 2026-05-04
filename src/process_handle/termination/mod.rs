@@ -16,6 +16,11 @@ use std::time::Duration;
 /// but there are rare cases where even forceful kill may not work.
 const FORCE_KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Grace window granted to Tokio's SIGCHLD reaper after a signal-send failure so a freshly-exited
+/// child is observed as exited rather than as still running. Covers the brief race where the OS
+/// rejects signals to a not-yet-reaped process group (`EPERM` on macOS, `ESRCH` on Linux).
+const REAP_AFTER_SIGNAL_FAILURE_GRACE: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TerminationOutcome {
     pub(super) exit_status: ExitStatus,
@@ -232,23 +237,36 @@ where
     /// Terminates this process by sending platform graceful shutdown signals first, then killing
     /// the process if it does not complete after receiving them.
     ///
-    /// On Unix this means `SIGINT`, then `SIGTERM`, then `SIGKILL`. On Windows, targeted
-    /// `CTRL_C_EVENT` delivery is not supported for child process groups, so both graceful phases
-    /// use `CTRL_BREAK_EVENT` before falling back to `TerminateProcess`.
-    /// After the graceful phases time out, termination performs one additional fixed 3-second wait
-    /// for the force-kill result.
+    /// On Unix this means `SIGINT`, then `SIGTERM`, then `SIGKILL`. On Windows, both graceful
+    /// phases send `CTRL_BREAK_EVENT` before falling back to `TerminateProcess`. The force-kill
+    /// fallback adds one fixed 3-second wait on top of the graceful timeouts.
     ///
-    /// When this method returns `Ok`, the process has reached a terminal state and this handle's
-    /// drop cleanup and panic guards are disarmed, so the handle can be dropped safely afterward.
+    /// # Timeouts
     ///
-    /// If this method returns `Err`, or if the returned future is canceled before completion, the
-    /// guards remain armed. Dropping the handle will still attempt best-effort cleanup and panic
-    /// unless the process is later successfully awaited, terminated, killed, or explicitly detached
-    /// with [`ProcessHandle::must_not_be_terminated`].
+    /// `interrupt_timeout` and `terminate_timeout` bound the post-signal wait of their phase:
+    ///
+    /// - Signal send succeeds: wait up to the user-supplied timeout and escalate if the process is
+    ///   not terminated.
+    /// - Signal send fails: replace the user timeout with a fixed 100 ms grace so Tokio's SIGCHLD
+    ///   reaper can catch up to a child that just exited (the OS rejects signals to a not-yet-
+    ///   reaped process group with `EPERM` on macOS or `ESRCH` on Linux). Real permission denials
+    ///   still surface as an error after the grace elapses.
+    ///
+    /// `Duration::from_secs(0)` disables the post-signal wait entirely and effectively forces the
+    /// call into `SIGKILL`. Prefer small but non-zero values (e.g. 100 ms to a few seconds).
+    ///
+    /// # Drop guards on `Ok` vs `Err`
+    ///
+    /// On `Ok`, the drop cleanup and panic guards are disarmed and the handle can be dropped
+    /// safely. On `Err` (or if the future is canceled), the guards stay armed: the library cannot
+    /// verify cleanup from the outside, so dropping would leak a process. Recover by retrying
+    /// `terminate`, escalating to [`kill`](Self::kill), calling
+    /// [`must_not_be_terminated`](Self::must_not_be_terminated) to accept the failure, or
+    /// propagating the error and letting the panic-on-drop surface the leak.
     ///
     /// # Errors
     ///
-    /// Returns [`TerminationError`] if signalling or waiting for process termination fails.
+    /// Returns [`TerminationError`] if signaling or waiting for process termination fails.
     pub async fn terminate(
         &mut self,
         interrupt_timeout: Duration,
@@ -412,15 +430,18 @@ where
     {
         let mut diagnostics = TerminationDiagnostics::default();
 
+        // We don't have to send the singal at all when the process already terminated.
         match try_reap_exit_status(self) {
-            Ok(Some(_)) => {
+            Ok(Some(_exit_status)) => {
                 self.must_not_be_terminated();
                 Ok(())
             }
             Ok(None) => match send_signal(&self.child) {
                 Ok(()) => Ok(()),
+                // Sync probe only. The SIGCHLD-grace bounded wait lives on the `terminate()` path.
+                // Keeping this sync avoids making the public `send_*_signal` APIs async.
                 Err(signal_error) => match try_reap_exit_status(self) {
-                    Ok(Some(_)) => {
+                    Ok(Some(_exit_status)) => {
                         self.must_not_be_terminated();
                         Ok(())
                     }
@@ -493,7 +514,8 @@ where
                     "Graceful shutdown signal could not be sent. Attempting next shutdown phase."
                 );
                 diagnostics.record_graceful_signal_error(phase, signal_name, err);
-                self.try_reap_after_failed_signal(signal_name, phase, diagnostics)
+                self.observe_exit_after_failed_signal(signal_name, phase, diagnostics)
+                    .await
             }
         }
     }
@@ -534,13 +556,19 @@ where
         }
     }
 
-    fn try_reap_after_failed_signal(
+    /// Recovery probe after a graceful signal send failed: waits briefly so a freshly-exited
+    /// child is observed as exited rather than as still running. See
+    /// [`REAP_AFTER_SIGNAL_FAILURE_GRACE`].
+    async fn observe_exit_after_failed_signal(
         &mut self,
         signal_name: &'static str,
         phase: GracefulTerminationPhase,
         diagnostics: &mut TerminationDiagnostics,
     ) -> Option<TerminationOutcome> {
-        match self.try_reap_exit_status() {
+        match self
+            .wait_for_exit_after_signal(REAP_AFTER_SIGNAL_FAILURE_GRACE)
+            .await
+        {
             Ok(Some(exit_status)) => Some(TerminationOutcome::graceful_success(exit_status)),
             Ok(None) => None,
             Err(reap_error) => {
@@ -611,7 +639,12 @@ where
                 );
                 diagnostics.record_kill_signal_error(kill_error);
 
-                match self.try_reap_exit_status() {
+                // Brief grace for Tokio's SIGCHLD reaper to catch up - see
+                // `REAP_AFTER_SIGNAL_FAILURE_GRACE`.
+                match self
+                    .wait_for_exit_after_signal(REAP_AFTER_SIGNAL_FAILURE_GRACE)
+                    .await
+                {
                     Ok(Some(exit_status)) => {
                         return Ok(TerminationOutcome::graceful_success(exit_status));
                     }
@@ -640,6 +673,9 @@ where
     /// matching [`tokio::process::Child::kill`] semantics.
     /// A successful call waits for the child to exit and disarms the drop cleanup and panic guards,
     /// so the handle can be dropped safely afterward.
+    ///
+    /// `kill` is a reasonable next step when [`terminate`](Self::terminate) returns `Err` and the
+    /// caller is not interested in further graceful escalation.
     ///
     /// # Errors
     ///
