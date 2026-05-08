@@ -1,5 +1,5 @@
 use crate::process_handle::ProcessHandle;
-use crate::process_handle::termination::GracefulTimeouts;
+use crate::process_handle::termination::GracefulShutdown;
 use crate::{OutputStream, async_drop};
 use std::ops::{Deref, DerefMut};
 
@@ -19,9 +19,9 @@ use std::ops::{Deref, DerefMut};
 ///
 /// Instead of relying on automatic termination, prefer these safer approaches:
 /// 1. Manual process termination using [`ProcessHandle::terminate`]
-/// 2. Awaiting process completion using [`ProcessHandle::wait_for_completion`]
-/// 3. Awaiting process completion or performing an explicit termination using
-///    [`ProcessHandle::wait_for_completion_or_terminate`]
+/// 2. Awaiting process completion using the [`ProcessHandle::wait_for_completion`] builder
+/// 3. Awaiting process completion or performing an explicit termination using the same
+///    builder followed by `.or_terminate(...)`
 ///
 /// # Implementation Details
 ///
@@ -31,7 +31,7 @@ use std::ops::{Deref, DerefMut};
 #[derive(Debug)]
 pub struct TerminateOnDrop<Stdout: OutputStream, Stderr: OutputStream = Stdout> {
     pub(crate) process_handle: ProcessHandle<Stdout, Stderr>,
-    pub(crate) timeouts: GracefulTimeouts,
+    pub(crate) shutdown: GracefulShutdown,
 }
 
 impl<Stdout, Stderr> Deref for TerminateOnDrop<Stdout, Stderr>
@@ -85,7 +85,7 @@ where
             }
 
             tracing::debug!(process = %self.process_handle.name, "Terminating process");
-            match self.process_handle.terminate(self.timeouts).await {
+            match self.process_handle.terminate(self.shutdown.clone()).await {
                 Ok(exit_status) => {
                     tracing::debug!(
                         process = %self.process_handle.name,

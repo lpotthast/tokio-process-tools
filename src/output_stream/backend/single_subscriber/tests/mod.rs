@@ -1,12 +1,12 @@
 use super::SingleSubscriberOutputStream;
 use crate::{
-    BestEffortDelivery, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NoReplay, NumBytes,
-    StreamConfig,
+    DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, LossyWithoutBackpressure, NoReplay,
+    NumBytes, StreamConfig,
 };
 
 mod active_consumer;
 mod common;
-mod consume_with;
+mod consume;
 mod consumer_lifecycle;
 mod consumer_unit_lifecycle;
 mod line_waiter;
@@ -27,7 +27,7 @@ fn from_stream_panics_on_zero_read_chunk_size() {
         StreamConfig {
             read_chunk_size: NumBytes::zero(),
             max_buffered_chunks: DEFAULT_MAX_BUFFERED_CHUNKS,
-            delivery: BestEffortDelivery,
+            delivery: LossyWithoutBackpressure,
             replay: NoReplay,
         },
     );
@@ -42,7 +42,7 @@ fn from_stream_panics_on_zero_max_buffered_chunks() {
         StreamConfig {
             read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
             max_buffered_chunks: 0,
-            delivery: BestEffortDelivery,
+            delivery: LossyWithoutBackpressure,
             replay: NoReplay,
         },
     );

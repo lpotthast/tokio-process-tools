@@ -1,7 +1,7 @@
 use crate::NumBytes;
 use crate::output_stream::policy::{
-    BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, ReliableDelivery, Replay,
-    ReplayEnabled, ReplayRetention,
+    Delivery, DeliveryGuarantee, LossyWithoutBackpressure, NoReplay, ReliableWithBackpressure,
+    Replay, ReplayEnabled, ReplayRetention,
 };
 
 /// Default chunk size read from the source stream. 16 kilobytes.
@@ -20,7 +20,7 @@ pub(crate) fn assert_max_buffered_chunks_non_zero(chunks: usize, parameter_name:
 /// consumers. This configuration controls delivery, replay, and buffering for whichever backend is
 /// selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamConfig<D = BestEffortDelivery, R = NoReplay>
+pub struct StreamConfig<D = LossyWithoutBackpressure, R = NoReplay>
 where
     D: Delivery,
     R: Replay,
@@ -33,8 +33,8 @@ where
     /// The number of chunks held by the underlying async channel.
     ///
     /// Must be greater than zero. The default is [`crate::DEFAULT_MAX_BUFFERED_CHUNKS`].
-    /// With [`DeliveryGuarantee::ReliableForActiveSubscribers`], it is the maximum unread chunk
-    /// lag an active subscriber can have before reading waits.
+    /// With [`DeliveryGuarantee::ReliableWithBackpressure`], it is the maximum unread chunk lag
+    /// an active subscriber can have before reading waits.
     pub max_buffered_chunks: usize,
 
     /// How slow active subscribers affect reading from the underlying stream.
@@ -44,7 +44,7 @@ where
     pub replay: R,
 }
 
-impl StreamConfig<BestEffortDelivery, NoReplay> {
+impl StreamConfig<LossyWithoutBackpressure, NoReplay> {
     /// Starts building an output stream configuration.
     #[must_use]
     pub fn builder() -> StreamConfigBuilder {
@@ -57,27 +57,35 @@ impl StreamConfig<BestEffortDelivery, NoReplay> {
 pub struct StreamConfigBuilder;
 
 impl StreamConfigBuilder {
-    /// Delivery that keeps reading while slow consumers lag behind.
+    /// Lossy delivery that never blocks the child.
     ///
-    /// Bounded buffers may overflow, so active consumers can observe gaps or dropped output. This
-    /// policy avoids applying backpressure for slow consumers, but it is not a blanket throughput
-    /// guarantee; backend implementation and workload shape still matter.
+    /// **Mechanism:** the reader task keeps draining the child's pipe regardless of consumer
+    /// pace. When a subscriber's buffer fills, that subscriber's chunk is dropped instead of
+    /// pausing the child.
+    ///
+    /// **Cost:** slow active consumers may observe gaps or dropped output. Line-aware consumers
+    /// discard the in-progress partial line and resync at the next newline rather than splicing
+    /// across the gap.
     #[must_use]
-    pub fn best_effort_delivery(self) -> StreamConfigReplayBuilder<BestEffortDelivery> {
+    pub fn lossy_without_backpressure(self) -> StreamConfigReplayBuilder<LossyWithoutBackpressure> {
         StreamConfigReplayBuilder {
-            delivery: BestEffortDelivery,
+            delivery: LossyWithoutBackpressure,
         }
     }
 
-    /// Delivery that waits for active subscribers when their buffers are full.
+    /// Reliable delivery to active subscribers, paid for with backpressure on the child.
     ///
-    /// This applies backpressure to process-output reading so active consumers see all chunks
-    /// delivered inside the library. It does not retain output for consumers that attach later;
-    /// that is controlled by replay settings.
+    /// **Mechanism:** when an active subscriber's buffer is full, the reader task waits before
+    /// reading more from the child's pipe. The kernel pipe then fills and the child's next write
+    /// blocks. That blocking is the cost of reliability.
+    ///
+    /// **Scope:** the guarantee applies only to subscribers that are *currently attached* when
+    /// each chunk is produced. Subscribers that attach later are not retroactively delivered
+    /// earlier chunks by this policy; that is what the replay axis is for.
     #[must_use]
-    pub fn reliable_for_active_subscribers(self) -> StreamConfigReplayBuilder<ReliableDelivery> {
+    pub fn reliable_with_backpressure(self) -> StreamConfigReplayBuilder<ReliableWithBackpressure> {
         StreamConfigReplayBuilder {
-            delivery: ReliableDelivery,
+            delivery: ReliableWithBackpressure,
         }
     }
 }
@@ -138,8 +146,10 @@ where
     ///
     /// This can potentially grow massively and could require a lot of memory.
     ///
-    /// Make sure to call `seal_replay()` on the stream when all subscribers were created. This
-    /// allows the system to free up memory for data already replayed to all subscribers.
+    /// Call `seal_replay()` on the stream once every consumer that needs the retained history has
+    /// attached. Sealing applies to *future* consumers only: it stops new replay from being
+    /// served, allowing the retained buffer to be released. Already-attached subscribers keep
+    /// the snapshot they were given at subscription time and are unaffected by the seal.
     #[must_use]
     pub fn replay_all(self) -> StreamConfigReadChunkSizeBuilder<D, ReplayEnabled> {
         StreamConfigReadChunkSizeBuilder {
@@ -300,55 +310,57 @@ mod tests {
 
     #[test]
     fn builder_creates_expected_delivery_and_replay_configs() {
-        let config: StreamConfig<BestEffortDelivery, NoReplay> = StreamConfig::builder()
-            .best_effort_delivery()
-            .no_replay()
-            .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-            .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            .build();
-
-        assert_that!(config.delivery_guarantee()).is_equal_to(DeliveryGuarantee::BestEffort);
-        assert_that!(config.replay_enabled()).is_false();
-        assert_that!(config.replay_retention()).is_none();
-        assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
-        assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
-
-        let config: StreamConfig<ReliableDelivery, NoReplay> = StreamConfig::builder()
-            .reliable_for_active_subscribers()
+        let config: StreamConfig<LossyWithoutBackpressure, NoReplay> = StreamConfig::builder()
+            .lossy_without_backpressure()
             .no_replay()
             .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
             .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             .build();
 
         assert_that!(config.delivery_guarantee())
-            .is_equal_to(DeliveryGuarantee::ReliableForActiveSubscribers);
+            .is_equal_to(DeliveryGuarantee::LossyWithoutBackpressure);
         assert_that!(config.replay_enabled()).is_false();
         assert_that!(config.replay_retention()).is_none();
         assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
         assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
 
-        let config: StreamConfig<BestEffortDelivery, ReplayEnabled> = StreamConfig::builder()
-            .best_effort_delivery()
+        let config: StreamConfig<ReliableWithBackpressure, NoReplay> = StreamConfig::builder()
+            .reliable_with_backpressure()
+            .no_replay()
+            .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
+            .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
+            .build();
+
+        assert_that!(config.delivery_guarantee())
+            .is_equal_to(DeliveryGuarantee::ReliableWithBackpressure);
+        assert_that!(config.replay_enabled()).is_false();
+        assert_that!(config.replay_retention()).is_none();
+        assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
+        assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
+
+        let config: StreamConfig<LossyWithoutBackpressure, ReplayEnabled> = StreamConfig::builder()
+            .lossy_without_backpressure()
             .replay_last_chunks(2)
             .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
             .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             .build();
 
-        assert_that!(config.delivery_guarantee()).is_equal_to(DeliveryGuarantee::BestEffort);
+        assert_that!(config.delivery_guarantee())
+            .is_equal_to(DeliveryGuarantee::LossyWithoutBackpressure);
         assert_that!(config.replay_enabled()).is_true();
         assert_that!(config.replay_retention()).is_equal_to(Some(ReplayRetention::LastChunks(2)));
         assert_that!(config.read_chunk_size).is_equal_to(DEFAULT_READ_CHUNK_SIZE);
         assert_that!(config.max_buffered_chunks).is_equal_to(DEFAULT_MAX_BUFFERED_CHUNKS);
 
-        let config: StreamConfig<ReliableDelivery, ReplayEnabled> = StreamConfig::builder()
-            .reliable_for_active_subscribers()
+        let config: StreamConfig<ReliableWithBackpressure, ReplayEnabled> = StreamConfig::builder()
+            .reliable_with_backpressure()
             .replay_last_bytes(16.bytes())
             .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
             .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             .build();
 
         assert_that!(config.delivery_guarantee())
-            .is_equal_to(DeliveryGuarantee::ReliableForActiveSubscribers);
+            .is_equal_to(DeliveryGuarantee::ReliableWithBackpressure);
         assert_that!(config.replay_enabled()).is_true();
         assert_that!(config.replay_retention())
             .is_equal_to(Some(ReplayRetention::LastBytes(16.bytes())));
@@ -360,7 +372,7 @@ mod tests {
     fn invalid_configs_panic_with_parameter_names() {
         assert_that_panic_by(|| {
             let _config = StreamConfig::builder()
-                .best_effort_delivery()
+                .lossy_without_backpressure()
                 .no_replay()
                 .read_chunk_size(0.bytes());
         })
@@ -369,7 +381,7 @@ mod tests {
 
         assert_that_panic_by(|| {
             let _config = StreamConfig::builder()
-                .best_effort_delivery()
+                .lossy_without_backpressure()
                 .no_replay()
                 .read_chunk_size(8.bytes())
                 .max_buffered_chunks(0);
@@ -379,7 +391,7 @@ mod tests {
 
         assert_that_panic_by(|| {
             let _config = StreamConfig::builder()
-                .best_effort_delivery()
+                .lossy_without_backpressure()
                 .replay_last_chunks(0);
         })
         .has_type::<String>()
@@ -387,7 +399,7 @@ mod tests {
 
         assert_that_panic_by(|| {
             let _config = StreamConfig::builder()
-                .best_effort_delivery()
+                .lossy_without_backpressure()
                 .replay_last_bytes(NumBytes::zero());
         })
         .has_type::<String>()
@@ -401,7 +413,7 @@ mod tests {
 
         assert_that_panic_by(|| {
             let config = StreamConfig::builder()
-                .best_effort_delivery()
+                .lossy_without_backpressure()
                 .replay_all()
                 .read_chunk_size(8.bytes())
                 .max_buffered_chunks(2)
@@ -417,7 +429,7 @@ mod tests {
             let config = StreamConfig {
                 read_chunk_size: 8.bytes(),
                 max_buffered_chunks: 2,
-                delivery: BestEffortDelivery,
+                delivery: LossyWithoutBackpressure,
                 replay: ReplayEnabled {
                     replay_retention: ReplayRetention::LastBytes(NumBytes::zero()),
                 },
@@ -436,7 +448,7 @@ mod tests {
         use crate::output_stream::backend::single_subscriber::SingleSubscriberOutputStream;
 
         let config = StreamConfig::builder()
-            .best_effort_delivery()
+            .lossy_without_backpressure()
             .no_replay()
             .read_chunk_size(8.bytes())
             .max_buffered_chunks(2)

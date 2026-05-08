@@ -5,16 +5,16 @@
 //! the subscriber registry (`HashMap<SubscriberId, SubscriberSender>`), the terminal-event
 //! slot, and the replay-sealing flag. Per-event dispatch happens in
 //! [`state::append_event`], which branches on the configured
-//! [`DeliveryGuarantee`](crate::output_stream::policy::DeliveryGuarantee): `ReliableForActiveSubscribers`
+//! [`DeliveryGuarantee`](crate::output_stream::policy::DeliveryGuarantee): `ReliableWithBackpressure`
 //! pushes through a per-subscriber `mpsc::Sender` and applies backpressure when active
-//! consumers fall behind, while `BestEffort` pushes through a `BestEffortLiveQueue` that
-//! drops on overflow.
+//! consumers fall behind, while `LossyWithoutBackpressure` pushes through a `BestEffortLiveQueue`
+//! that drops on overflow.
 //!
 //! Compared with [`fast`], every event takes a mutex on the shared state and the replay
 //! buffer is maintained on the hot path. That overhead is the price of supporting late
 //! subscribers (via replay retention), reliable delivery, or both. This backend is
 //! selected by [`BroadcastOutputStream::from_stream`] in [`super`] for any
-//! `ReliableDelivery` config or any `ReplayEnabled` config.
+//! `ReliableWithBackpressure` config or any `ReplayEnabled` config.
 //!
 //! [`fast`]: super::fast
 //! [`state`]: super::state
@@ -116,9 +116,9 @@ mod tests {
     use assertr::prelude::*;
     use std::io::Cursor;
 
-    fn replay_all_options() -> StreamConfig<crate::BestEffortDelivery, crate::ReplayEnabled> {
+    fn replay_all_options() -> StreamConfig<crate::LossyWithoutBackpressure, crate::ReplayEnabled> {
         StreamConfig::builder()
-            .best_effort_delivery()
+            .lossy_without_backpressure()
             .replay_all()
             .read_chunk_size(2.bytes())
             .max_buffered_chunks(8)

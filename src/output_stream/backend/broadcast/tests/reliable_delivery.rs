@@ -3,10 +3,14 @@ use super::common::{
     CountingWrite, GatedChunkedReader, build_chunk_payload, line_collection_options,
     reliable_no_replay_options_with,
 };
-use crate::{LineParsingOptions, NumBytesExt, WriteCollectionOptions};
+use crate::output_stream::Consumable;
+use crate::output_stream::line::adapter::ParseLines;
+use crate::output_stream::visitors::write::WriteChunks;
+use crate::{CollectedLines, LineParsingOptions, NumBytesExt, WriteCollectionOptions};
 use assertr::prelude::*;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use unwrap_infallible::UnwrapInfallible;
 
 #[tokio::test]
 async fn block_until_subscribers_catch_up_preserves_all_output_for_active_subscribers() {
@@ -16,8 +20,13 @@ async fn block_until_subscribers_catch_up_preserves_all_output_for_active_subscr
         "custom",
         reliable_no_replay_options_with(2.bytes(), 1),
     );
-    let collector =
-        stream.collect_lines_into_vec(LineParsingOptions::default(), line_collection_options());
+    let collector = stream
+        .consume(ParseLines::collect(
+            LineParsingOptions::default(),
+            CollectedLines::new(),
+            CollectedLines::line_collector(line_collection_options()),
+        ))
+        .unwrap_infallible();
 
     write_half.write_all(b"a\nb\nc\n").await.unwrap();
     drop(write_half);
@@ -40,10 +49,13 @@ async fn block_until_subscribers_catch_up_gated_multi_subscriber_collection_comp
     );
     let collectors = (0..subscriber_count)
         .map(|_| {
-            stream.collect_chunks_into_write(
-                CountingWrite::default(),
-                WriteCollectionOptions::fail_fast(),
-            )
+            stream
+                .consume_async(WriteChunks::passthrough(
+                    "custom",
+                    CountingWrite::default(),
+                    WriteCollectionOptions::fail_fast(),
+                ))
+                .unwrap_infallible()
         })
         .collect::<Vec<_>>();
 

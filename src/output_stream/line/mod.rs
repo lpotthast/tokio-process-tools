@@ -5,8 +5,8 @@
 //!   (the configuration surface).
 //! - [`parser`] holds [`parser::LineParser`], the stateful state machine that turns byte
 //!   chunks into lines.
-//! - [`adapter`] holds [`adapter::LineAdapter`] plus the [`adapter::LineSink`] and
-//!   [`adapter::AsyncLineSink`] traits that user sinks implement to plug into the line-aware
+//! - [`adapter`] holds [`adapter::ParseLines`] plus the [`adapter::LineVisitor`] and
+//!   [`adapter::AsyncLineVisitor`] traits that user sinks implement to plug into the line-aware
 //!   consumer pipeline.
 
 pub(crate) mod adapter;

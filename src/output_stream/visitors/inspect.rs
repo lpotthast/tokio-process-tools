@@ -1,17 +1,21 @@
 use crate::output_stream::Next;
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::adapter::{AsyncLineSink, LineSink};
+use crate::output_stream::line::adapter::{AsyncLineVisitor, LineVisitor};
 use crate::output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
 use std::borrow::Cow;
 use std::future::Future;
 use std::marker::PhantomData;
 use typed_builder::TypedBuilder;
 
+/// Synchronous [`StreamVisitor`] that calls `f` once per observed chunk and discards the
+/// chunk afterwards. Construct via [`builder`](Self::builder) and pass to
+/// [`Consumable::consume`](crate::Consumable::consume).
 #[derive(TypedBuilder)]
-pub(crate) struct InspectChunks<F>
+pub struct InspectChunks<F>
 where
     F: FnMut(Chunk) -> Next + Send + 'static,
 {
+    /// Per-chunk callback. Return [`Next::Break`] to stop the consumer early.
     pub f: F,
 }
 
@@ -28,16 +32,19 @@ where
     fn into_output(self) -> Self::Output {}
 }
 
+/// Asynchronous counterpart to [`InspectChunks`]. Construct via [`builder`](Self::builder) and
+/// pass to [`Consumable::consume_async`](crate::Consumable::consume_async).
 #[derive(TypedBuilder)]
-pub(crate) struct InspectChunksAsync<F, Fut>
+pub struct InspectChunksAsync<F, Fut>
 where
     F: FnMut(Chunk) -> Fut + Send + 'static,
     Fut: Future<Output = Next> + Send + 'static,
 {
+    /// Per-chunk async callback. The returned future yields [`Next::Break`] to stop early.
     pub f: F,
     /// Phantom marker so the `Fut` bound lives on the struct (and on the derived builder)
     /// rather than only on the impl block. The closure's return type carries `Fut`, so the
-    /// builder infers it from `f` — users never spell `Fut` out.
+    /// builder infers it from `f`. Users never spell `Fut` out.
     #[builder(default, setter(skip))]
     pub _fut: PhantomData<fn() -> Fut>,
 }
@@ -56,14 +63,15 @@ where
     fn into_output(self) -> Self::Output {}
 }
 
-/// [`LineSink`] wrapping a per-line closure. Compose with
-/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) to drive `inspect_lines`, or to
-/// build your own custom inspect-lines consumer outside the built-in factory methods.
-pub struct InspectLineSink<F> {
+/// [`LineVisitor`] wrapping a per-line closure. Compose with
+/// [`ParseLines`](crate::output_stream::line::adapter::ParseLines) (most easily via
+/// [`ParseLines::inspect`](crate::output_stream::line::adapter::ParseLines::inspect)) to
+/// build a line-by-line inspector consumer.
+pub struct InspectLines<F> {
     f: F,
 }
 
-impl<F> InspectLineSink<F>
+impl<F> InspectLines<F>
 where
     F: FnMut(Cow<'_, str>) -> Next + Send + 'static,
 {
@@ -73,7 +81,7 @@ where
     }
 }
 
-impl<F> LineSink for InspectLineSink<F>
+impl<F> LineVisitor for InspectLines<F>
 where
     F: FnMut(Cow<'_, str>) -> Next + Send + 'static,
 {
@@ -86,17 +94,17 @@ where
     fn into_output(self) -> Self::Output {}
 }
 
-/// [`AsyncLineSink`] wrapping a per-line async closure. Compose with
-/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) (its [`AsyncStreamVisitor`] impl
-/// is selected automatically when the inner sink is an [`AsyncLineSink`]) to drive
-/// `inspect_lines_async`. The `PhantomData<fn() -> Fut>` carries the future's type onto the
-/// struct so callers never name `Fut` explicitly.
-pub struct InspectLineSinkAsync<F, Fut> {
+/// [`AsyncLineVisitor`] wrapping a per-line async closure. Compose with
+/// [`ParseLines`](crate::output_stream::line::adapter::ParseLines) (most easily via
+/// [`ParseLines::inspect_async`](crate::output_stream::line::adapter::ParseLines::inspect_async))
+/// to build an async line-by-line inspector consumer. The `PhantomData<fn() -> Fut>` carries
+/// the future's type onto the struct so callers never name `Fut` explicitly.
+pub struct InspectLinesAsync<F, Fut> {
     f: F,
     _fut: PhantomData<fn() -> Fut>,
 }
 
-impl<F, Fut> InspectLineSinkAsync<F, Fut>
+impl<F, Fut> InspectLinesAsync<F, Fut>
 where
     F: FnMut(Cow<'_, str>) -> Fut + Send + 'static,
     Fut: Future<Output = Next> + Send + 'static,
@@ -110,7 +118,7 @@ where
     }
 }
 
-impl<F, Fut> AsyncLineSink for InspectLineSinkAsync<F, Fut>
+impl<F, Fut> AsyncLineVisitor for InspectLinesAsync<F, Fut>
 where
     F: FnMut(Cow<'_, str>) -> Fut + Send + 'static,
     Fut: Future<Output = Next> + Send + 'static,
@@ -131,7 +139,7 @@ mod tests {
     use crate::output_stream::consumer::driver::spawn_consumer_sync;
     use crate::output_stream::event::StreamEvent;
     use crate::output_stream::event::tests::event_receiver;
-    use crate::output_stream::line::adapter::LineAdapter;
+    use crate::output_stream::line::adapter::ParseLines;
     use crate::output_stream::line::options::LineParsingOptions;
     use crate::{ConsumerCancelOutcome, ConsumerError, StreamReadError};
     use assertr::prelude::*;
@@ -165,13 +173,13 @@ mod tests {
         #[test]
         #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]
         fn panics_when_max_line_length_is_zero() {
-            let _visitor = LineAdapter::new(
+            let _visitor = ParseLines::new(
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: crate::LineOverflowBehavior::default(),
                     buffer_compaction_threshold: None,
                 },
-                InspectLineSink::new(|_line| Next::Continue),
+                InspectLines::new(|_line| Next::Continue),
             );
         }
 
@@ -185,10 +193,7 @@ mod tests {
                     StreamEvent::ReadError(error),
                 ])
                 .await,
-                LineAdapter::new(
-                    LineParsingOptions::default(),
-                    InspectLineSink::new(|_line| Next::Continue),
-                ),
+                ParseLines::inspect(LineParsingOptions::default(), |_line| Next::Continue),
             );
 
             match inspector.wait().await {
@@ -217,13 +222,10 @@ mod tests {
                     StreamEvent::Eof,
                 ])
                 .await,
-                LineAdapter::new(
-                    LineParsingOptions::default(),
-                    InspectLineSink::new(move |line| {
-                        seen_in_task.lock().unwrap().push(line.into_owned());
-                        Next::Continue
-                    }),
-                ),
+                ParseLines::inspect(LineParsingOptions::default(), move |line| {
+                    seen_in_task.lock().unwrap().push(line.into_owned());
+                    Next::Continue
+                }),
             );
 
             inspector.wait().await.unwrap();
@@ -322,13 +324,13 @@ mod tests {
         #[test]
         #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]
         fn panics_when_max_line_length_is_zero() {
-            let _visitor = LineAdapter::new(
+            let _visitor = ParseLines::new(
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: crate::LineOverflowBehavior::default(),
                     buffer_compaction_threshold: None,
                 },
-                InspectLineSinkAsync::new(|_line| async { Next::Continue }),
+                InspectLinesAsync::new(|_line| async { Next::Continue }),
             );
         }
 
@@ -343,17 +345,14 @@ mod tests {
                     StreamEvent::Eof,
                 ])
                 .await,
-                LineAdapter::new(
-                    LineParsingOptions::default(),
-                    InspectLineSinkAsync::new(move |line| {
-                        let seen = Arc::clone(&seen_in_task);
-                        let line = line.into_owned();
-                        async move {
-                            seen.lock().unwrap().push(line);
-                            Next::Continue
-                        }
-                    }),
-                ),
+                ParseLines::inspect_async(LineParsingOptions::default(), move |line| {
+                    let seen = Arc::clone(&seen_in_task);
+                    let line = line.into_owned();
+                    async move {
+                        seen.lock().unwrap().push(line);
+                        Next::Continue
+                    }
+                }),
             );
 
             inspector.wait().await.unwrap();

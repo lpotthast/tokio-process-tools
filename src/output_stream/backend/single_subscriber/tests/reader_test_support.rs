@@ -36,7 +36,7 @@ where
     }
 
     let stream_reader = match delivery_guarantee {
-        DeliveryGuarantee::BestEffort => tokio::spawn(read_chunked_best_effort(
+        DeliveryGuarantee::LossyWithoutBackpressure => tokio::spawn(read_chunked_best_effort(
             read,
             Arc::clone(&shared),
             active_rx,
@@ -44,7 +44,7 @@ where
             None,
             "custom",
         )),
-        DeliveryGuarantee::ReliableForActiveSubscribers => tokio::spawn(read_chunked_reliable(
+        DeliveryGuarantee::ReliableWithBackpressure => tokio::spawn(read_chunked_reliable(
             read,
             Arc::clone(&shared),
             active_rx,

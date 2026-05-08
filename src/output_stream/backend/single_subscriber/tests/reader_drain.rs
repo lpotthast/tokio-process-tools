@@ -1,6 +1,8 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::wait_for_no_active_consumer;
-use crate::{NumBytesExt, RawCollectionOptions, StreamConfig};
+use crate::output_stream::Consumable;
+use crate::output_stream::visitors::collect::CollectChunks;
+use crate::{CollectedBytes, NumBytesExt, RawCollectionOptions, StreamConfig};
 use assertr::prelude::*;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -13,7 +15,7 @@ async fn reader_drains_after_consumer_drop() {
         read_half,
         "custom",
         StreamConfig::builder()
-            .reliable_for_active_subscribers()
+            .reliable_with_backpressure()
             .no_replay()
             .read_chunk_size(16.bytes())
             .max_buffered_chunks(1)
@@ -21,7 +23,10 @@ async fn reader_drains_after_consumer_drop() {
     );
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     drop(collector);
     wait_for_no_active_consumer(&stream).await;
@@ -34,7 +39,10 @@ async fn reader_drains_after_consumer_drop() {
     sleep(Duration::from_millis(25)).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"tail").await.unwrap();
     drop(write_half);

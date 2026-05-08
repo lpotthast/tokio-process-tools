@@ -1,49 +1,34 @@
 //! Spawned-process handle, stdin lifecycle, and process state queries.
 
 mod drop_guard;
+mod group;
 pub(crate) mod output_collection;
 mod replay;
+#[cfg(any(unix, windows))]
+mod signal;
 mod spawn;
 pub(crate) mod termination;
 mod wait;
+pub(crate) mod wait_builder;
 
 use crate::output_stream::OutputStream;
-use crate::panic_on_drop::PanicOnDrop;
-use crate::process_handle::termination::GracefulTimeouts;
+use crate::process_handle::drop_guard::DropMode;
+use crate::process_handle::group::ProcessGroup;
 use std::borrow::Cow;
 use std::io;
 use std::mem::ManuallyDrop;
 use std::process::ExitStatus;
-use std::time::Duration;
 use tokio::process::Child;
 use tokio::process::ChildStdin;
-
-/// Options for waiting until a process exits, terminating it if waiting fails.
-///
-/// `graceful_timeouts` is a [`GracefulTimeouts`] value, whose shape itself differs per platform
-/// (two timeouts on Unix, one on Windows). Cross-platform callers construct it under cfg gates;
-/// the wait-or-terminate signature stays the same on every supported OS.
-///
-/// This type is only available on Unix and Windows because the underlying `terminate(...)`
-/// machinery is gated to those platforms.
-#[cfg(any(unix, windows))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WaitForCompletionOrTerminateOptions {
-    /// Maximum time to wait before attempting termination.
-    pub wait_timeout: Duration,
-
-    /// Per-platform graceful-shutdown timeout budget. See [`GracefulTimeouts`].
-    pub graceful_timeouts: GracefulTimeouts,
-}
 
 /// Represents the `stdin` stream of a child process.
 ///
 /// stdin is always configured as piped, so it starts as `Open` with a [`ChildStdin`] handle
 /// that can be used to write data to the process. It can be explicitly closed by calling
-/// [`Stdin::close`], or implicitly closed by terminal wait helpers such as
-/// [`ProcessHandle::wait_for_completion`] and [`ProcessHandle::kill`], after which it transitions
-/// to the `Closed` state. Note that some operations (kill) close `stdin` early in order to match
-/// the behavior of tokio.
+/// [`Stdin::close`], or implicitly closed by the staged
+/// [`ProcessHandle::wait_for_completion`] builder and [`ProcessHandle::kill`], after which it
+/// transitions to the `Closed` state. Note that some operations (kill) close `stdin` early in
+/// order to match the behavior of tokio.
 #[derive(Debug)]
 pub enum Stdin {
     /// `stdin` is open and available for writing.
@@ -71,9 +56,10 @@ impl Stdin {
     /// Closes stdin by dropping the underlying [`ChildStdin`] handle.
     ///
     /// This sends `EOF` to the child process. After calling this method, this stdin
-    /// will be in the `Closed` state and no further writes will be possible. Terminal wait helpers
-    /// such as [`ProcessHandle::wait_for_completion`] and [`ProcessHandle::kill`] also close any
-    /// still-open stdin automatically; call this method when the child must observe EOF earlier.
+    /// will be in the `Closed` state and no further writes will be possible. The staged
+    /// [`ProcessHandle::wait_for_completion`] builder and [`ProcessHandle::kill`] also close
+    /// any still-open stdin automatically; call this method when the child must observe EOF
+    /// earlier.
     pub fn close(&mut self) {
         *self = Stdin::Closed;
     }
@@ -81,6 +67,9 @@ impl Stdin {
 
 /// Represents the running state of a process.
 #[derive(Debug)]
+#[must_use = "Discarding the state defeats the purpose of probing; match on the variants \
+              (or call `is_definitely_running`) to distinguish Running, Terminated, and \
+              Uncertain."]
 pub enum RunningState {
     /// The process is still running.
     Running,
@@ -117,20 +106,6 @@ impl RunningState {
     }
 }
 
-/// Drop-time behavior selected by the lifecycle methods on [`ProcessHandle`].
-///
-/// The state machine has two reachable states because every public lifecycle entry point either
-/// keeps both safeguards on (`Armed`) or turns both off (`Disarmed`). There is no "panic only,
-/// no cleanup" or "cleanup only, no panic" combination: the panic guard makes sense only when
-/// paired with the kill that signals the misuse.
-#[derive(Debug)]
-pub(super) enum DropMode {
-    /// Cleanup is attempted on drop and the panic guard fires when it does.
-    Armed { panic: PanicOnDrop },
-    /// Both cleanup and the panic guard are off. Drop is a no-op for this handle's lifecycle.
-    Disarmed,
-}
-
 /// A handle to a spawned process with captured stdout/stderr streams.
 ///
 /// This type provides methods for waiting on process completion, terminating the process,
@@ -138,7 +113,7 @@ pub(super) enum DropMode {
 /// or terminated before being dropped (see [`ProcessHandle::must_be_terminated`]).
 ///
 /// If applicable, a process handle can be wrapped in a [`crate::TerminateOnDrop`] to be terminated
-/// automatically upon being dropped. Note that this requires a multi-threaded runtime!
+/// automatically upon being dropped. Note that this requires a multithreaded runtime!
 #[derive(Debug)]
 pub struct ProcessHandle<Stdout, Stderr = Stdout>
 where
@@ -146,10 +121,17 @@ where
     Stderr: OutputStream,
 {
     pub(crate) name: Cow<'static, str>,
-    child: Child,
+
+    /// Owns the spawned child as the leader of a process group. On Windows this also owns the
+    /// Job Object the child has been assigned to, so the forceful-kill path can call
+    /// `TerminateJobObject` and reach every descendant the OS has associated with the job
+    /// instead of orphaning the tree the way `Child::start_kill` would.
+    pub(super) group: ProcessGroup,
+
     std_in: Stdin,
     std_out_stream: Stdout,
     std_err_stream: Stderr,
+
     pub(super) drop_mode: DropMode,
 }
 
@@ -158,6 +140,15 @@ where
     Stdout: OutputStream,
     Stderr: OutputStream,
 {
+    /// Returns the process name configured at spawn time.
+    ///
+    /// The name is set by the [`Process`](crate::Process) builder via either an explicit string
+    /// or an [`AutoName`](crate::AutoName) / [`AutoNameSettings`](crate::AutoNameSettings)
+    /// derivation, and is used in diagnostics and error messages to identify the child.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Returns a mutable reference to the (potentially already closed) stdin stream.
     ///
     /// Use this to write data to the child process's stdin. The stdin stream implements
@@ -178,7 +169,7 @@ where
     ///     .stdout_and_stderr(|stream| {
     ///         stream
     ///             .broadcast()
-    ///             .best_effort_delivery()
+    ///             .lossy_without_backpressure()
     ///             .no_replay()
     ///             .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
     ///             .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
@@ -202,18 +193,24 @@ where
 
     /// Returns a reference to the stdout stream.
     ///
-    /// For `BroadcastOutputStream`, this allows creating multiple concurrent consumers.
-    /// For `SingleSubscriberOutputStream`, only one active consumer can exist at a time
-    /// (concurrent attempts will panic with a helpful error message).
+    /// For [`BroadcastOutputStream`](crate::BroadcastOutputStream), this allows creating multiple
+    /// concurrent consumers. For
+    /// [`SingleSubscriberOutputStream`](crate::SingleSubscriberOutputStream), only one active
+    /// consumer can exist at a time; concurrent attempts return
+    /// [`StreamConsumerError::ActiveConsumer`](crate::StreamConsumerError::ActiveConsumer) from
+    /// `consume(...)` / `consume_async(...)` / `wait_for_line(...)` rather than panicking.
     pub fn stdout(&self) -> &Stdout {
         &self.std_out_stream
     }
 
     /// Returns a reference to the stderr stream.
     ///
-    /// For `BroadcastOutputStream`, this allows creating multiple concurrent consumers.
-    /// For `SingleSubscriberOutputStream`, only one active consumer can exist at a time
-    /// (concurrent attempts will panic with a helpful error message).
+    /// For [`BroadcastOutputStream`](crate::BroadcastOutputStream), this allows creating multiple
+    /// concurrent consumers. For
+    /// [`SingleSubscriberOutputStream`](crate::SingleSubscriberOutputStream), only one active
+    /// consumer can exist at a time; concurrent attempts return
+    /// [`StreamConsumerError::ActiveConsumer`](crate::StreamConsumerError::ActiveConsumer) from
+    /// `consume(...)` / `consume_async(...)` / `wait_for_line(...)` rather than panicking.
     pub fn stderr(&self) -> &Stderr {
         &self.std_err_stream
     }
@@ -224,11 +221,20 @@ where
     Stdout: OutputStream,
     Stderr: OutputStream,
 {
+    /// Forwards to [`ProcessGroup::send_kill`].
+    ///
+    /// Kept as a single named entry point so its callers in [`drop_guard`](super::drop_guard)
+    /// and [`termination`](super::termination) read consistently as "kill via the handle"
+    /// rather than reaching into the wrapped [`ProcessGroup`] directly.
+    pub(super) fn send_kill_signal(&mut self) -> io::Result<()> {
+        self.group.send_kill()
+    }
+
     /// Returns the OS process ID if the process hasn't exited yet.
     ///
     /// Once this process has been polled to completion this will return None.
     pub fn id(&self) -> Option<u32> {
-        self.child.id()
+        self.group.id()
     }
 
     /// Reaps the child's exit status without affecting the drop-cleanup or panic guards.
@@ -237,8 +243,12 @@ where
     /// [`Self::must_not_be_terminated`] when they take ownership of the lifecycle: the wait,
     /// terminate, and kill paths do this explicitly when they succeed. `is_running` deliberately
     /// does not, so a status check never silently disarms the safeguards.
-    pub(super) fn try_reap_exit_status(&mut self) -> Result<Option<ExitStatus>, io::Error> {
-        self.child.try_wait()
+    ///
+    /// Exposed publicly so callers can wire this as the preflight reaper to
+    /// [`Self::terminate_with_hooks`].
+    #[doc(hidden)]
+    pub fn try_reap_exit_status(&mut self) -> Result<Option<ExitStatus>, io::Error> {
+        self.group.try_wait()
     }
 
     /// Checks if the process is currently running.
@@ -251,8 +261,8 @@ where
     /// This is a pure status query: it does not disarm the drop-cleanup or panic guards, even
     /// when it observes that the process has exited. A handle whose status reads
     /// [`RunningState::Terminated`] still panics on drop until one of the lifecycle methods has
-    /// closed it. Use [`Self::wait_for_completion`], [`Self::terminate`], or [`Self::kill`] to
-    /// close the lifecycle through a successful terminal call, or call
+    /// closed it. Use [`Self::wait_for_completion`] (the staged builder), [`Self::terminate`],
+    /// or [`Self::kill`] to close the lifecycle through a successful terminal call, or call
     /// [`Self::must_not_be_terminated`] explicitly to detach the handle without termination.
     //noinspection RsSelfConvention
     pub fn is_running(&mut self) -> RunningState {
@@ -282,9 +292,12 @@ where
 
         // SAFETY: `this` is wrapped in `ManuallyDrop`, so moving out fields with `ptr::read` will
         // not cause the original `ProcessHandle` destructor to run. We explicitly drop the fields
-        // not returned from this function exactly once before returning the owned parts.
+        // not returned from this function exactly once before returning the owned parts. The
+        // `ProcessGroup` is consumed by `into_leader()` to produce the bare Tokio `Child`; on
+        // Windows this drops the Job Object handle, which only closes the kernel handle (no
+        // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is set) and does not kill the child.
         unsafe {
-            let child = std::ptr::read(&raw const this.child);
+            let group = std::ptr::read(&raw const this.group);
             let stdin = std::ptr::read(&raw const this.std_in);
             let stdout = std::ptr::read(&raw const this.std_out_stream);
             let stderr = std::ptr::read(&raw const this.std_err_stream);
@@ -292,7 +305,7 @@ where
             std::ptr::drop_in_place(&raw mut this.name);
             std::ptr::drop_in_place(&raw mut this.drop_mode);
 
-            (child, stdin, stdout, stderr)
+            (group.into_leader(), stdin, stdout, stderr)
         }
     }
 }
@@ -300,219 +313,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AutoName, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, Process, RunningState,
-        test_support::long_running_command,
-    };
     use assertr::prelude::*;
-    use std::process::Stdio;
-    use std::time::Duration;
 
-    mod stdin {
-        use super::*;
+    #[test]
+    fn closed_stdin_reports_closed() {
+        let mut stdin = Stdin::Closed;
 
-        #[tokio::test]
-        async fn open_stdin_reports_open_until_closed() {
-            let mut child = long_running_command(Duration::from_secs(5))
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let child_stdin = child.stdin.take().unwrap();
-            let mut stdin = Stdin::Open(child_stdin);
+        assert_that!(stdin.is_open()).is_false();
+        assert_that!(stdin.as_mut()).is_none();
 
-            assert_that!(stdin.is_open()).is_true();
-            assert_that!(stdin.as_mut().is_some()).is_true();
+        stdin.close();
 
-            stdin.close();
-
-            assert_that!(stdin.is_open()).is_false();
-            assert_that!(stdin.as_mut()).is_none();
-
-            child.kill().await.unwrap();
-        }
-
-        #[test]
-        fn closed_stdin_reports_closed() {
-            let mut stdin = Stdin::Closed;
-
-            assert_that!(stdin.is_open()).is_false();
-            assert_that!(stdin.as_mut()).is_none();
-
-            stdin.close();
-
-            assert_that!(stdin.is_open()).is_false();
-            assert_that!(stdin.as_mut()).is_none();
-        }
-    }
-
-    mod is_running {
-        use super::*;
-
-        #[tokio::test]
-        async fn does_not_disarm_drop_guards_when_process_has_exited() {
-            let mut process = Process::new(long_running_command(Duration::from_millis(50)))
-                .name(AutoName::program_only())
-                .stdout_and_stderr(|stream| {
-                    stream
-                        .broadcast()
-                        .best_effort_delivery()
-                        .no_replay()
-                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-                })
-                .spawn()
-                .unwrap();
-
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
-            // Observe the exit through the query API. Even with the child reaped, the drop
-            // guards must remain armed because is_running is documented as a pure status query.
-            let _state = process.is_running();
-
-            assert_that!(process.is_drop_armed()).is_true();
-
-            // Detach explicitly so the test does not panic when `process` drops.
-            process.must_not_be_terminated();
-        }
-
-        #[tokio::test]
-        async fn reports_running_before_wait_and_terminated_after_wait() {
-            let mut process = Process::new(long_running_command(Duration::from_secs(1)))
-                .name(AutoName::program_only())
-                .stdout_and_stderr(|stream| {
-                    stream
-                        .broadcast()
-                        .best_effort_delivery()
-                        .no_replay()
-                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-                })
-                .spawn()
-                .unwrap();
-
-            match process.is_running() {
-                RunningState::Running => {}
-                RunningState::Terminated(exit_status) => {
-                    assert_that!(exit_status).fail("process should still be running");
-                }
-                RunningState::Uncertain(_) => {
-                    assert_that!(&process).fail("process state should not be uncertain");
-                }
-            }
-
-            process
-                .wait_for_completion(Duration::from_secs(2))
-                .await
-                .unwrap();
-
-            match process.is_running() {
-                RunningState::Running => {
-                    assert_that!(process).fail("process should not be running anymore");
-                }
-                RunningState::Terminated(exit_status) => {
-                    assert_that!(exit_status.code()).is_some().is_equal_to(0);
-                    assert_that!(exit_status.success()).is_true();
-                }
-                RunningState::Uncertain(_) => {
-                    assert_that!(process).fail("process state should not be uncertain");
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod into_inner {
-        use super::*;
-        use crate::LineParsingOptions;
-        use crate::test_support::line_collection_options;
-        use tokio::io::AsyncWriteExt;
-
-        #[tokio::test]
-        async fn returns_stdin_with_pipe_still_open() {
-            let cmd = tokio::process::Command::new("cat");
-            let process = Process::new(cmd)
-                .name("cat")
-                .stdout_and_stderr(|stream| {
-                    stream
-                        .broadcast()
-                        .best_effort_delivery()
-                        .no_replay()
-                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-                })
-                .spawn()
-                .unwrap();
-
-            let (mut child, mut stdin, stdout, _stderr) = process.into_inner();
-            assert_that!(child.stdin.is_none()).is_true();
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            assert_that!(child.try_wait().unwrap().is_none()).is_true();
-
-            let collector = stdout
-                .collect_lines_into_vec(LineParsingOptions::default(), line_collection_options());
-
-            let Some(stdin_handle) = stdin.as_mut() else {
-                assert_that!(stdin.is_open()).fail("stdin should be returned open");
-                return;
-            };
-            stdin_handle
-                .write_all(b"stdin stayed open\n")
-                .await
-                .unwrap();
-            stdin_handle.flush().await.unwrap();
-
-            stdin.close();
-
-            let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_that!(status.success()).is_true();
-
-            let collected = collector.wait().await.unwrap();
-            assert_that!(collected.lines().len()).is_equal_to(1);
-            assert_that!(collected[0].as_str()).is_equal_to("stdin stayed open");
-        }
-
-        #[tokio::test]
-        async fn defuses_panic_guard() {
-            let process = Process::new(long_running_command(Duration::from_secs(5)))
-                .name("long-running")
-                .stdout_and_stderr(|stream| {
-                    stream
-                        .broadcast()
-                        .best_effort_delivery()
-                        .no_replay()
-                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-                })
-                .spawn()
-                .unwrap();
-
-            let (mut child, _stdin, _stdout, _stderr) = process.into_inner();
-            child.kill().await.unwrap();
-            let _status = child.wait().await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn supports_handles_built_with_owned_name() {
-            let process = Process::new(long_running_command(Duration::from_secs(5)))
-                .name(format!("sleeper-{}", 7))
-                .stdout_and_stderr(|stream| {
-                    stream
-                        .broadcast()
-                        .best_effort_delivery()
-                        .no_replay()
-                        .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                        .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-                })
-                .spawn()
-                .unwrap();
-
-            let (mut child, _stdin, _stdout, _stderr) = process.into_inner();
-            child.kill().await.unwrap();
-            let _status = child.wait().await.unwrap();
-        }
+        assert_that!(stdin.is_open()).is_false();
+        assert_that!(stdin.as_mut()).is_none();
     }
 }

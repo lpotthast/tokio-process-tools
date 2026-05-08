@@ -1,36 +1,45 @@
-//! Terminal `wait_for_completion_with_*output*` methods that drain stdout/stderr alongside
-//! process exit.
+//! Helpers used by the staged [`crate::WaitForCompletion`] builder to drain stdout/stderr
+//! alongside process exit. The builder lives in `process_handle::wait_builder`; this module
+//! owns the supporting collector spawn and the timed drain orchestration.
 
-mod drain;
+pub(crate) mod drain;
 pub(crate) mod options;
-pub(crate) mod output;
-#[cfg(test)]
-mod tests;
 
-#[cfg(any(unix, windows))]
-use self::drain::wait_for_completion_or_terminate_with_collectors;
-use self::drain::wait_for_completion_with_collectors;
-use self::output::ProcessOutput;
 use super::ProcessHandle;
-#[cfg(any(unix, windows))]
-use crate::error::WaitForCompletionOrTerminateResult;
-use crate::error::{WaitForCompletionResult, WaitWithOutputError};
-use crate::output_stream::consumer::{Consumer, spawn_consumer_sync};
+use crate::error::WaitWithOutputError;
+use crate::output_stream::consumer::{Consumer, Sink, spawn_consumer_sync};
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::adapter::LineAdapter;
+use crate::output_stream::line::adapter::ParseLines;
 use crate::output_stream::line::options::LineParsingOptions;
-use crate::output_stream::visitors::collect::{CollectChunks, CollectLineSink};
-use crate::output_stream::{Next, Subscription, TrySubscribable};
-#[cfg(any(unix, windows))]
-use crate::process_handle::WaitForCompletionOrTerminateOptions;
-use crate::process_handle::output_collection::options::{LineOutputOptions, RawOutputOptions};
-use crate::{CollectedBytes, CollectedLines, LineCollectionOptions, RawCollectionOptions};
+use crate::output_stream::visitors::collect::CollectChunks;
+use crate::output_stream::{Next, Subscription};
+use crate::{
+    CollectedBytes, CollectedLines, LineCollectionOptions, OutputStream, RawCollectionOptions,
+    Subscribable,
+};
 use std::borrow::Cow;
+use std::process::ExitStatus;
+
+/// Full output of a process that terminated.
+///
+/// `Stdout` and `Stderr` describe the collected payload type for each stream. For example,
+/// line collection uses `ProcessOutput<CollectedLines>` and raw byte collection uses
+/// `ProcessOutput<CollectedBytes>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOutput<Stdout, Stderr = Stdout> {
+    /// Status the process exited with.
+    pub status: ExitStatus,
+
+    /// The process's collected output on its `stdout` stream.
+    pub stdout: Stdout,
+
+    /// The process's collected output on its `stderr` stream.
+    pub stderr: Stderr,
+}
 
 /// Spawn a consumer that collects line output into a [`CollectedLines`] sink. Used by the
-/// generic `wait_for_completion_with_*output*` paths that take a `TrySubscribable` and can't
-/// call backend-specific methods.
-fn spawn_lines_into_vec_consumer<S>(
+/// staged builder paths that take a `Subscribable` and can't call backend-specific methods.
+pub(crate) fn spawn_line_collector<S>(
     stream_name: &'static str,
     subscription: S,
     parsing_options: LineParsingOptions,
@@ -42,21 +51,19 @@ where
     spawn_consumer_sync(
         stream_name,
         subscription,
-        LineAdapter::new(
+        ParseLines::collect(
             parsing_options,
-            CollectLineSink::new(
-                CollectedLines::new(),
-                move |line: Cow<'_, str>, sink: &mut CollectedLines| {
-                    sink.push_line(line.into_owned(), collection_options);
-                    Next::Continue
-                },
-            ),
+            CollectedLines::new(),
+            move |line: Cow<'_, str>, sink: &mut CollectedLines| {
+                sink.push_line(line.into_owned(), collection_options);
+                Next::Continue
+            },
         ),
     )
 }
 
 /// Spawn a consumer that collects raw byte output into a [`CollectedBytes`] sink.
-fn spawn_chunks_into_vec_consumer<S>(
+pub(crate) fn spawn_chunk_collector<S>(
     stream_name: &'static str,
     subscription: S,
     options: RawCollectionOptions,
@@ -78,279 +85,46 @@ where
 
 impl<Stdout, Stderr> ProcessHandle<Stdout, Stderr>
 where
-    Stdout: TrySubscribable,
-    Stderr: TrySubscribable,
+    Stdout: OutputStream + Subscribable,
+    Stderr: OutputStream + Subscribable,
 {
-    /// Waits for the process to complete while collecting line output.
-    ///
-    /// Collectors are attached when this method is called. If the stream was configured with
-    /// `.no_replay()`, output produced before attachment may be discarded; configure replay before
-    /// spawning when startup output must be included.
-    /// Any still-open stdin handle is closed before the terminal wait begins, matching
-    /// [`tokio::process::Child::wait`].
-    /// `timeout` bounds both process completion and stdout/stderr collection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaitWithOutputError`] if waiting for the process or collecting output
-    /// fails after the process completes. Process timeout is returned as
-    /// [`WaitForCompletionResult::Timeout`].
-    pub async fn wait_for_completion_with_output(
+    /// Subscribes to stdout and stderr, spawning a collector on each via the caller-supplied
+    /// factories. If the stderr subscription fails after the stdout collector has started, the
+    /// stdout collector is aborted (awaiting task join) before returning, so the stdout slot is
+    /// released by the time the error reaches the caller. `Drop` alone is not sufficient here:
+    /// for `SingleSubscriberOutputStream`, the consumer claim is only fully released after the
+    /// task has been joined.
+    pub(crate) async fn try_spawn_output_collectors<StdoutSink, StderrSink, FOut, FErr>(
         &mut self,
-        timeout: std::time::Duration,
-        output_options: LineOutputOptions,
-    ) -> Result<WaitForCompletionResult<ProcessOutput<CollectedLines>>, WaitWithOutputError> {
-        let LineOutputOptions {
-            line_parsing_options,
-            stdout_collection_options,
-            stderr_collection_options,
-        } = output_options;
-        let stdout = self.stdout();
-        let out_subscription = stdout.try_subscribe().map_err(|source| {
+        spawn_stdout: FOut,
+        spawn_stderr: FErr,
+    ) -> Result<(Consumer<StdoutSink>, Consumer<StderrSink>), WaitWithOutputError>
+    where
+        StdoutSink: Sink,
+        StderrSink: Sink,
+        FOut: FnOnce(&'static str, Stdout::Subscription) -> Consumer<StdoutSink>,
+        FErr: FnOnce(&'static str, Stderr::Subscription) -> Consumer<StderrSink>,
+    {
+        let out_subscription = self.stdout().try_subscribe().map_err(|source| {
             WaitWithOutputError::OutputCollectionStartFailed {
                 process_name: self.name.clone(),
-                source,
+                source: Box::new(source),
             }
         })?;
-        let out_collector = spawn_lines_into_vec_consumer(
-            stdout.name(),
-            out_subscription,
-            line_parsing_options,
-            stdout_collection_options,
-        );
-        let stderr = self.stderr();
-        let err_subscription = match stderr.try_subscribe() {
+        let out_collector = spawn_stdout(self.stdout().name(), out_subscription);
+
+        let err_subscription = match self.stderr().try_subscribe() {
             Ok(subscription) => subscription,
             Err(source) => {
                 out_collector.abort().await;
                 return Err(WaitWithOutputError::OutputCollectionStartFailed {
                     process_name: self.name.clone(),
-                    source,
+                    source: Box::new(source),
                 });
             }
         };
-        let err_collector = spawn_lines_into_vec_consumer(
-            stderr.name(),
-            err_subscription,
-            line_parsing_options,
-            stderr_collection_options,
-        );
+        let err_collector = spawn_stderr(self.stderr().name(), err_subscription);
 
-        let result =
-            wait_for_completion_with_collectors(self, timeout, out_collector, err_collector)
-                .await?;
-
-        Ok(result.map(|(status, stdout, stderr)| ProcessOutput {
-            status,
-            stdout,
-            stderr,
-        }))
-    }
-
-    /// Waits for the process to complete while collecting raw byte output.
-    ///
-    /// Any still-open stdin handle is closed before the terminal wait begins, matching
-    /// [`tokio::process::Child::wait`].
-    /// `timeout` bounds both process completion and stdout/stderr collection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaitWithOutputError`] if waiting for the process or collecting output
-    /// fails after the process completes. Process timeout is returned as
-    /// [`WaitForCompletionResult::Timeout`].
-    pub async fn wait_for_completion_with_raw_output(
-        &mut self,
-        timeout: std::time::Duration,
-        output_options: RawOutputOptions,
-    ) -> Result<WaitForCompletionResult<ProcessOutput<CollectedBytes>>, WaitWithOutputError> {
-        let RawOutputOptions {
-            stdout_collection_options,
-            stderr_collection_options,
-        } = output_options;
-        let stdout = self.stdout();
-        let out_subscription = stdout.try_subscribe().map_err(|source| {
-            WaitWithOutputError::OutputCollectionStartFailed {
-                process_name: self.name.clone(),
-                source,
-            }
-        })?;
-        let out_collector = spawn_chunks_into_vec_consumer(
-            stdout.name(),
-            out_subscription,
-            stdout_collection_options,
-        );
-        let stderr = self.stderr();
-        let err_subscription = match stderr.try_subscribe() {
-            Ok(subscription) => subscription,
-            Err(source) => {
-                out_collector.abort().await;
-                return Err(WaitWithOutputError::OutputCollectionStartFailed {
-                    process_name: self.name.clone(),
-                    source,
-                });
-            }
-        };
-        let err_collector = spawn_chunks_into_vec_consumer(
-            stderr.name(),
-            err_subscription,
-            stderr_collection_options,
-        );
-
-        let result =
-            wait_for_completion_with_collectors(self, timeout, out_collector, err_collector)
-                .await?;
-
-        Ok(result.map(|(status, stdout, stderr)| ProcessOutput {
-            status,
-            stdout,
-            stderr,
-        }))
-    }
-
-    /// Waits for completion within `wait_timeout`, terminating the process if needed, while
-    /// collecting line output.
-    ///
-    /// Any still-open stdin handle is closed before the initial terminal wait begins, matching
-    /// [`tokio::process::Child::wait`].
-    /// Output collection is bounded by `wait_timeout` plus the per-platform graceful budget
-    /// (`interrupt_timeout + terminate_timeout` on Unix, `graceful_timeout` on Windows), plus a
-    /// fixed 3-second post-kill confirmation wait when force-kill fallback is required.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaitWithOutputError`] if waiting, termination, or output
-    /// collection fails. Timeout-triggered cleanup success is returned as
-    /// [`WaitForCompletionOrTerminateResult::TerminatedAfterTimeout`].
-    #[cfg(any(unix, windows))]
-    pub async fn wait_for_completion_with_output_or_terminate(
-        &mut self,
-        options: WaitForCompletionOrTerminateOptions,
-        output_options: LineOutputOptions,
-    ) -> Result<
-        WaitForCompletionOrTerminateResult<ProcessOutput<CollectedLines>>,
-        WaitWithOutputError,
-    > {
-        let LineOutputOptions {
-            line_parsing_options,
-            stdout_collection_options,
-            stderr_collection_options,
-        } = output_options;
-        let stdout = self.stdout();
-        let out_subscription = stdout.try_subscribe().map_err(|source| {
-            WaitWithOutputError::OutputCollectionStartFailed {
-                process_name: self.name.clone(),
-                source,
-            }
-        })?;
-        let out_collector = spawn_lines_into_vec_consumer(
-            stdout.name(),
-            out_subscription,
-            line_parsing_options,
-            stdout_collection_options,
-        );
-        let stderr = self.stderr();
-        let err_subscription = match stderr.try_subscribe() {
-            Ok(subscription) => subscription,
-            Err(source) => {
-                out_collector.abort().await;
-                return Err(WaitWithOutputError::OutputCollectionStartFailed {
-                    process_name: self.name.clone(),
-                    source,
-                });
-            }
-        };
-        let err_collector = spawn_lines_into_vec_consumer(
-            stderr.name(),
-            err_subscription,
-            line_parsing_options,
-            stderr_collection_options,
-        );
-
-        let result = wait_for_completion_or_terminate_with_collectors(
-            self,
-            options.wait_timeout,
-            options.graceful_timeouts,
-            out_collector,
-            err_collector,
-        )
-        .await?;
-
-        Ok(result.map(|(status, stdout, stderr)| ProcessOutput {
-            status,
-            stdout,
-            stderr,
-        }))
-    }
-
-    /// Waits for completion within `wait_timeout`, terminating the process if needed, while
-    /// collecting raw byte output.
-    ///
-    /// Any still-open stdin handle is closed before the initial terminal wait begins, matching
-    /// [`tokio::process::Child::wait`].
-    /// Output collection is bounded by `wait_timeout` plus the per-platform graceful budget
-    /// (`interrupt_timeout + terminate_timeout` on Unix, `graceful_timeout` on Windows), plus a
-    /// fixed 3-second post-kill confirmation wait when force-kill fallback is required.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WaitWithOutputError`] if waiting, termination, or output
-    /// collection fails. Timeout-triggered cleanup success is returned as
-    /// [`WaitForCompletionOrTerminateResult::TerminatedAfterTimeout`].
-    #[cfg(any(unix, windows))]
-    pub async fn wait_for_completion_with_raw_output_or_terminate(
-        &mut self,
-        options: WaitForCompletionOrTerminateOptions,
-        output_options: RawOutputOptions,
-    ) -> Result<
-        WaitForCompletionOrTerminateResult<ProcessOutput<CollectedBytes>>,
-        WaitWithOutputError,
-    > {
-        let RawOutputOptions {
-            stdout_collection_options,
-            stderr_collection_options,
-        } = output_options;
-        let stdout = self.stdout();
-        let out_subscription = stdout.try_subscribe().map_err(|source| {
-            WaitWithOutputError::OutputCollectionStartFailed {
-                process_name: self.name.clone(),
-                source,
-            }
-        })?;
-        let out_collector = spawn_chunks_into_vec_consumer(
-            stdout.name(),
-            out_subscription,
-            stdout_collection_options,
-        );
-        let stderr = self.stderr();
-        let err_subscription = match stderr.try_subscribe() {
-            Ok(subscription) => subscription,
-            Err(source) => {
-                out_collector.abort().await;
-                return Err(WaitWithOutputError::OutputCollectionStartFailed {
-                    process_name: self.name.clone(),
-                    source,
-                });
-            }
-        };
-        let err_collector = spawn_chunks_into_vec_consumer(
-            stderr.name(),
-            err_subscription,
-            stderr_collection_options,
-        );
-
-        let result = wait_for_completion_or_terminate_with_collectors(
-            self,
-            options.wait_timeout,
-            options.graceful_timeouts,
-            out_collector,
-            err_collector,
-        )
-        .await?;
-
-        Ok(result.map(|(status, stdout, stderr)| ProcessOutput {
-            status,
-            stdout,
-            stderr,
-        }))
+        Ok((out_collector, err_collector))
     }
 }

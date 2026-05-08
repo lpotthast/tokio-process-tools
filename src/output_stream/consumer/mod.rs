@@ -17,7 +17,7 @@ use tokio::time::{Instant, sleep_until};
 
 /// Errors that the [`Consumer`] infrastructure itself can raise while driving its stream.
 ///
-/// These describe failures of the consumer task — joining, or reading the underlying stream.
+/// These describe failures of the consumer task: joining, or reading the underlying stream.
 /// Visitor-specific failures (for example, a write-backed visitor's sink rejecting bytes) live
 /// in the visitor's own [`StreamVisitor::Output`](crate::StreamVisitor::Output) /
 /// [`AsyncStreamVisitor::Output`](crate::AsyncStreamVisitor::Output) type, not here. So a
@@ -28,7 +28,7 @@ use tokio::time::{Instant, sleep_until};
 #[non_exhaustive]
 pub enum ConsumerError {
     /// The consumer task could not be joined/terminated.
-    #[error("Failed to join/terminate the consumer task over stream '{stream_name}': {source}")]
+    #[error("Failed to join/terminate the consumer task over stream '{stream_name}'.")]
     TaskJoin {
         /// The name of the stream this consumer operates on.
         stream_name: &'static str,
@@ -39,7 +39,7 @@ pub enum ConsumerError {
     },
 
     /// The underlying stream failed while being read.
-    #[error("{source}")]
+    #[error("Failed to read stream.")]
     StreamRead {
         /// The source error.
         #[source]
@@ -56,6 +56,8 @@ impl<T> Sink for T where T: Send + 'static {}
 
 /// The result of [`Consumer::cancel`].
 #[derive(Debug)]
+#[must_use = "Discarding the outcome hides whether the consumer cancelled cooperatively \
+              (returning its sink) or was forcefully aborted (dropping its sink)."]
 pub enum ConsumerCancelOutcome<S: Sink> {
     /// The consumer observed cooperative cancellation before the timeout and returned its sink.
     Cancelled(S),
@@ -90,11 +92,18 @@ impl<S: Sink> ConsumerCancelOutcome<S> {
 
 /// A handle for a tokio task that consumes a stream by driving a visitor over its events.
 ///
-/// Consumers are produced by the `inspect_*`, `collect_*`, and `wait_for_line` factory methods on
-/// [`BroadcastOutputStream`](crate::BroadcastOutputStream) and
-/// [`SingleSubscriberOutputStream`](crate::SingleSubscriberOutputStream). The type parameter `S`
-/// is the visitor's output (a sink, a writer, `()`, or another value the visitor returns when the
-/// stream ends).
+/// Consumers are produced by [`Consumable::consume`](crate::Consumable::consume) and
+/// [`Consumable::consume_async`](crate::Consumable::consume_async) on any consumable stream
+/// (e.g. [`BroadcastOutputStream`](crate::BroadcastOutputStream),
+/// [`SingleSubscriberOutputStream`](crate::SingleSubscriberOutputStream),
+/// [`DiscardedOutputStream`](crate::DiscardedOutputStream)). Pass a bundled visitor from
+/// [`crate::visitors`] or your own [`StreamVisitor`](crate::StreamVisitor) /
+/// [`AsyncStreamVisitor`](crate::AsyncStreamVisitor) implementation. The backends additionally
+/// expose `wait_for_line(...)` as a thin timeout wrapper over
+/// [`WaitForLine`](crate::visitors::wait::WaitForLine).
+///
+/// The type parameter `S` is the visitor's output (a sink, a writer, `()`, or another value
+/// the visitor returns when the stream ends).
 ///
 /// For proper cleanup, call
 /// - `wait()`, which waits for the consumer task to complete.
@@ -219,8 +228,9 @@ impl<S: Sink> Consumer<S> {
     /// ```rust, no_run
     /// # use std::time::Duration;
     /// # use tokio_process_tools::{
-    /// #     AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE,
-    /// #     GracefulTimeouts, LineCollectionOptions, LineParsingOptions, NumBytesExt, Process, both,
+    /// #     AutoName, CollectedLines, CollectionOverflowBehavior, Consumable,
+    /// #     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, GracefulShutdown,
+    /// #     ParseLines, LineCollectionOptions, LineParsingOptions, NumBytesExt, Process,
     /// # };
     /// # async fn test() {
     /// # let cmd = tokio::process::Command::new("ls");
@@ -229,26 +239,30 @@ impl<S: Sink> Consumer<S> {
     ///     .stdout_and_stderr(|stream| {
     ///         stream
     ///             .broadcast()
-    ///             .best_effort_delivery()
+    ///             .lossy_without_backpressure()
     ///             .no_replay()
     ///             .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
     ///             .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
     ///     })
     ///     .spawn()
     ///     .unwrap();
-    /// let consumer = process.stdout().collect_lines_into_vec(
-    ///     LineParsingOptions::default(),
-    ///     LineCollectionOptions::Bounded {
-    ///         max_bytes: 1.megabytes(),
-    ///         max_lines: 1024,
-    ///         overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
-    ///     },
-    /// );
-    /// let timeouts = GracefulTimeouts::builder()
-    ///     .unix(both(Duration::from_secs(1)))
-    ///     .windows(Duration::from_secs(2))
+    /// let consumer = process
+    ///     .stdout()
+    ///     .consume(ParseLines::collect(
+    ///         LineParsingOptions::default(),
+    ///         CollectedLines::new(),
+    ///         CollectedLines::line_collector(LineCollectionOptions::Bounded {
+    ///             max_bytes: 1.megabytes(),
+    ///             max_lines: 1024,
+    ///             overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+    ///         }),
+    ///     ))
+    ///     .expect("no other consumer is attached yet");
+    /// let shutdown = GracefulShutdown::builder()
+    ///     .unix_sigterm(Duration::from_secs(1))
+    ///     .windows_ctrl_break(Duration::from_secs(2))
     ///     .build();
-    /// process.terminate(timeouts).await.unwrap();
+    /// process.terminate(shutdown).await.unwrap();
     /// let collected = consumer.wait().await.unwrap(); // This will return immediately.
     /// # }
     /// ```
@@ -362,17 +376,7 @@ impl<S: Sink> Drop for Consumer<S> {
 mod tests {
     use super::*;
     use assertr::prelude::*;
-    use std::io;
     use tokio::sync::oneshot;
-
-    #[test]
-    fn stream_read_display_uses_source_context() {
-        let source = StreamReadError::new("stdout", io::Error::from(io::ErrorKind::BrokenPipe));
-        let expected = source.to_string();
-        let err = ConsumerError::StreamRead { source };
-
-        assert_that!(err.to_string()).is_equal_to(expected);
-    }
 
     #[tokio::test]
     async fn cancel_returns_cancelled_when_cooperative() {

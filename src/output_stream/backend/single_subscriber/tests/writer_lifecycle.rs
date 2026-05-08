@@ -1,6 +1,9 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::{PendingWrite, best_effort_no_replay_options, wait_for_no_active_consumer};
-use crate::{ConsumerCancelOutcome, RawCollectionOptions, WriteCollectionOptions};
+use crate::output_stream::Consumable;
+use crate::output_stream::visitors::collect::CollectChunks;
+use crate::output_stream::visitors::write::WriteChunks;
+use crate::{CollectedBytes, ConsumerCancelOutcome, RawCollectionOptions, WriteCollectionOptions};
 use assertr::prelude::*;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -17,10 +20,11 @@ async fn pending_writer_abort_releases_single_subscriber_claim() {
 
     let (entered_tx, entered_rx) = oneshot::channel();
     let collector = stream
-        .collect_chunks_into_write(
+        .consume_async(WriteChunks::passthrough(
+            "custom",
             PendingWrite::new(entered_tx),
             WriteCollectionOptions::fail_fast(),
-        )
+        ))
         .unwrap();
 
     write_half.write_all(b"ready").await.unwrap();
@@ -32,7 +36,10 @@ async fn pending_writer_abort_releases_single_subscriber_claim() {
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);

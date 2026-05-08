@@ -1,19 +1,27 @@
 use crate::output_stream::Next;
-use crate::output_stream::line::adapter::LineSink;
+use crate::output_stream::line::adapter::LineVisitor;
 use std::borrow::Cow;
 
-/// [`LineSink`] that breaks the moment a predicate accepts a line and remembers whether it
+/// [`LineVisitor`] that breaks the moment a predicate accepts a line and remembers whether it
 /// has matched yet. Compose with
-/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) to drive `wait_for_line`, or to
-/// build your own custom predicate-driven consumer outside the built-in factory methods.
-pub struct WaitForLineSink<P> {
+/// [`ParseLines`](crate::output_stream::line::adapter::ParseLines) to build a
+/// predicate-driven consumer; the backends' `wait_for_line` helpers wrap this same visitor with
+/// an additional [`tokio::time::timeout`].
+///
+/// There is no async counterpart. The predicate is a synchronous
+/// `Fn(Cow<'_, str>) -> bool` and has no `.await`, so an [`AsyncLineVisitor`] would not add
+/// capability. If you need to react asynchronously when a matching line is observed, await
+/// [`Consumer::wait`](crate::Consumer::wait) on this visitor's consumer and dispatch from there.
+///
+/// [`AsyncLineVisitor`]: crate::output_stream::line::adapter::AsyncLineVisitor
+pub struct WaitForLine<P> {
     predicate: P,
     matched: bool,
 }
 
-impl<P> WaitForLineSink<P>
+impl<P> WaitForLine<P>
 where
-    P: Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
+    P: Fn(Cow<'_, str>) -> bool + Send + 'static,
 {
     /// Creates a new sink that breaks the parser the first time `predicate` returns `true`.
     pub fn new(predicate: P) -> Self {
@@ -24,9 +32,9 @@ where
     }
 }
 
-impl<P> LineSink for WaitForLineSink<P>
+impl<P> LineVisitor for WaitForLine<P>
 where
-    P: Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
+    P: Fn(Cow<'_, str>) -> bool + Send + 'static,
 {
     type Output = bool;
 
@@ -49,7 +57,7 @@ mod tests {
     use super::*;
     use crate::output_stream::consumer::driver::consume_sync;
     use crate::output_stream::event::{Chunk, StreamEvent};
-    use crate::output_stream::line::adapter::LineAdapter;
+    use crate::output_stream::line::adapter::ParseLines;
     use crate::output_stream::line::options::LineParsingOptions;
     use crate::{LineOverflowBehavior, NumBytesExt, StreamReadError, WaitForLineResult};
     use assertr::prelude::*;
@@ -58,13 +66,13 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
 
-    /// Drive a `WaitForLineSink` over the supplied events and translate the visitor's `bool`
+    /// Drive a `WaitForLine` over the supplied events and translate the visitor's `bool`
     /// output into [`WaitForLineResult`]. Mirrors what the deleted `wait_for_line` factory
     /// used to do; lives in tests because production code now drives the visitor straight from
     /// the backend method.
     async fn drive_wait_for_line(
         events: Vec<StreamEvent>,
-        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
+        predicate: impl Fn(Cow<'_, str>) -> bool + Send + 'static,
         options: LineParsingOptions,
     ) -> Result<WaitForLineResult, StreamReadError> {
         let (tx, rx) = mpsc::channel(events.len().max(1));
@@ -74,7 +82,7 @@ mod tests {
         drop(tx);
 
         let (_term_sig_tx, term_sig_rx) = oneshot::channel::<()>();
-        let visitor = LineAdapter::new(options, WaitForLineSink::new(predicate));
+        let visitor = ParseLines::new(options, WaitForLine::new(predicate));
         let matched = consume_sync(rx, visitor, term_sig_rx).await?;
         if matched {
             Ok(WaitForLineResult::Matched)
@@ -166,13 +174,13 @@ mod tests {
         #[test]
         #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]
         fn panics_when_max_line_length_is_zero() {
-            let _visitor = LineAdapter::new(
+            let _visitor = ParseLines::new(
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: LineOverflowBehavior::default(),
                     buffer_compaction_threshold: None,
                 },
-                WaitForLineSink::new(|_line| true),
+                WaitForLine::new(|_line| true),
             );
         }
 
@@ -205,9 +213,9 @@ mod tests {
         async fn times_out_with_timeout_error() {
             let (_tx, rx) = mpsc::channel::<StreamEvent>(1);
             let (_term_sig_tx, term_sig_rx) = oneshot::channel::<()>();
-            let visitor = LineAdapter::new(
+            let visitor = ParseLines::new(
                 LineParsingOptions::default(),
-                WaitForLineSink::new(|line| line == "ready"),
+                WaitForLine::new(|line| line == "ready"),
             );
             let timeout = tokio::time::timeout(
                 Duration::from_millis(25),

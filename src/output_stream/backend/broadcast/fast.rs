@@ -1,8 +1,8 @@
-//! Lossy fast path for the `BestEffortDelivery + NoReplay` configuration.
+//! Lossy fast path for the `LossyWithoutBackpressure + NoReplay` configuration.
 //!
 //! This module exists purely as a performance specialization. It delegates straight to
 //! `tokio::sync::broadcast`, so a single `send` fans out to every live receiver without a
-//! mutex, a per-subscriber queue, or any replay bookkeeping — the cost the [`fanout`]
+//! mutex, a per-subscriber queue, or any replay bookkeeping: the cost the [`fanout`]
 //! module pays to support reliable delivery and replay.
 //!
 //! In exchange it gives up replay and backpressure: subscribers that fall behind the
@@ -11,7 +11,7 @@
 //! only events still in the buffer plus the terminal event.
 //!
 //! This backend is selected by [`BroadcastOutputStream::from_stream`] in
-//! [`super`] when the config is exactly `BestEffortDelivery + NoReplay`; every other
+//! [`super`] when the config is exactly `LossyWithoutBackpressure + NoReplay`; every other
 //! combination of [`Delivery`](crate::output_stream::policy::Delivery) and
 //! [`Replay`](crate::output_stream::policy::Replay) routes to [`fanout`] instead.
 //!
@@ -21,7 +21,7 @@
 
 use crate::output_stream::config::StreamConfig;
 use crate::output_stream::event::{Chunk, StreamEvent};
-use crate::output_stream::policy::{BestEffortDelivery, NoReplay};
+use crate::output_stream::policy::{LossyWithoutBackpressure, NoReplay};
 use crate::{NumBytes, StreamReadError};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -39,7 +39,7 @@ pub(super) struct FastBackend {
     pub(super) closure_state: Arc<Mutex<FastClosureState>>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) bytes_ingested_tx: watch::Sender<u64>,
-    pub(super) options: StreamConfig<BestEffortDelivery, NoReplay>,
+    pub(super) options: StreamConfig<LossyWithoutBackpressure, NoReplay>,
     pub(super) name: &'static str,
 }
 
@@ -76,7 +76,7 @@ where
         options: StreamConfig {
             read_chunk_size,
             max_buffered_chunks,
-            delivery: BestEffortDelivery,
+            delivery: LossyWithoutBackpressure,
             replay: NoReplay,
         },
         name: stream_name,

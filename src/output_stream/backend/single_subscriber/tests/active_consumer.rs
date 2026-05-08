@@ -2,8 +2,11 @@ use super::super::SingleSubscriberOutputStream;
 use super::common::{
     best_effort_no_replay_options, best_effort_no_replay_options_with, reliable_replay_options,
 };
+use crate::output_stream::Consumable;
+use crate::output_stream::line::adapter::ParseLines;
+use crate::output_stream::visitors::collect::CollectChunks;
 use crate::{
-    DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, LineParsingOptions, Next,
+    CollectedBytes, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, LineParsingOptions, Next,
     RawCollectionOptions, ReplayRetention, StreamConsumerError,
 };
 use assertr::prelude::*;
@@ -21,7 +24,10 @@ async fn configured_second_subscriber_error_does_not_poison_state_or_stop_reader
     );
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
 
     let err = stream
@@ -87,11 +93,17 @@ async fn multiple_subscribers_are_not_possible() {
     );
 
     let _inspector = os
-        .inspect_lines(|_line| Next::Continue, LineParsingOptions::default())
+        .consume(ParseLines::inspect(
+            LineParsingOptions::default(),
+            |_line| Next::Continue,
+        ))
         .unwrap();
 
     let err = os
-        .inspect_lines(|_line| Next::Continue, LineParsingOptions::default())
+        .consume(ParseLines::inspect(
+            LineParsingOptions::default(),
+            |_line| Next::Continue,
+        ))
         .err()
         .expect("second consumer should be rejected");
     assert_that!(err).is_equal_to(StreamConsumerError::ActiveConsumer {

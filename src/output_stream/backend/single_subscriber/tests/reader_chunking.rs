@@ -17,8 +17,12 @@ async fn configured_reader_does_not_terminate_when_first_read_can_fill_the_entir
     write_half.write_all(b"hello world").await.unwrap();
     write_half.flush().await.unwrap();
 
-    let (stream_reader, mut rx, _shared) =
-        spawn_configured_reader(read_half, DeliveryGuarantee::BestEffort, 2.bytes(), 64);
+    let (stream_reader, mut rx, _shared) = spawn_configured_reader(
+        read_half,
+        DeliveryGuarantee::LossyWithoutBackpressure,
+        2.bytes(),
+        64,
+    );
 
     drop(write_half);
     tokio::time::timeout(Duration::from_secs(1), stream_reader)

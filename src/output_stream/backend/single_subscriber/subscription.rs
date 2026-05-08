@@ -5,8 +5,12 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Subscription handle returned by
+/// [`SingleSubscriberOutputStream::try_subscribe`](crate::SingleSubscriberOutputStream).
+/// Treat this as an opaque value: pass it to a built-in consumer or your own
+/// [`Subscription`]-driven loop. Internal fields are not part of the public API.
 #[derive(Debug)]
-pub(super) struct SingleSubscriberSubscription {
+pub struct SingleSubscriberSubscription {
     pub(super) id: SubscriberId,
     pub(super) shared: Arc<ConfiguredShared>,
     pub(super) replay: VecDeque<StreamEvent>,

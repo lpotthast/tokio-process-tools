@@ -1,13 +1,14 @@
 use crate::output_stream::Next;
 use crate::output_stream::consumer::Sink;
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::adapter::{AsyncLineSink, LineSink};
+use crate::output_stream::line::adapter::{AsyncLineVisitor, LineVisitor};
 use crate::output_stream::num_bytes::NumBytes;
 use crate::output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::ops::Deref;
+use std::pin::Pin;
 use typed_builder::TypedBuilder;
 
 /// Controls which output is retained once a bounded in-memory collection reaches its limit.
@@ -80,7 +81,20 @@ impl CollectedBytes {
         }
     }
 
-    pub(crate) fn push_chunk(&mut self, chunk: &[u8], options: RawCollectionOptions) {
+    /// Returns a closure suitable as the `f` field of a [`CollectChunks`] visitor that appends
+    /// each observed chunk into a [`CollectedBytes`] sink under `options`. Mirrors the
+    /// closure that the removed `collect_chunks_into_vec` factory used to inline.
+    #[must_use = "the returned closure must be wired into a CollectChunks visitor; dropping it discards the collection logic"]
+    pub fn collector(
+        options: RawCollectionOptions,
+    ) -> impl FnMut(Chunk, &mut Self) + Send + 'static {
+        move |chunk: Chunk, sink: &mut Self| {
+            sink.push_chunk(chunk.as_ref(), options);
+        }
+    }
+
+    /// Appends `chunk` into this buffer, honoring `options` (truncation / overflow behavior).
+    pub fn push_chunk(&mut self, chunk: &[u8], options: RawCollectionOptions) {
         match options {
             RawCollectionOptions::TrustedUnbounded => self.bytes.extend_from_slice(chunk),
             RawCollectionOptions::Bounded {
@@ -176,7 +190,28 @@ impl CollectedLines {
         (self.lines, self.truncated)
     }
 
-    pub(crate) fn push_line(&mut self, line: String, options: LineCollectionOptions) {
+    /// Returns a closure suitable as the `f` field of a [`CollectLines`] (composed inside a
+    /// [`ParseLines`](crate::output_stream::line::adapter::ParseLines)) that appends each
+    /// parsed line into a [`CollectedLines`] sink under `options`. Mirrors the closure that
+    /// the removed `collect_lines_into_vec` factory used to inline.
+    #[must_use = "the returned closure must be wired into a CollectLines visitor; dropping it discards the collection logic"]
+    pub fn line_collector(
+        options: LineCollectionOptions,
+    ) -> impl FnMut(Cow<'_, str>, &mut Self) -> Next + Send + 'static {
+        move |line: Cow<'_, str>, sink: &mut Self| {
+            sink.push_line(line.into_owned(), options);
+            Next::Continue
+        }
+    }
+
+    /// Appends `line` into this buffer, honoring `options` (truncation / overflow behavior).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal invariant is violated while evicting older lines under
+    /// [`CollectionOverflowBehavior::DropOldestData`]; the eviction loop only runs while the
+    /// buffer is non-empty, so this is unreachable in correct use.
+    pub fn push_line(&mut self, line: String, options: LineCollectionOptions) {
         match options {
             LineCollectionOptions::TrustedUnbounded => self.push_back(line),
             LineCollectionOptions::Bounded {
@@ -249,52 +284,39 @@ impl Deref for CollectedLines {
     }
 }
 
-/// An async collector for raw output chunks.
+/// Synchronous [`StreamVisitor`] that observes each chunk and lets `f` decide what to do with
+/// the sink `T`. The sink is yielded back to the caller via
+/// [`StreamVisitor::into_output`] when the consumer terminates, allowing patterns like
+/// "collect into a `Vec<u8>` and return it on completion."
 ///
-/// The collector itself may hold state via `&mut self`, but only the sink `S` is returned from
-/// [`Consumer::wait`](crate::Consumer::wait) or [`Consumer::cancel`](crate::Consumer::cancel).
-///
-/// This trait-based API avoids allocating a boxed future for every collected item while still
-/// letting the returned future borrow `chunk` and `sink` across `.await`.
-///
-/// This uses a trait rather than `std::ops::AsyncFn` because stable Rust can express the lending
-/// async callback shape, but cannot yet express the `Send` bound required on an `AsyncFn`
-/// callback's returned future for use inside `tokio::spawn`.
-pub trait AsyncChunkCollector<S: Sink>: Send + 'static {
-    /// Collect a single chunk into `sink`.
-    fn collect<'a>(
-        &'a mut self,
-        chunk: Chunk,
-        sink: &'a mut S,
-    ) -> impl Future<Output = Next> + Send + 'a;
-}
-
-/// An async collector for parsed output lines.
-///
-/// The collector itself may hold state via `&mut self`, but only the sink `S` is returned from
-/// [`Consumer::wait`](crate::Consumer::wait) or [`Consumer::cancel`](crate::Consumer::cancel).
-///
-/// This uses a trait rather than `std::ops::AsyncFn` because stable Rust can express the lending
-/// async callback shape, but cannot yet express the `Send` bound required on an `AsyncFn`
-/// callback's returned future for use inside `tokio::spawn`. Once that bound is expressible on
-/// stable Rust, this API can move back toward async-closure ergonomics.
-pub trait AsyncLineCollector<S: Sink>: Send + 'static {
-    /// Collect a single parsed line into `sink`.
-    fn collect<'a>(
-        &'a mut self,
-        line: Cow<'a, str>,
-        sink: &'a mut S,
-    ) -> impl Future<Output = Next> + Send + 'a;
-}
-
+/// Construct via [`builder`](Self::builder) and pass to
+/// [`Consumable::consume`](crate::Consumable::consume). For the common
+/// "collect-into-`CollectedBytes`" case, see [`CollectedBytes::collector`].
 #[derive(TypedBuilder)]
-pub(crate) struct CollectChunks<T, F>
+pub struct CollectChunks<T, F>
 where
     T: Sink,
     F: FnMut(Chunk, &mut T) + Send + 'static,
 {
+    /// Sink to collect into.
     pub sink: T,
+    /// Per-chunk collector closure.
     pub f: F,
+}
+
+impl<T, F> CollectChunks<T, F>
+where
+    T: Sink,
+    F: FnMut(Chunk, &mut T) + Send + 'static,
+{
+    /// Fold-style constructor: `sink` is the initial accumulator and `f` folds each observed
+    /// chunk into it. Equivalent to
+    /// `CollectChunks::builder().sink(sink).f(f).build()`, but reads at the call site like a
+    /// `fold(initial, step)`.
+    #[must_use]
+    pub fn fold(sink: T, f: F) -> Self {
+        Self { sink, f }
+    }
 }
 
 impl<T, F> StreamVisitor for CollectChunks<T, F>
@@ -314,25 +336,65 @@ where
     }
 }
 
-#[derive(TypedBuilder)]
-pub(crate) struct CollectChunksAsync<T, C>
+/// Asynchronous counterpart to [`CollectChunks`]. The per-chunk hook is a closure that returns a
+/// boxed future, allowing the future to borrow `chunk` and `sink` across `.await` while remaining
+/// `Send` for `tokio::spawn`. Construct via [`fold`](Self::fold) and pass to
+/// [`Consumable::consume_async`](crate::Consumable::consume_async).
+///
+/// The boxed future incurs one allocation per observed chunk; for hot paths that cannot afford
+/// that, implement [`AsyncStreamVisitor`] directly on a struct that owns the sink.
+///
+/// # Example
+///
+/// ```rust, no_run
+/// # use tokio_process_tools::{Chunk, Next};
+/// # use tokio_process_tools::visitors::collect::CollectChunksAsync;
+/// let visitor = CollectChunksAsync::fold(Vec::<u8>::new(), |chunk, sink| {
+///     Box::pin(async move {
+///         sink.extend_from_slice(chunk.as_ref());
+///         Next::Continue
+///     })
+/// });
+/// ```
+pub struct CollectChunksAsync<T, F>
 where
     T: Sink,
-    C: AsyncChunkCollector<T>,
+    F: for<'a> FnMut(Chunk, &'a mut T) -> Pin<Box<dyn Future<Output = Next> + Send + 'a>>
+        + Send
+        + 'static,
 {
-    pub sink: T,
-    pub collector: C,
+    sink: T,
+    f: F,
 }
 
-impl<T, C> AsyncStreamVisitor for CollectChunksAsync<T, C>
+impl<T, F> CollectChunksAsync<T, F>
 where
     T: Sink,
-    C: AsyncChunkCollector<T>,
+    F: for<'a> FnMut(Chunk, &'a mut T) -> Pin<Box<dyn Future<Output = Next> + Send + 'a>>
+        + Send
+        + 'static,
+{
+    /// Fold-style constructor: `sink` is the initial accumulator and `f` folds each observed
+    /// chunk into it asynchronously. The closure must wrap its async body in
+    /// `Box::pin(async move { ... })` so the returned future can borrow `chunk` and `sink`
+    /// while remaining `Send`.
+    #[must_use]
+    pub fn fold(sink: T, f: F) -> Self {
+        Self { sink, f }
+    }
+}
+
+impl<T, F> AsyncStreamVisitor for CollectChunksAsync<T, F>
+where
+    T: Sink,
+    F: for<'a> FnMut(Chunk, &'a mut T) -> Pin<Box<dyn Future<Output = Next> + Send + 'a>>
+        + Send
+        + 'static,
 {
     type Output = T;
 
     fn on_chunk(&mut self, chunk: Chunk) -> impl Future<Output = Next> + Send + '_ {
-        self.collector.collect(chunk, &mut self.sink)
+        (self.f)(chunk, &mut self.sink)
     }
 
     fn into_output(self) -> Self::Output {
@@ -340,16 +402,17 @@ where
     }
 }
 
-/// [`LineSink`] holding the user closure and a sink; `on_line` calls the closure with the
+/// [`LineVisitor`] holding the user closure and a sink; `on_line` calls the closure with the
 /// line and a `&mut` borrow of the sink. Compose with
-/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) to drive `collect_lines`, or to
-/// build your own custom collect-lines consumer outside the built-in factory methods.
-pub struct CollectLineSink<T, F> {
+/// [`ParseLines`](crate::output_stream::line::adapter::ParseLines) (most easily via
+/// [`ParseLines::collect`](crate::output_stream::line::adapter::ParseLines::collect)) to
+/// drive a line-aware collecting consumer.
+pub struct CollectLines<T, F> {
     sink: T,
     f: F,
 }
 
-impl<T, F> CollectLineSink<T, F>
+impl<T, F> CollectLines<T, F>
 where
     T: Sink,
     F: FnMut(Cow<'_, str>, &mut T) -> Next + Send + 'static,
@@ -360,7 +423,7 @@ where
     }
 }
 
-impl<T, F> LineSink for CollectLineSink<T, F>
+impl<T, F> LineVisitor for CollectLines<T, F>
 where
     T: Sink,
     F: FnMut(Cow<'_, str>, &mut T) -> Next + Send + 'static,
@@ -376,36 +439,50 @@ where
     }
 }
 
-/// [`AsyncLineSink`] holding the user collector and a sink. Compose with
-/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) (its [`AsyncStreamVisitor`] impl
-/// is selected automatically when the inner sink is an [`AsyncLineSink`]) to drive
-/// `collect_lines_async`.
-pub struct CollectLineSinkAsync<T, C> {
-    sink: T,
-    collector: C,
-}
-
-impl<T, C> CollectLineSinkAsync<T, C>
+/// [`AsyncLineVisitor`] holding a closure that takes each parsed line and a `&mut` borrow of the
+/// sink, returning a boxed future. Compose with
+/// [`ParseLines`](crate::output_stream::line::adapter::ParseLines) (most easily via
+/// [`ParseLines::collect_async`](crate::output_stream::line::adapter::ParseLines::collect_async))
+/// to build an async line-aware collecting consumer.
+///
+/// The boxed future incurs one allocation per observed line; for hot paths that cannot afford
+/// that, implement [`AsyncLineVisitor`] directly on a struct that owns the sink.
+pub struct CollectLinesAsync<T, F>
 where
     T: Sink,
-    C: AsyncLineCollector<T>,
+    F: for<'a> FnMut(Cow<'a, str>, &'a mut T) -> Pin<Box<dyn Future<Output = Next> + Send + 'a>>
+        + Send
+        + 'static,
 {
-    /// Creates a new sink that awaits `collector` with each parsed line and a `&mut` borrow of
-    /// `sink`.
-    pub fn new(sink: T, collector: C) -> Self {
-        Self { sink, collector }
+    sink: T,
+    f: F,
+}
+
+impl<T, F> CollectLinesAsync<T, F>
+where
+    T: Sink,
+    F: for<'a> FnMut(Cow<'a, str>, &'a mut T) -> Pin<Box<dyn Future<Output = Next> + Send + 'a>>
+        + Send
+        + 'static,
+{
+    /// Creates a new visitor that awaits `f` for each parsed line with a `&mut` borrow of `sink`.
+    /// The closure must wrap its async body in `Box::pin(async move { ... })`.
+    pub fn new(sink: T, f: F) -> Self {
+        Self { sink, f }
     }
 }
 
-impl<T, C> AsyncLineSink for CollectLineSinkAsync<T, C>
+impl<T, F> AsyncLineVisitor for CollectLinesAsync<T, F>
 where
     T: Sink,
-    C: AsyncLineCollector<T>,
+    F: for<'a> FnMut(Cow<'a, str>, &'a mut T) -> Pin<Box<dyn Future<Output = Next> + Send + 'a>>
+        + Send
+        + 'static,
 {
     type Output = T;
 
     fn on_line<'a>(&'a mut self, line: Cow<'a, str>) -> impl Future<Output = Next> + Send + 'a {
-        self.collector.collect(line, &mut self.sink)
+        (self.f)(line, &mut self.sink)
     }
 
     fn into_output(self) -> Self::Output {
@@ -420,10 +497,9 @@ mod tests {
     use crate::output_stream::consumer::driver::{spawn_consumer_async, spawn_consumer_sync};
     use crate::output_stream::event::StreamEvent;
     use crate::output_stream::event::tests::event_receiver;
-    use crate::output_stream::line::adapter::LineAdapter;
+    use crate::output_stream::line::adapter::ParseLines;
     use crate::output_stream::line::options::LineParsingOptions;
     use crate::output_stream::num_bytes::NumBytesExt;
-    use crate::{AsyncChunkCollector, AsyncLineCollector};
     use assertr::prelude::*;
     use bytes::Bytes;
     use std::borrow::Cow;
@@ -913,12 +989,13 @@ mod tests {
                 StreamEvent::ReadError(error),
             ])
             .await,
-            LineAdapter::new(
+            ParseLines::collect(
                 LineParsingOptions::default(),
-                CollectLineSink::new(Vec::<String>::new(), |line, lines: &mut Vec<String>| {
+                Vec::<String>::new(),
+                |line, lines: &mut Vec<String>| {
                     lines.push(line.into_owned());
                     Next::Continue
-                }),
+                },
             ),
         );
 
@@ -946,26 +1023,18 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            LineAdapter::new(
+            ParseLines::collect(
                 LineParsingOptions::default(),
-                CollectLineSink::new(Vec::<String>::new(), |line, lines: &mut Vec<String>| {
+                Vec::<String>::new(),
+                |line, lines| {
                     lines.push(line.into_owned());
                     Next::Continue
-                }),
+                },
             ),
         );
 
         let lines = collector.wait().await.unwrap();
         assert_that!(lines).contains_exactly(["one", "two", "final"]);
-    }
-
-    struct ExtendChunks;
-
-    impl AsyncChunkCollector<Vec<u8>> for ExtendChunks {
-        async fn collect<'a>(&'a mut self, chunk: Chunk, seen: &'a mut Vec<u8>) -> Next {
-            seen.extend_from_slice(chunk.as_ref());
-            Next::Continue
-        }
     }
 
     #[tokio::test]
@@ -979,10 +1048,12 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            CollectChunksAsync::builder()
-                .sink(Vec::new())
-                .collector(ExtendChunks)
-                .build(),
+            CollectChunksAsync::fold(Vec::new(), |chunk, seen: &mut Vec<u8>| {
+                Box::pin(async move {
+                    seen.extend_from_slice(chunk.as_ref());
+                    Next::Continue
+                })
+            }),
         );
 
         let seen = collector.wait().await.unwrap();
@@ -1030,16 +1101,14 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            LineAdapter::new(
+            ParseLines::collect(
                 LineParsingOptions::default(),
-                CollectLineSink::new(
-                    Vec::new(),
-                    move |line: Cow<'_, str>, indexed_lines: &mut Vec<String>| {
-                        line_index += 1;
-                        indexed_lines.push(format!("{line_index}:{line}"));
-                        Next::Continue
-                    },
-                ),
+                Vec::new(),
+                move |line: Cow<'_, str>, indexed_lines: &mut Vec<String>| {
+                    line_index += 1;
+                    indexed_lines.push(format!("{line_index}:{line}"));
+                    Next::Continue
+                },
             ),
         );
 
@@ -1051,20 +1120,6 @@ mod tests {
         ]);
     }
 
-    struct BreakOnLine;
-
-    impl AsyncLineCollector<Vec<String>> for BreakOnLine {
-        async fn collect<'a>(&'a mut self, line: Cow<'a, str>, seen: &'a mut Vec<String>) -> Next {
-            if line == "break" {
-                seen.push(line.into_owned());
-                Next::Break
-            } else {
-                seen.push(line.into_owned());
-                Next::Continue
-            }
-        }
-    }
-
     #[tokio::test]
     async fn line_collector_async_break_stops_after_requested_line() {
         let collector = spawn_consumer_async(
@@ -1074,9 +1129,20 @@ mod tests {
                 StreamEvent::Eof,
             ])
             .await,
-            LineAdapter::new(
+            ParseLines::collect_async(
                 LineParsingOptions::default(),
-                CollectLineSinkAsync::new(Vec::new(), BreakOnLine),
+                Vec::new(),
+                |line, seen: &mut Vec<String>| {
+                    Box::pin(async move {
+                        let is_break = line == "break";
+                        seen.push(line.into_owned());
+                        if is_break {
+                            Next::Break
+                        } else {
+                            Next::Continue
+                        }
+                    })
+                },
             ),
         );
 

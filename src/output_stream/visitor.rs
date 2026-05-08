@@ -1,14 +1,15 @@
-//! Visitor traits — the core abstraction every stream observer builds against.
+//! Visitor traits, the core abstraction every stream observer builds against.
 //!
 //! [`StreamVisitor`] and [`AsyncStreamVisitor`] describe what a chunk-level observer is, without
 //! committing to a runtime: methods are plain `&mut self` calls (synchronous) or return-position
 //! `impl Future` (asynchronous), and the trait bounds are `Send + 'static` only.
 //!
-//! The tokio-bound machinery that actually drives a visitor — task spawning, cooperative
-//! cancellation, the `Consumer<S>` handle — lives in [`crate::output_stream::consumer`]. Built-in
+//! The tokio-bound machinery that actually drives a visitor (task spawning, cooperative
+//! cancellation, the `Consumer<S>` handle) lives in [`crate::output_stream::consumer`]. Built-in
 //! implementations (`collect`, `inspect`, `wait`, `write`) live in
 //! [`crate::output_stream::visitors`]. User code can implement these traits directly and pass
-//! the visitor to `consume_with(...)` / `consume_with_async(...)` on any backend without
+//! the visitor to [`Consumable::consume`](crate::Consumable::consume) /
+//! [`Consumable::consume_async`](crate::Consumable::consume_async) on any backend without
 //! touching the built-ins.
 
 use crate::output_stream::Next;
@@ -19,12 +20,12 @@ use std::future::Future;
 ///
 /// `StreamVisitor` is the synchronous counterpart to [`AsyncStreamVisitor`]. Implement it on a
 /// type that needs to react to chunks, gaps, and EOF without `.await`-ing between events, then
-/// drive it via `consume_with` to obtain a [`Consumer`](crate::Consumer) handle that owns the
+/// drive it via `consume` to obtain a [`Consumer`](crate::Consumer) handle that owns the
 /// resulting tokio task.
 ///
-/// All built-in consumer factories (`inspect_*`, `collect_*`, `wait_for_line`) construct a
-/// built-in visitor and call `consume_with` internally; this trait is what users implement to
-/// plug in custom logic without wrapping a closure in shared mutable state.
+/// The built-in visitors under [`crate::visitors`] all implement this trait (or its async
+/// counterpart [`AsyncStreamVisitor`]). Implement it on your own type to plug in custom
+/// chunk-level logic without wrapping a closure in shared mutable state.
 ///
 /// # Lifecycle
 ///
@@ -90,6 +91,7 @@ pub trait StreamVisitor: Send + 'static {
     /// Called after the visitor has stopped observing events (via EOF, `Break`, or cancellation).
     /// The returned value is what the owning [`Consumer`](crate::Consumer)'s `wait`/`cancel`
     /// methods yield.
+    #[must_use]
     fn into_output(self) -> Self::Output;
 }
 
@@ -99,9 +101,7 @@ pub trait StreamVisitor: Send + 'static {
 /// observing a chunk needs to `.await` (network I/O, async writers, channel sends).
 ///
 /// The trait uses return-position `impl Future` rather than `async fn` to keep the `Send` bound
-/// on the returned future expressible on stable Rust; this is the same shape used by
-/// [`AsyncChunkCollector`](crate::AsyncChunkCollector) and
-/// [`AsyncLineCollector`](crate::AsyncLineCollector). See [`StreamVisitor`] for the lifecycle
+/// on the returned future expressible on stable Rust. See [`StreamVisitor`] for the lifecycle
 /// description; the only difference is that `on_chunk` and `on_eof` are async.
 ///
 /// # Example
@@ -157,5 +157,6 @@ pub trait AsyncStreamVisitor: Send + 'static {
     ///
     /// Called after the visitor has stopped observing events. Synchronous because no further
     /// stream interaction is required at this point.
+    #[must_use]
     fn into_output(self) -> Self::Output;
 }

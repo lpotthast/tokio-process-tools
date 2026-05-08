@@ -1,7 +1,9 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::wait_for_terminal_shared;
 use super::reader_test_support::{recv_event_with_timeout, spawn_configured_reader};
+use crate::output_stream::Consumable;
 use crate::output_stream::event::StreamEvent;
+use crate::output_stream::line::adapter::ParseLines;
 use crate::output_stream::policy::DeliveryGuarantee;
 use crate::{DEFAULT_READ_CHUNK_SIZE, LineParsingOptions, Next, NumBytesExt, StreamConfig};
 use assertr::prelude::*;
@@ -53,8 +55,12 @@ impl AsyncRead for AlwaysReadyBytes {
 #[tokio::test(flavor = "multi_thread")]
 async fn configured_reader_sends_pending_gap_before_terminal_eof() {
     let read = Cursor::new(b"aabbcc".to_vec());
-    let (stream_reader, mut rx, shared) =
-        spawn_configured_reader(read, DeliveryGuarantee::BestEffort, 2.bytes(), 1);
+    let (stream_reader, mut rx, shared) = spawn_configured_reader(
+        read,
+        DeliveryGuarantee::LossyWithoutBackpressure,
+        2.bytes(),
+        1,
+    );
     drop(shared);
 
     match rx.recv().await.unwrap() {
@@ -90,8 +96,12 @@ async fn configured_reader_sends_pending_gap_before_terminal_eof() {
 #[tokio::test(flavor = "multi_thread")]
 async fn configured_reader_records_eof_while_active_queue_is_full() {
     let read = Cursor::new(b"aabbcc".to_vec());
-    let (stream_reader, mut rx, shared) =
-        spawn_configured_reader(read, DeliveryGuarantee::BestEffort, 2.bytes(), 1);
+    let (stream_reader, mut rx, shared) = spawn_configured_reader(
+        read,
+        DeliveryGuarantee::LossyWithoutBackpressure,
+        2.bytes(),
+        1,
+    );
 
     let terminal = tokio::time::timeout(Duration::from_secs(1), wait_for_terminal_shared(&shared))
         .await
@@ -121,7 +131,7 @@ async fn configured_best_effort_yields_when_pending_gap_channel_is_full() {
     let bytes_read = Arc::new(AtomicUsize::new(0));
     let (stream_reader, mut rx, _shared) = spawn_configured_reader(
         AlwaysReadyBytes::new(total_bytes, Arc::clone(&bytes_read)),
-        DeliveryGuarantee::BestEffort,
+        DeliveryGuarantee::LossyWithoutBackpressure,
         1.bytes(),
         1,
     );
@@ -149,8 +159,12 @@ async fn configured_best_effort_yields_when_pending_gap_channel_is_full() {
 #[tokio::test(flavor = "multi_thread")]
 async fn configured_reader_sends_pending_gap_before_resumed_chunk_delivery() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
-    let (stream_reader, mut rx, shared) =
-        spawn_configured_reader(read_half, DeliveryGuarantee::BestEffort, 2.bytes(), 2);
+    let (stream_reader, mut rx, shared) = spawn_configured_reader(
+        read_half,
+        DeliveryGuarantee::LossyWithoutBackpressure,
+        2.bytes(),
+        2,
+    );
     drop(shared);
 
     write_half.write_all(b"aabbcc").await.unwrap();
@@ -195,7 +209,7 @@ async fn handles_backpressure_by_dropping_newer_chunks_after_channel_buffer_fill
         read_half,
         "custom",
         StreamConfig::builder()
-            .best_effort_delivery()
+            .lossy_without_backpressure()
             .no_replay()
             .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
             .max_buffered_chunks(2)
@@ -203,13 +217,13 @@ async fn handles_backpressure_by_dropping_newer_chunks_after_channel_buffer_fill
     );
 
     let inspector = os
-        .inspect_lines_async(
+        .consume_async(ParseLines::inspect_async(
+            LineParsingOptions::default(),
             |_line| async move {
                 sleep(Duration::from_millis(100)).await;
                 Next::Continue
             },
-            LineParsingOptions::default(),
-        )
+        ))
         .unwrap();
 
     let producer = tokio::spawn(async move {

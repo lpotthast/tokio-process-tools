@@ -1,7 +1,7 @@
 use crate::output_stream::Next;
 use crate::output_stream::consumer::Sink;
 use crate::output_stream::event::Chunk;
-use crate::output_stream::line::adapter::AsyncLineSink;
+use crate::output_stream::line::adapter::AsyncLineVisitor;
 use crate::output_stream::visitor::AsyncStreamVisitor;
 use std::borrow::Cow;
 use std::io;
@@ -44,7 +44,7 @@ pub enum SinkWriteOperation {
     /// Parsed line bytes failed to write.
     Line,
 
-    /// The line delimiter requested by [`crate::LineWriteMode::AppendLf`] failed to write.
+    /// The line delimiter requested by [`LineWriteMode::AppendLf`] failed to write.
     LineDelimiter,
 }
 
@@ -177,24 +177,103 @@ impl WriteCollectionOptions {
 }
 
 impl<H> WriteCollectionOptions<H> {
-    pub(crate) fn into_error_handler(self) -> H {
+    /// Consumes these options and returns the configured error handler. Useful when wiring a
+    /// [`WriteChunks`] / [`WriteLines`] visitor manually instead of via a built-in
+    /// constructor.
+    pub fn into_error_handler(self) -> H {
         self.error_handler
     }
 }
 
+/// Asynchronous [`StreamVisitor`](AsyncStreamVisitor) that runs each observed chunk
+/// through `mapper`, writes the resulting bytes via `writer`, and routes failures through
+/// `error_handler`. The visitor surfaces the writer (or the first sink write error) via
+/// [`AsyncStreamVisitor::into_output`](AsyncStreamVisitor::into_output).
+///
+/// The two common shapes have dedicated constructors:
+/// - [`WriteChunks::passthrough`] writes each chunk's raw bytes unchanged.
+/// - [`WriteChunks::mapped`] runs each chunk through a user mapper first.
+///
+/// If you need full control over every field (e.g. injecting a pre-existing
+/// [`SinkWriteError`] into the `error` slot for tests), use
+/// [`builder`](Self::builder) directly.
+///
+/// `WriteChunks` is [`AsyncStreamVisitor`]-only because the underlying writer is
+/// [`AsyncWriteExt`]. There is no synchronous counterpart; reach for
+/// [`CollectChunks`](crate::visitors::collect::CollectChunks) (with a sink that performs the
+/// blocking write) if you need a sync chunk-level visitor.
 #[derive(TypedBuilder)]
-pub(crate) struct WriteChunks<W, H, F, B>
+pub struct WriteChunks<W, H, F, B>
 where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
     B: AsRef<[u8]> + Send + 'static,
     F: Fn(Chunk) -> B + Send + Sync + 'static,
 {
+    /// Stream name used to label any [`SinkWriteError`] this visitor surfaces.
     pub stream_name: &'static str,
+    /// Async writer chunks are forwarded into.
     pub writer: W,
+    /// Routing for sink write failures.
     pub error_handler: H,
+    /// Per-chunk mapper that produces the bytes actually written to `writer`.
     pub mapper: F,
+    /// Latest sink write error, if any. Constructors initialize this to `None`.
+    /// The visitor writes into it before signaling [`Next::Break`](Next::Break).
+    #[builder(default)]
     pub error: Option<SinkWriteError>,
+}
+
+impl<W, H> WriteChunks<W, H, fn(Chunk) -> Chunk, Chunk>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+{
+    /// Identity-mapper constructor. Each chunk's raw bytes are written to `writer` unchanged.
+    /// `stream_name` labels any [`SinkWriteError`] this visitor surfaces.
+    pub fn passthrough(
+        stream_name: &'static str,
+        writer: W,
+        options: WriteCollectionOptions<H>,
+    ) -> Self {
+        Self {
+            stream_name,
+            writer,
+            error_handler: options.into_error_handler(),
+            mapper: identity_chunk,
+            error: None,
+        }
+    }
+}
+
+impl<W, H, F, B> WriteChunks<W, H, F, B>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+    B: AsRef<[u8]> + Send + 'static,
+    F: Fn(Chunk) -> B + Send + Sync + 'static,
+{
+    /// Mapped constructor. Each chunk is run through `mapper` before being written. Use this
+    /// when the bytes you want to forward differ from the raw chunk bytes (for example, a
+    /// rendered line, an envelope-wrapped frame, or a transcoded representation).
+    pub fn mapped(
+        stream_name: &'static str,
+        writer: W,
+        options: WriteCollectionOptions<H>,
+        mapper: F,
+    ) -> Self {
+        Self {
+            stream_name,
+            writer,
+            error_handler: options.into_error_handler(),
+            mapper,
+            error: None,
+        }
+    }
+}
+
+fn identity_chunk(chunk: Chunk) -> Chunk {
+    chunk
 }
 
 impl<W, H, F, B> AsyncStreamVisitor for WriteChunks<W, H, F, B>
@@ -234,13 +313,17 @@ where
     }
 }
 
-/// [`AsyncLineSink`] that maps each parsed line through `mapper`, writes the result via
+/// [`AsyncLineVisitor`] that maps each parsed line through `mapper`, writes the result via
 /// `writer`, and routes failures through `error_handler`. Compose with
-/// [`LineAdapter`](crate::output_stream::line::adapter::LineAdapter) (its [`AsyncStreamVisitor`] impl
-/// is selected automatically when the inner sink is an [`AsyncLineSink`]) to drive
-/// `collect_lines_into_write` and friends, or to build your own custom write-lines consumer
-/// outside the built-in factory methods.
-pub struct WriteLineSink<W, H, F, B>
+/// [`ParseLines`](crate::output_stream::line::adapter::ParseLines) (its
+/// [`AsyncStreamVisitor`] impl is selected automatically when the inner sink is an
+/// [`AsyncLineVisitor`]) and pass the resulting visitor to
+/// [`Consumable::consume_async`](crate::Consumable::consume_async).
+///
+/// The common identity-mapper shape has a dedicated constructor: [`WriteLines::passthrough`].
+/// For mappers that change the line bytes, use [`WriteLines::new`] with a typed mapper
+/// closure.
+pub struct WriteLines<W, H, F, B>
 where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
@@ -255,7 +338,7 @@ where
     error: Option<SinkWriteError>,
 }
 
-impl<W, H, F, B> WriteLineSink<W, H, F, B>
+impl<W, H, F, B> WriteLines<W, H, F, B>
 where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
@@ -283,7 +366,34 @@ where
     }
 }
 
-impl<W, H, F, B> AsyncLineSink for WriteLineSink<W, H, F, B>
+impl<W, H> WriteLines<W, H, fn(Cow<'_, str>) -> String, String>
+where
+    W: Sink + AsyncWriteExt + Unpin,
+    H: SinkWriteErrorHandler,
+{
+    /// Identity-mapper constructor. Each parsed line is written to `writer` (with `mode`)
+    /// without transformation. `stream_name` labels any [`SinkWriteError`] this sink emits.
+    pub fn passthrough(
+        stream_name: &'static str,
+        writer: W,
+        options: WriteCollectionOptions<H>,
+        mode: LineWriteMode,
+    ) -> Self {
+        Self::new(
+            stream_name,
+            writer,
+            options.into_error_handler(),
+            identity_line,
+            mode,
+        )
+    }
+}
+
+fn identity_line(line: Cow<'_, str>) -> String {
+    line.into_owned()
+}
+
+impl<W, H, F, B> AsyncLineVisitor for WriteLines<W, H, F, B>
 where
     W: Sink + AsyncWriteExt + Unpin,
     H: SinkWriteErrorHandler,
@@ -384,7 +494,7 @@ mod tests {
     use crate::output_stream::consumer::driver::spawn_consumer_async;
     use crate::output_stream::event::StreamEvent;
     use crate::output_stream::event::tests::event_receiver;
-    use crate::output_stream::line::adapter::LineAdapter;
+    use crate::output_stream::line::adapter::ParseLines;
     use crate::output_stream::line::options::LineParsingOptions;
     use assertr::prelude::*;
     use bytes::Bytes;
@@ -396,7 +506,7 @@ mod tests {
     use tokio::io::AsyncWrite;
 
     // Test-only helpers replacing the deleted factory functions. They build the visitor via
-    // its constructor and spawn a consumer task — the same shape every test wants without
+    // its constructor and spawn a consumer task, the same shape every test wants without
     // each test repeating the boilerplate.
     fn collect_chunks_into_write<S, W, H>(
         stream_name: &'static str,
@@ -465,9 +575,9 @@ mod tests {
         spawn_consumer_async(
             stream_name,
             subscription,
-            LineAdapter::new(
+            ParseLines::new(
                 options,
-                WriteLineSink::new(
+                WriteLines::new(
                     stream_name,
                     write,
                     write_options.into_error_handler(),
@@ -497,9 +607,9 @@ mod tests {
         spawn_consumer_async(
             stream_name,
             subscription,
-            LineAdapter::new(
+            ParseLines::new(
                 options,
-                WriteLineSink::new(
+                WriteLines::new(
                     stream_name,
                     write,
                     write_options.into_error_handler(),

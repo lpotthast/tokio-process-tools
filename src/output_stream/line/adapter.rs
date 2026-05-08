@@ -1,28 +1,20 @@
 //! Adapter that turns a chunk-level [`StreamVisitor`] / [`AsyncStreamVisitor`] into a
-//! line-level sink.
+//! line-level [`LineVisitor`] / [`AsyncLineVisitor`].
 //!
-//! Six visitors used to drive the same five-step dance independently:
+//! Each line-aware visitor ([`InspectLines`], [`CollectLines`],
+//! [`crate::visitors::wait::WaitForLine`], [`crate::visitors::write::WriteLines`],
+//! plus their async twins) collapses to an inner  [`LineVisitor`] / [`AsyncLineVisitor`] that only
+//! describes the per-line action. Adding a new line-aware visitor is now "implement [`LineVisitor`]
+//! (or [`AsyncLineVisitor`]) and compose with [`ParseLines`]," not "re-derive the parser plumbing
+//! for the seventh time."
 //!
-//! 1. Hold a [`LineParser`] + [`LineParsingOptions`].
-//! 2. On every chunk, feed bytes into the parser and dispatch each emitted line to the
-//!    visitor-specific per-line callback.
-//! 3. On a gap, reset the parser's partial-line buffer.
-//! 4. On EOF, flush any unterminated trailing line through the same callback.
-//! 5. Assert at construction time that `options.max_line_length` is non-zero.
-//!
-//! [`LineAdapter`] owns steps 1–5 in one place; each line-aware visitor (`InspectLines`,
-//! `CollectLines`, `WaitForLine`, `WriteLines`, plus their async twins) collapses to an inner
-//! [`LineSink`] / [`AsyncLineSink`] that only describes the per-line action. Adding a new
-//! line-aware visitor is now "implement [`LineSink`] (or [`AsyncLineSink`]) and compose with
-//! [`LineAdapter`]," not "re-derive the parser plumbing for the seventh time."
-//!
-//! A single [`LineAdapter<S>`] struct serves both the sync and async paths: it carries two
-//! trait impls — [`StreamVisitor`] when `S: LineSink`, [`AsyncStreamVisitor`] when
-//! `S: AsyncLineSink` — and Rust selects the right one based on which trait the inner sink
-//! implements. Implementing both [`LineSink`] and [`AsyncLineSink`] for the same sink is
-//! supported but creates ambiguity at the [`LineAdapter`] call site: the caller has to make
+//! A single [`ParseLines<S>`] struct serves both the sync and async paths: it carries two
+//! trait impls ([`StreamVisitor`] when `S: LineVisitor`, [`AsyncStreamVisitor`] when
+//! `S: AsyncLineVisitor`), and Rust selects the right one based on which trait the inner sink
+//! implements. Implementing both [`LineVisitor`] and [`AsyncLineVisitor`] for the same sink is
+//! supported but creates ambiguity at the [`ParseLines`] call site: the caller has to make
 //! the trait selection explicit (e.g., by which consumer driver they hand the adapter to).
-//! In practice you implement whichever trait matches the work the sink does — sync if
+//! In practice, you implement whichever trait matches the work the sink does: sync if
 //! `on_line` is non-blocking, async if it `.await`s.
 //!
 //! Encoding the `max_line_length > 0` invariant as a `NonZero*` newtype was rejected on
@@ -34,16 +26,19 @@
 use super::options::{LineParsingOptions, assert_max_line_length_non_zero};
 use super::parser::LineParser;
 use crate::output_stream::Next;
+use crate::output_stream::consumer::Sink;
 use crate::output_stream::event::Chunk;
 use crate::output_stream::visitor::{AsyncStreamVisitor, StreamVisitor};
+use crate::output_stream::visitors::collect::{CollectLines, CollectLinesAsync};
+use crate::output_stream::visitors::inspect::{InspectLines, InspectLinesAsync};
 use std::borrow::Cow;
 use std::future::Future;
 
-/// Per-line action selected by the [`StreamVisitor`] impl of [`LineAdapter`].
+/// Per-line action selected by the [`StreamVisitor`] impl of [`ParseLines`].
 ///
 /// Implementors only describe what should happen for each parsed line; chunk parsing, gap
 /// handling, and EOF flushing are carried by the adapter.
-pub trait LineSink: Send + 'static {
+pub trait LineVisitor: Send + 'static {
     /// Final value produced once the adapter is finished. Returned via
     /// [`Consumer::wait`](crate::Consumer::wait).
     type Output: Send + 'static;
@@ -62,27 +57,27 @@ pub trait LineSink: Send + 'static {
     fn on_eof(&mut self) {}
 
     /// Consumes the sink and returns its final output.
+    #[must_use]
     fn into_output(self) -> Self::Output;
 }
 
-/// Async per-line action selected by the [`AsyncStreamVisitor`] impl of [`LineAdapter`].
+/// Async per-line action selected by the [`AsyncStreamVisitor`] impl of [`ParseLines`].
 ///
-/// `on_line` is async because the line-aware async visitors (`inspect_lines_async`,
-/// `collect_lines_async`, `collect_lines_into_write*`) all need to `.await` per-line work.
-/// `on_gap` stays synchronous because gap notification carries no payload to await on,
-/// mirroring [`AsyncStreamVisitor::on_gap`].
+/// `on_line` is async because async per-line work (writing to an async sink, awaiting a
+/// channel) needs `.await`. `on_gap` stays synchronous because gap notification carries no
+/// payload to await on, mirroring [`AsyncStreamVisitor::on_gap`].
 ///
 /// # Allocation note
 ///
 /// The async path materializes every parsed line as an owned `String` before handing it to
-/// `on_line`. The synchronous [`LineSink`] path can instead pass a `Cow::Borrowed` straight out
+/// `on_line`. The synchronous [`LineVisitor`] path can instead pass a `Cow::Borrowed` straight out
 /// of the chunk on the fast path, so it avoids a per-line allocation when the line fits in the
 /// current chunk. The allocation is the cost of holding the parser's borrow across an `.await`,
-/// which Rust does not allow because the next iteration re-borrows the parser. Use [`LineSink`]
-/// (and the corresponding `inspect_lines` / `collect_lines` factories) when per-line work is
-/// non-blocking and you want the zero-copy fast path; reach for [`AsyncLineSink`] only when the
-/// per-line work genuinely needs to await.
-pub trait AsyncLineSink: Send + 'static {
+/// which Rust does not allow because the next iteration re-borrows the parser. Prefer
+/// [`LineVisitor`] (composed via [`ParseLines::inspect`] / [`ParseLines::collect`]) when
+/// per-line work is non-blocking, and you want the zero-copy fast path; reach for
+/// [`AsyncLineVisitor`] only when the per-line work genuinely needs to await.
+pub trait AsyncLineVisitor: Send + 'static {
     /// Final value produced once the adapter is finished.
     type Output: Send + 'static;
 
@@ -90,7 +85,7 @@ pub trait AsyncLineSink: Send + 'static {
     /// parsing.
     fn on_line<'a>(&'a mut self, line: Cow<'a, str>) -> impl Future<Output = Next> + Send + 'a;
 
-    /// Synchronous gap hook; default no-op. See [`LineSink::on_gap`].
+    /// Synchronous gap hook; default no-op. See [`LineVisitor::on_gap`].
     fn on_gap(&mut self) {}
 
     /// Asynchronous EOF hook; default no-op. Invoked after the adapter has flushed any
@@ -100,22 +95,22 @@ pub trait AsyncLineSink: Send + 'static {
     }
 
     /// Consumes the sink and returns its final output.
+    #[must_use]
     fn into_output(self) -> Self::Output;
 }
 
-/// Adapter that drives [`LineParser`] over chunk events and dispatches every emitted line to
-/// the inner [`LineSink`] (sync) or [`AsyncLineSink`] (async).
+/// Adapter that drives a [`LineParser`] over chunk events and dispatches every emitted line to
+/// the `inner` [`LineVisitor`] (sync) or [`AsyncLineVisitor`] (async).
 ///
-/// One struct, two trait impls: [`StreamVisitor`] when `S: LineSink`, [`AsyncStreamVisitor`]
-/// when `S: AsyncLineSink`. Rust selects the right impl from the inner sink's type at the
-/// call site.
-pub struct LineAdapter<S> {
+/// Implements [`StreamVisitor`] when `S: LineVisitor` and [`AsyncStreamVisitor`] when
+/// `S: AsyncLineVisitor`.
+pub struct ParseLines<S> {
     parser: LineParser,
     options: LineParsingOptions,
     inner: S,
 }
 
-impl<S> LineAdapter<S> {
+impl<S> ParseLines<S> {
     /// Creates a new line adapter.
     ///
     /// # Panics
@@ -133,7 +128,75 @@ impl<S> LineAdapter<S> {
     }
 }
 
-impl<S: LineSink> StreamVisitor for LineAdapter<S> {
+impl<F> ParseLines<InspectLines<F>>
+where
+    F: FnMut(Cow<'_, str>) -> Next + Send + 'static,
+{
+    /// Convenience constructor: wraps `f` in an [`InspectLines`] and composes it with this
+    /// adapter. Equivalent to `ParseLines::new(options, InspectLines::new(f))`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `options.max_line_length` is zero.
+    pub fn inspect(options: LineParsingOptions, f: F) -> Self {
+        Self::new(options, InspectLines::new(f))
+    }
+}
+
+impl<F, Fut> ParseLines<InspectLinesAsync<F, Fut>>
+where
+    F: FnMut(Cow<'_, str>) -> Fut + Send + 'static,
+    Fut: Future<Output = Next> + Send + 'static,
+{
+    /// Convenience constructor: wraps `f` in an [`InspectLinesAsync`] and composes it with this
+    /// adapter. Equivalent to `ParseLines::new(options, InspectLinesAsync::new(f))`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `options.max_line_length` is zero.
+    pub fn inspect_async(options: LineParsingOptions, f: F) -> Self {
+        Self::new(options, InspectLinesAsync::new(f))
+    }
+}
+
+impl<T, F> ParseLines<CollectLines<T, F>>
+where
+    T: Sink,
+    F: FnMut(Cow<'_, str>, &mut T) -> Next + Send + 'static,
+{
+    /// Convenience constructor: wraps `sink` and `f` in a [`CollectLines`] and composes it with
+    /// this adapter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `options.max_line_length` is zero.
+    pub fn collect(options: LineParsingOptions, sink: T, f: F) -> Self {
+        Self::new(options, CollectLines::new(sink, f))
+    }
+}
+
+impl<T, F> ParseLines<CollectLinesAsync<T, F>>
+where
+    T: Sink,
+    F: for<'a> FnMut(
+            Cow<'a, str>,
+            &'a mut T,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Next> + Send + 'a>>
+        + Send
+        + 'static,
+{
+    /// Convenience constructor: wraps `sink` and `f` in a [`CollectLinesAsync`] and composes it
+    /// with this adapter. The closure must wrap its async body in `Box::pin(async move { ... })`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `options.max_line_length` is zero.
+    pub fn collect_async(options: LineParsingOptions, sink: T, f: F) -> Self {
+        Self::new(options, CollectLinesAsync::new(sink, f))
+    }
+}
+
+impl<S: LineVisitor> StreamVisitor for ParseLines<S> {
     type Output = S::Output;
 
     fn on_chunk(&mut self, chunk: Chunk) -> Next {
@@ -168,14 +231,7 @@ impl<S: LineSink> StreamVisitor for LineAdapter<S> {
     }
 }
 
-/// Async impl of the same [`LineAdapter`] struct.
-///
-/// Each per-line iteration calls `next_line` synchronously, materializes the line as a fresh
-/// `String` via `Cow::into_owned`, drops the parser borrow, then awaits the inner sink. The
-/// allocation per line is the price of supporting async per-line callbacks on stable Rust —
-/// holding a parser borrow across an `.await` is forbidden because the next iteration
-/// re-borrows the parser.
-impl<S: AsyncLineSink> AsyncStreamVisitor for LineAdapter<S> {
+impl<S: AsyncLineVisitor> AsyncStreamVisitor for ParseLines<S> {
     type Output = S::Output;
 
     async fn on_chunk(&mut self, chunk: Chunk) -> Next {
@@ -230,7 +286,7 @@ mod tests {
         seen: Arc<Mutex<Vec<String>>>,
     }
 
-    impl LineSink for CollectingSink {
+    impl LineVisitor for CollectingSink {
         type Output = ();
 
         fn on_line(&mut self, line: Cow<'_, str>) -> Next {
@@ -245,7 +301,7 @@ mod tests {
         seen: Arc<Mutex<Vec<String>>>,
     }
 
-    impl AsyncLineSink for CollectingAsyncSink {
+    impl AsyncLineVisitor for CollectingAsyncSink {
         type Output = ();
 
         async fn on_line(&mut self, line: Cow<'_, str>) -> Next {
@@ -262,7 +318,7 @@ mod tests {
         #[test]
         #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]
         fn new_panics_when_max_line_length_is_zero() {
-            let _ = LineAdapter::new(
+            let _ = ParseLines::new(
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: LineOverflowBehavior::default(),
@@ -285,7 +341,7 @@ mod tests {
                     StreamEvent::Eof,
                 ])
                 .await,
-                LineAdapter::new(
+                ParseLines::new(
                     LineParsingOptions::default(),
                     CollectingSink {
                         seen: Arc::clone(&seen),
@@ -310,7 +366,7 @@ mod tests {
                     StreamEvent::Eof,
                 ])
                 .await,
-                LineAdapter::new(
+                ParseLines::new(
                     LineParsingOptions::default(),
                     CollectingSink {
                         seen: Arc::clone(&seen),
@@ -329,7 +385,7 @@ mod tests {
                 count: usize,
             }
 
-            impl LineSink for StopAtSecondLine {
+            impl LineVisitor for StopAtSecondLine {
                 type Output = ();
                 fn on_line(&mut self, line: Cow<'_, str>) -> Next {
                     self.count += 1;
@@ -351,7 +407,7 @@ mod tests {
                     StreamEvent::Eof,
                 ])
                 .await,
-                LineAdapter::new(
+                ParseLines::new(
                     LineParsingOptions::default(),
                     StopAtSecondLine {
                         seen: Arc::clone(&seen),
@@ -371,7 +427,7 @@ mod tests {
         #[test]
         #[should_panic(expected = "LineParsingOptions::max_line_length must be greater than zero")]
         fn new_panics_when_max_line_length_is_zero() {
-            let _ = LineAdapter::new(
+            let _ = ParseLines::new(
                 LineParsingOptions {
                     max_line_length: 0.bytes(),
                     overflow_behavior: LineOverflowBehavior::default(),
@@ -393,7 +449,7 @@ mod tests {
                     StreamEvent::Eof,
                 ])
                 .await,
-                LineAdapter::new(
+                ParseLines::new(
                     LineParsingOptions::default(),
                     CollectingAsyncSink {
                         seen: Arc::clone(&seen),

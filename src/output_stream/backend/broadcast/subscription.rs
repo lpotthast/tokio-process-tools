@@ -1,7 +1,7 @@
 use super::state::{BestEffortLiveQueue, IndexedEvent, Shared, SubscriberId};
 use crate::output_stream::Subscription;
 use crate::output_stream::event::StreamEvent;
-use crate::output_stream::policy::{BestEffortDelivery, Delivery, NoReplay, Replay};
+use crate::output_stream::policy::{Delivery, LossyWithoutBackpressure, NoReplay, Replay};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -51,7 +51,7 @@ impl LiveReceiver {
 }
 
 #[derive(Debug)]
-pub(super) struct SharedSubscription<D = BestEffortDelivery, R = NoReplay>
+pub(super) struct SharedSubscription<D = LossyWithoutBackpressure, R = NoReplay>
 where
     D: Delivery,
     R: Replay,
@@ -114,8 +114,21 @@ where
     }
 }
 
+/// Subscription handle returned by
+/// [`BroadcastOutputStream::try_subscribe`](crate::BroadcastOutputStream).
+/// Treat this as an opaque value: pass it to a built-in consumer or your own
+/// [`Subscription`]-driven loop. The internal representation is not part of the public API.
 #[derive(Debug)]
-pub(super) enum BroadcastSubscription<D = BestEffortDelivery, R = NoReplay>
+pub struct BroadcastSubscription<D = LossyWithoutBackpressure, R = NoReplay>
+where
+    D: Delivery,
+    R: Replay,
+{
+    inner: BroadcastSubscriptionInner<D, R>,
+}
+
+#[derive(Debug)]
+enum BroadcastSubscriptionInner<D, R>
 where
     D: Delivery,
     R: Replay,
@@ -129,10 +142,22 @@ where
     D: Delivery,
     R: Replay,
 {
+    pub(super) fn fast(subscription: FastSubscription) -> Self {
+        Self {
+            inner: BroadcastSubscriptionInner::Fast(subscription),
+        }
+    }
+
+    pub(super) fn shared(subscription: SharedSubscription<D, R>) -> Self {
+        Self {
+            inner: BroadcastSubscriptionInner::Shared(subscription),
+        }
+    }
+
     pub(super) async fn recv(&mut self) -> Option<StreamEvent> {
-        match self {
-            BroadcastSubscription::Fast(subscription) => subscription.recv().await,
-            BroadcastSubscription::Shared(subscription) => subscription.recv().await,
+        match &mut self.inner {
+            BroadcastSubscriptionInner::Fast(subscription) => subscription.recv().await,
+            BroadcastSubscriptionInner::Shared(subscription) => subscription.recv().await,
         }
     }
 }
@@ -156,14 +181,16 @@ mod tests {
     use super::super::state::{SubscriberSender, append_event};
     use super::*;
     use crate::StreamReadError;
-    use crate::{NumBytesExt, ReliableDelivery, ReplayEnabled, ReplayRetention, StreamConfig};
+    use crate::{
+        NumBytesExt, ReliableWithBackpressure, ReplayEnabled, ReplayRetention, StreamConfig,
+    };
     use assertr::prelude::*;
     use std::io;
 
     fn best_effort_options(
         retention: ReplayRetention,
-    ) -> StreamConfig<BestEffortDelivery, ReplayEnabled> {
-        let builder = StreamConfig::builder().best_effort_delivery();
+    ) -> StreamConfig<LossyWithoutBackpressure, ReplayEnabled> {
+        let builder = StreamConfig::builder().lossy_without_backpressure();
         match retention {
             ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
             ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
@@ -174,9 +201,9 @@ mod tests {
         .build()
     }
 
-    fn reliable_no_replay_options() -> StreamConfig<ReliableDelivery, NoReplay> {
+    fn reliable_no_replay_options() -> StreamConfig<ReliableWithBackpressure, NoReplay> {
         StreamConfig::builder()
-            .reliable_for_active_subscribers()
+            .reliable_with_backpressure()
             .no_replay()
             .read_chunk_size(1.bytes())
             .max_buffered_chunks(1)
@@ -185,8 +212,8 @@ mod tests {
 
     fn reliable_replay_options(
         retention: ReplayRetention,
-    ) -> StreamConfig<ReliableDelivery, ReplayEnabled> {
-        let builder = StreamConfig::builder().reliable_for_active_subscribers();
+    ) -> StreamConfig<ReliableWithBackpressure, ReplayEnabled> {
+        let builder = StreamConfig::builder().reliable_with_backpressure();
         match retention {
             ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
             ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
@@ -206,14 +233,14 @@ mod tests {
         R: Replay,
     {
         let (sender, live_receiver) = match options.delivery_guarantee() {
-            crate::DeliveryGuarantee::ReliableForActiveSubscribers => {
+            crate::DeliveryGuarantee::ReliableWithBackpressure => {
                 let (sender, receiver) = mpsc::channel(options.max_buffered_chunks);
                 (
                     SubscriberSender::Reliable(sender),
                     LiveReceiver::Reliable(receiver),
                 )
             }
-            crate::DeliveryGuarantee::BestEffort => {
+            crate::DeliveryGuarantee::LossyWithoutBackpressure => {
                 let queue = Arc::new(BestEffortLiveQueue::new(options.max_buffered_chunks));
                 (
                     SubscriberSender::BestEffort(Arc::clone(&queue)),

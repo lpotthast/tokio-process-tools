@@ -7,7 +7,7 @@ use crate::output_stream::config::{
     StreamConfigReadChunkSizeBuilder, StreamConfigReadyBuilder, StreamConfigReplayBuilder,
 };
 use crate::output_stream::policy::{
-    BestEffortDelivery, Delivery, ReliableDelivery, Replay, ReplayEnabled,
+    Delivery, LossyWithoutBackpressure, ReliableWithBackpressure, Replay, ReplayEnabled,
 };
 use std::marker::PhantomData;
 use std::process::Stdio;
@@ -162,20 +162,23 @@ impl<Backend, Stage> PipedStreamConfig<Backend, Stage> {
 }
 
 impl<Backend> PipedStreamConfig<Backend, StreamConfigBuilder> {
-    /// Selects bounded live delivery where slow consumers may observe gaps or dropped output.
+    /// Selects lossy delivery that never blocks the child. Slow active subscribers may observe
+    /// gaps; line-aware consumers resync at the next newline.
     #[must_use]
-    pub fn best_effort_delivery(
+    pub fn lossy_without_backpressure(
         self,
-    ) -> PipedStreamConfig<Backend, StreamConfigReplayBuilder<BestEffortDelivery>> {
-        PipedStreamConfig::new(self.stage.best_effort_delivery())
+    ) -> PipedStreamConfig<Backend, StreamConfigReplayBuilder<LossyWithoutBackpressure>> {
+        PipedStreamConfig::new(self.stage.lossy_without_backpressure())
     }
 
-    /// Selects delivery that waits for active consumers when their buffers are full.
+    /// Selects reliable delivery that pauses the reader task when an active subscriber's buffer is
+    /// full, applying backpressure to the child. Reliability is scoped to currently-attached
+    /// subscribers; late attachers depend on the replay axis for earlier output.
     #[must_use]
-    pub fn reliable_for_active_subscribers(
+    pub fn reliable_with_backpressure(
         self,
-    ) -> PipedStreamConfig<Backend, StreamConfigReplayBuilder<ReliableDelivery>> {
-        PipedStreamConfig::new(self.stage.reliable_for_active_subscribers())
+    ) -> PipedStreamConfig<Backend, StreamConfigReplayBuilder<ReliableWithBackpressure>> {
+        PipedStreamConfig::new(self.stage.reliable_with_backpressure())
     }
 }
 
@@ -295,7 +298,7 @@ mod tests {
             assert_that_panic_by(|| {
                 let _config = ProcessStreamBuilder
                     .single_subscriber()
-                    .best_effort_delivery()
+                    .lossy_without_backpressure()
                     .no_replay()
                     .read_chunk_size(NumBytes::zero())
                     .max_buffered_chunks(1);
@@ -313,7 +316,7 @@ mod tests {
             assert_that_panic_by(|| {
                 let _config = ProcessStreamBuilder
                     .single_subscriber()
-                    .best_effort_delivery()
+                    .lossy_without_backpressure()
                     .no_replay()
                     .read_chunk_size(8.bytes())
                     .max_buffered_chunks(0);
@@ -327,7 +330,7 @@ mod tests {
             assert_that_panic_by(|| {
                 let _config = ProcessStreamBuilder
                     .broadcast()
-                    .best_effort_delivery()
+                    .lossy_without_backpressure()
                     .no_replay()
                     .read_chunk_size(8.bytes())
                     .max_buffered_chunks(0);

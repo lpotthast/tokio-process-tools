@@ -12,7 +12,7 @@ use std::time::Duration;
 async fn configured_reader_publishes_read_error_without_panicking() {
     let (stream_reader, mut rx, _shared) = spawn_configured_reader(
         ReadErrorAfterBytes::new(b"ready\n", io::ErrorKind::BrokenPipe),
-        DeliveryGuarantee::BestEffort,
+        DeliveryGuarantee::LossyWithoutBackpressure,
         2.bytes(),
         64,
     );
@@ -45,7 +45,7 @@ async fn configured_reader_publishes_read_error_without_panicking() {
 async fn configured_reader_records_read_error_while_active_queue_is_full() {
     let (stream_reader, mut rx, shared) = spawn_configured_reader(
         ReadErrorAfterBytes::new(b"aabbcc", io::ErrorKind::BrokenPipe),
-        DeliveryGuarantee::BestEffort,
+        DeliveryGuarantee::LossyWithoutBackpressure,
         2.bytes(),
         1,
     );

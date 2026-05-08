@@ -4,13 +4,15 @@ mod support;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::collections::HashMap;
+use std::future::Future;
 use std::hint::black_box;
 use std::time::Duration;
 use support::{BackendKind, DeliveryKind};
 use tokio_process_tools::{
-    AsyncChunkCollector, BroadcastOutputStream, Chunk, CollectedLines, Consumer,
-    LineCollectionOptions, LineParsingOptions, Next, SingleSubscriberOutputStream,
+    AsyncStreamVisitor, BroadcastOutputStream, Chunk, CollectedLines, Consumable, Consumer,
+    LineCollectionOptions, LineParsingOptions, Next, ParseLines, SingleSubscriberOutputStream,
 };
+use unwrap_infallible::UnwrapInfallible;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineConsumerKind {
@@ -174,25 +176,53 @@ trait LineBenchStream {
     fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines>;
 }
 
+#[allow(clippy::type_complexity)]
+fn line_stats_visitor(
+    options: LineParsingOptions,
+) -> ParseLines<
+    tokio_process_tools::visitors::collect::CollectLines<
+        support::LineStats,
+        impl FnMut(std::borrow::Cow<'_, str>, &mut support::LineStats) -> Next + Send + 'static,
+    >,
+> {
+    ParseLines::collect(
+        options,
+        support::LineStats::default(),
+        |line: std::borrow::Cow<'_, str>, stats: &mut support::LineStats| {
+            stats.observe(line.as_ref());
+            Next::Continue
+        },
+    )
+}
+
+#[allow(clippy::type_complexity)]
+fn line_buffer_visitor(
+    parsing_options: LineParsingOptions,
+) -> ParseLines<
+    tokio_process_tools::visitors::collect::CollectLines<
+        CollectedLines,
+        impl FnMut(std::borrow::Cow<'_, str>, &mut CollectedLines) -> Next + Send + 'static,
+    >,
+> {
+    ParseLines::collect(
+        parsing_options,
+        CollectedLines::new(),
+        CollectedLines::line_collector(LineCollectionOptions::TrustedUnbounded),
+    )
+}
+
 impl<D, R> LineBenchStream for SingleSubscriberOutputStream<D, R>
 where
     D: tokio_process_tools::Delivery,
     R: tokio_process_tools::Replay,
 {
     fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
-        self.collect_lines(
-            support::LineStats::default(),
-            |line, stats: &mut support::LineStats| {
-                stats.observe(line.as_ref());
-                Next::Continue
-            },
-            options,
-        )
-        .expect("single-subscriber benchmark consumer should start")
+        self.consume(line_stats_visitor(options))
+            .expect("single-subscriber benchmark consumer should start")
     }
 
     fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
-        self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
+        self.consume(line_buffer_visitor(options))
             .expect("single-subscriber benchmark consumer should start")
     }
 }
@@ -203,27 +233,26 @@ where
     R: tokio_process_tools::Replay,
 {
     fn collect_line_stats(&self, options: LineParsingOptions) -> Consumer<support::LineStats> {
-        self.collect_lines(
-            support::LineStats::default(),
-            |line, stats: &mut support::LineStats| {
-                stats.observe(line.as_ref());
-                Next::Continue
-            },
-            options,
-        )
+        self.consume(line_stats_visitor(options))
+            .unwrap_infallible()
     }
 
     fn collect_line_buffer(&self, options: LineParsingOptions) -> Consumer<CollectedLines> {
-        self.collect_lines_into_vec(options, LineCollectionOptions::TrustedUnbounded)
+        self.consume(line_buffer_visitor(options))
+            .unwrap_infallible()
     }
 }
 
 struct HangingChunkCollector;
 
-impl AsyncChunkCollector<()> for HangingChunkCollector {
-    async fn collect<'a>(&'a mut self, _chunk: Chunk, _sink: &'a mut ()) -> Next {
-        std::future::pending::<Next>().await
+impl AsyncStreamVisitor for HangingChunkCollector {
+    type Output = ();
+
+    fn on_chunk(&mut self, _chunk: Chunk) -> impl Future<Output = Next> + Send + '_ {
+        std::future::pending::<Next>()
     }
+
+    fn into_output(self) {}
 }
 
 async fn run_line_case(
@@ -411,7 +440,7 @@ async fn run_best_effort_replay_slow_subscriber_case(
 ) -> LineBenchResult {
     let (reader, gate) = support::GatedChunkedReader::new(payload);
     let stream = support::broadcast_stream_best_effort_replay(reader, read_chunk_size);
-    let _slow_subscriber = stream.collect_chunks_async((), HangingChunkCollector);
+    let _slow_subscriber = stream.consume_async(HangingChunkCollector);
     let collector = stream.collect_line_stats(options);
 
     open_gate_after_subscriber_is_polling(gate).await;

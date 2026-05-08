@@ -3,10 +3,10 @@
 //! Two implementations live side by side and are selected by
 //! [`BroadcastOutputStream::from_stream`]:
 //!
-//! - [`fast`] — a thin wrapper around `tokio::sync::broadcast` used only when the config
-//!   is exactly `BestEffortDelivery + NoReplay`. It avoids the shared-state mutex and the
+//! - [`fast`]: a thin wrapper around `tokio::sync::broadcast` used only when the config
+//!   is exactly `LossyWithoutBackpressure + NoReplay`. It avoids the shared-state mutex and the
 //!   replay buffer entirely, at the cost of dropping output for slow or late subscribers.
-//! - [`fanout`] — the generic `<D: Delivery, R: Replay>` path used for every other
+//! - [`fanout`]: the generic `<D: Delivery, R: Replay>` path used for every other
 //!   combination. It owns an `Arc<Shared>` that tracks the subscriber registry and replay
 //!   history, and routes per-event dispatch through [`state::append_event`] to honor the
 //!   configured delivery guarantee.
@@ -17,19 +17,16 @@
 use crate::WaitForLineResult;
 use crate::output_stream::config::StreamConfig;
 use crate::output_stream::consumer::driver::consume_sync;
-use crate::output_stream::consumer::{spawn_consumer_async, spawn_consumer_sync};
 use crate::output_stream::event::StreamEvent;
-use crate::output_stream::line::adapter::LineAdapter;
+use crate::output_stream::line::adapter::ParseLines;
 use crate::output_stream::policy::{
-    BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, Replay, ReplayEnabled,
+    Delivery, DeliveryGuarantee, LossyWithoutBackpressure, NoReplay, Replay, ReplayEnabled,
 };
-use crate::output_stream::visitors::factories::impl_consumer_factories;
-use crate::output_stream::visitors::wait::WaitForLineSink;
-use crate::output_stream::{OutputStream, TrySubscribable};
-use crate::{
-    AsyncStreamVisitor, Consumer, LineParsingOptions, NumBytes, StreamConsumerError, StreamVisitor,
-};
+use crate::output_stream::visitors::wait::WaitForLine;
+use crate::output_stream::{Consumable, OutputStream, Subscribable};
+use crate::{LineParsingOptions, NumBytes};
 use std::borrow::Cow;
+use std::convert::Infallible;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
@@ -37,10 +34,7 @@ use std::time::Duration;
 use tokio::io::AsyncRead;
 #[cfg(test)]
 use tokio::sync::watch;
-
-/// Per-backend return-type alias used by the [`impl_consumer_factories!`] macro to keep the
-/// macro body backend-agnostic. Broadcast factories cannot fail, so the alias is the identity.
-type FactoryReturn<T> = T;
+use unwrap_infallible::UnwrapInfallible;
 
 mod fanout;
 mod fast;
@@ -50,7 +44,9 @@ mod subscription;
 use fanout::{FanoutReplayBackend, new_fanout_backend};
 use fast::{FastBackend, new_fast_backend};
 use state::{BestEffortLiveQueue, SubscriberSender};
-use subscription::{BroadcastSubscription, FastSubscription, LiveReceiver, SharedSubscription};
+use subscription::{FastSubscription, LiveReceiver, SharedSubscription};
+
+pub use subscription::BroadcastSubscription;
 
 enum Backend<D, R>
 where
@@ -68,7 +64,7 @@ where
 /// needs concurrent fanout, such as logging plus readiness checks or logging plus collection.
 /// Delivery policy still determines whether slow active consumers observe gaps or apply
 /// backpressure.
-pub struct BroadcastOutputStream<D = BestEffortDelivery, R = NoReplay>
+pub struct BroadcastOutputStream<D = LossyWithoutBackpressure, R = NoReplay>
 where
     D: Delivery,
     R: Replay,
@@ -158,6 +154,8 @@ where
     R: Replay,
 {
     /// Creates a new broadcast output stream from an async read stream and typed stream config.
+    #[doc(hidden)]
+    #[must_use]
     pub fn from_stream<S: AsyncRead + Unpin + Send + 'static>(
         stream: S,
         stream_name: &'static str,
@@ -165,7 +163,7 @@ where
     ) -> Self {
         options.assert_valid("options");
 
-        if options.delivery_guarantee() == DeliveryGuarantee::BestEffort
+        if options.delivery_guarantee() == DeliveryGuarantee::LossyWithoutBackpressure
             && !options.replay_enabled()
         {
             return Self {
@@ -243,64 +241,16 @@ where
     }
 }
 
-impl<D, R> BroadcastOutputStream<D, R>
+impl<D, R> Subscribable for BroadcastOutputStream<D, R>
 where
     D: Delivery,
     R: Replay,
 {
-    fn subscribe(&self) -> BroadcastSubscription<D, R> {
-        let Backend::FanoutReplay(backend) = &self.backend else {
-            panic!("fanout broadcast subscription requested for fast backend");
-        };
-        let mut state = backend
-            .shared
-            .state
-            .lock()
-            .expect("broadcast state poisoned");
+    type Subscription = BroadcastSubscription<D, R>;
+    type SubscribeError = Infallible;
 
-        let (subscriber_sender, live_receiver) = match backend.options.delivery_guarantee() {
-            DeliveryGuarantee::ReliableForActiveSubscribers => {
-                let (sender, receiver) =
-                    tokio::sync::mpsc::channel(backend.options.max_buffered_chunks);
-                (
-                    SubscriberSender::Reliable(sender),
-                    LiveReceiver::Reliable(receiver),
-                )
-            }
-            DeliveryGuarantee::BestEffort => {
-                let queue = Arc::new(BestEffortLiveQueue::new(
-                    backend.options.max_buffered_chunks,
-                ));
-                (
-                    SubscriberSender::BestEffort(Arc::clone(&queue)),
-                    LiveReceiver::BestEffort(queue),
-                )
-            }
-        };
-        let (replay, live_start_seq) = state.replay_snapshot(backend.options);
-        let id = if state.closed || state.terminal.is_some() {
-            None
-        } else {
-            Some(state.add_subscriber(subscriber_sender))
-        };
-
-        BroadcastSubscription::Shared(SharedSubscription {
-            shared: Arc::clone(&backend.shared),
-            id,
-            replay,
-            live_start_seq,
-            live_receiver: if id.is_some() {
-                live_receiver
-            } else {
-                LiveReceiver::Closed
-            },
-            _marker: std::marker::PhantomData,
-            done: false,
-        })
-    }
-
-    fn subscribe_normal(&self) -> BroadcastSubscription<D, R> {
-        match &self.backend {
+    fn try_subscribe(&self) -> Result<Self::Subscription, Self::SubscribeError> {
+        Ok(match &self.backend {
             Backend::Fast(backend) => {
                 let (receiver, emit_terminal_event) = {
                     let state = backend
@@ -316,26 +266,69 @@ where
                     (receiver, terminal_event)
                 };
 
-                BroadcastSubscription::Fast(FastSubscription {
+                BroadcastSubscription::fast(FastSubscription {
                     receiver,
                     emit_terminal_event,
                 })
             }
-            Backend::FanoutReplay(_) => self.subscribe(),
-        }
+            Backend::FanoutReplay(backend) => {
+                let mut state = backend
+                    .shared
+                    .state
+                    .lock()
+                    .expect("broadcast state poisoned");
+
+                let (subscriber_sender, live_receiver) = match backend.options.delivery_guarantee()
+                {
+                    DeliveryGuarantee::ReliableWithBackpressure => {
+                        let (sender, receiver) =
+                            tokio::sync::mpsc::channel(backend.options.max_buffered_chunks);
+                        (
+                            SubscriberSender::Reliable(sender),
+                            LiveReceiver::Reliable(receiver),
+                        )
+                    }
+                    DeliveryGuarantee::LossyWithoutBackpressure => {
+                        let queue = Arc::new(BestEffortLiveQueue::new(
+                            backend.options.max_buffered_chunks,
+                        ));
+                        (
+                            SubscriberSender::BestEffort(Arc::clone(&queue)),
+                            LiveReceiver::BestEffort(queue),
+                        )
+                    }
+                };
+                let (replay, live_start_seq) = state.replay_snapshot(backend.options);
+                let id = if state.closed || state.terminal.is_some() {
+                    None
+                } else {
+                    Some(state.add_subscriber(subscriber_sender))
+                };
+
+                BroadcastSubscription::shared(SharedSubscription {
+                    shared: Arc::clone(&backend.shared),
+                    id,
+                    replay,
+                    live_start_seq,
+                    live_receiver: if id.is_some() {
+                        live_receiver
+                    } else {
+                        LiveReceiver::Closed
+                    },
+                    _marker: std::marker::PhantomData,
+                    done: false,
+                })
+            }
+        })
     }
 }
 
-impl<D, R> TrySubscribable for BroadcastOutputStream<D, R>
+impl<D, R> Consumable for BroadcastOutputStream<D, R>
 where
     D: Delivery,
     R: Replay,
 {
-    fn try_subscribe(
-        &self,
-    ) -> Result<impl crate::output_stream::Subscription, StreamConsumerError> {
-        Ok(self.subscribe_normal())
-    }
+    type Error = Infallible;
 }
 
 impl<D, R> BroadcastOutputStream<D, R>
@@ -343,38 +336,6 @@ where
     D: Delivery,
     R: Replay,
 {
-    /// Drives the provided synchronous [`StreamVisitor`] over this stream and returns a
-    /// [`Consumer`] that owns the spawned task.
-    ///
-    /// All built-in `inspect_*`, `collect_*`, and `wait_for_line` factories construct a
-    /// built-in visitor and call this method internally; reach for `consume_with` when the
-    /// closure-shaped factories don't fit and you need direct access to the chunk/gap/EOF
-    /// lifecycle. The returned [`Consumer`]'s [`wait`](Consumer::wait) yields whatever the
-    /// visitor produces from [`StreamVisitor::into_output`].
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your visitor is never invoked and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn consume_with<V>(&self, visitor: V) -> Consumer<V::Output>
-    where
-        V: StreamVisitor,
-    {
-        spawn_consumer_sync(self.name(), self.subscribe_normal(), visitor)
-    }
-
-    /// Drives the provided asynchronous [`AsyncStreamVisitor`] over this stream and returns a
-    /// [`Consumer`] that owns the spawned task.
-    ///
-    /// Use this when observing a chunk requires `.await` (for example, forwarding chunks to an
-    /// async writer or channel). See [`consume_with`](Self::consume_with) for the synchronous
-    /// variant.
-    #[must_use = "If not at least assigned to a variable, the return value will be dropped immediately, which in turn drops the internal tokio task, meaning that your visitor is never invoked and the consumer effectively dies immediately. You can safely do a `let _consumer = ...` binding to ignore the typical 'unused' warning."]
-    pub fn consume_with_async<V>(&self, visitor: V) -> Consumer<V::Output>
-    where
-        V: AsyncStreamVisitor,
-    {
-        spawn_consumer_async(self.name(), self.subscribe_normal(), visitor)
-    }
-
-    impl_consumer_factories!();
-
     /// Waits for a line that matches the given predicate within `timeout`.
     ///
     /// The returned future resolves to
@@ -390,7 +351,7 @@ where
     /// replay enabled and unsealed, that can include retained past output; otherwise it starts
     /// at live output.
     ///
-    /// When chunks are dropped in [`DeliveryGuarantee::BestEffort`] mode, this waiter discards
+    /// When chunks are dropped in [`DeliveryGuarantee::LossyWithoutBackpressure`] mode, this waiter discards
     /// any partial line in progress and resynchronizes at the next newline instead of matching
     /// across the gap.
     ///
@@ -404,15 +365,15 @@ where
     pub fn wait_for_line(
         &self,
         timeout: Duration,
-        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
+        predicate: impl Fn(Cow<'_, str>) -> bool + Send + 'static,
         options: LineParsingOptions,
     ) -> impl Future<Output = Result<WaitForLineResult, crate::StreamReadError>> + Send + 'static
     {
-        let subscription = self.subscribe_normal();
-        let visitor = LineAdapter::new(options, WaitForLineSink::new(predicate));
+        let subscription = self.try_subscribe().unwrap_infallible();
+        let visitor = ParseLines::new(options, WaitForLine::new(predicate));
         async move {
             // Hold the sender on this stack frame so the receiver never fires while the future
-            // is alive — the sender drops naturally when the future returns or is cancelled.
+            // is alive (the sender drops naturally when the future returns or is canceled).
             let (_term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
             match tokio::time::timeout(timeout, consume_sync(subscription, visitor, term_sig_rx))
                 .await

@@ -7,11 +7,14 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Duration;
 use support::{BackendKind, DeliveryKind};
+use tokio_process_tools::visitors::collect::{CollectChunks, CollectChunksAsync};
+use tokio_process_tools::visitors::write::WriteChunks;
 use tokio_process_tools::{
-    AsyncChunkCollector, BroadcastOutputStream, Chunk, CollectedBytes, Consumer, Delivery, Next,
+    BroadcastOutputStream, Chunk, CollectedBytes, Consumable, Consumer, Delivery, Next,
     RawCollectionOptions, Replay, SingleSubscriberOutputStream, SinkWriteError,
     WriteCollectionOptions,
 };
+use unwrap_infallible::UnwrapInfallible;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChunkConsumerKind {
@@ -149,13 +152,15 @@ trait ChunkBenchStream {
     fn write_chunks(&self) -> Consumer<Result<support::CountingWrite, SinkWriteError>>;
 }
 
-struct AsyncChunkStatsCollector;
-
-impl AsyncChunkCollector<support::ChunkStats> for AsyncChunkStatsCollector {
-    async fn collect<'a>(&'a mut self, chunk: Chunk, stats: &'a mut support::ChunkStats) -> Next {
-        stats.observe(chunk.as_ref());
-        Next::Continue
-    }
+fn build_chunk_stats_visitor()
+-> CollectChunks<support::ChunkStats, impl FnMut(Chunk, &mut support::ChunkStats) + Send + 'static>
+{
+    CollectChunks::fold(
+        support::ChunkStats::default(),
+        |chunk: Chunk, stats: &mut support::ChunkStats| {
+            stats.observe(chunk.as_ref());
+        },
+    )
 }
 
 impl<D, R> ChunkBenchStream for SingleSubscriberOutputStream<D, R>
@@ -164,30 +169,37 @@ where
     R: Replay,
 {
     fn collect_chunk_stats(&self) -> Consumer<support::ChunkStats> {
-        self.collect_chunks(
-            support::ChunkStats::default(),
-            |chunk, stats: &mut support::ChunkStats| {
-                stats.observe(chunk.as_ref());
-            },
-        )
-        .expect("single-subscriber benchmark consumer should start")
+        self.consume(build_chunk_stats_visitor())
+            .expect("single-subscriber benchmark consumer should start")
     }
 
     fn collect_chunk_bytes(&self) -> Consumer<CollectedBytes> {
-        self.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
-            .expect("single-subscriber benchmark consumer should start")
+        self.consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
+        .expect("single-subscriber benchmark consumer should start")
     }
 
     fn collect_chunk_stats_async(&self) -> Consumer<support::ChunkStats> {
-        self.collect_chunks_async(support::ChunkStats::default(), AsyncChunkStatsCollector)
-            .expect("single-subscriber benchmark consumer should start")
+        self.consume_async(CollectChunksAsync::fold(
+            support::ChunkStats::default(),
+            |chunk: Chunk, stats: &mut support::ChunkStats| {
+                Box::pin(async move {
+                    stats.observe(chunk.as_ref());
+                    Next::Continue
+                })
+            },
+        ))
+        .expect("single-subscriber benchmark consumer should start")
     }
 
     fn write_chunks(&self) -> Consumer<Result<support::CountingWrite, SinkWriteError>> {
-        self.collect_chunks_into_write(
+        self.consume_async(WriteChunks::passthrough(
+            "chunk-bench",
             support::CountingWrite::default(),
             WriteCollectionOptions::fail_fast(),
-        )
+        ))
         .expect("single-subscriber benchmark consumer should start")
     }
 }
@@ -198,27 +210,38 @@ where
     R: Replay,
 {
     fn collect_chunk_stats(&self) -> Consumer<support::ChunkStats> {
-        self.collect_chunks(
-            support::ChunkStats::default(),
-            |chunk, stats: &mut support::ChunkStats| {
-                stats.observe(chunk.as_ref());
-            },
-        )
+        self.consume(build_chunk_stats_visitor())
+            .unwrap_infallible()
     }
 
     fn collect_chunk_bytes(&self) -> Consumer<CollectedBytes> {
-        self.collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        self.consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
+        .unwrap_infallible()
     }
 
     fn collect_chunk_stats_async(&self) -> Consumer<support::ChunkStats> {
-        self.collect_chunks_async(support::ChunkStats::default(), AsyncChunkStatsCollector)
+        self.consume_async(CollectChunksAsync::fold(
+            support::ChunkStats::default(),
+            |chunk: Chunk, stats: &mut support::ChunkStats| {
+                Box::pin(async move {
+                    stats.observe(chunk.as_ref());
+                    Next::Continue
+                })
+            },
+        ))
+        .unwrap_infallible()
     }
 
     fn write_chunks(&self) -> Consumer<Result<support::CountingWrite, SinkWriteError>> {
-        self.collect_chunks_into_write(
+        self.consume_async(WriteChunks::passthrough(
+            "chunk-bench",
             support::CountingWrite::default(),
             WriteCollectionOptions::fail_fast(),
-        )
+        ))
+        .unwrap_infallible()
     }
 }
 

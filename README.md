@@ -41,8 +41,7 @@ If `tokio::process::Command` already gives you enough control, this crate may ad
 
 ## Core model
 
-The library has three layers, and most of the configuration in this README is about the
-relationship between them:
+The library has three layers, and most of the configuration in this README is about the relationship between them:
 
 - A **`Process`** is a spawn configuration. `Process::new(command)` starts the chain, `.spawn()` returns a
   `ProcessHandle`.
@@ -53,191 +52,38 @@ relationship between them:
   output for later, a `wait_for_line()` that resolves on a match. Consumers are implemented through a visitor pattern,
   allowing for custom extensions to be written.
 
-Consumers attach after spawn, so anything the child writes before a consumer is in place is gone unless a replay policy
-retains it for late arrivals.
+Consumers can only attach *after* `spawn()` returns, but the child is already running by then and may have written
+output before the first consumer registers. A replay policy is what closes that gap: with replay enabled, every new
+subscription is delivered the retained history before live events, so even a consumer attached on the very next line
+sees the bytes that landed during the spawn-to-attach window. Without a replay policy the stream does not retain those
+early bytes (a synchronously-attached consumer may still see them by luck of scheduling; see the Replay axis below).
 
 A `ProcessHandle` is "armed" until it is successfully waited, terminated, killed, or explicitly excused with
 `must_not_be_terminated()`. Dropping an armed handle without one of those calls runs best-effort cleanup and then
-panics. Better to be loud than to silently leak children.
-See [Automatic termination on drop](#automatic-termination-on-drop) for the opt-out.
+panics. Better to be loud than to silently leak children. See
+[Automatic termination on drop](#automatic-termination-on-drop) for the opt-out.
 
 ## Quickstart
 
-Add to your `Cargo.toml`:
+Add `tokio-process-tools` to your `Cargo.toml` and ensure you are using a multithreaded runtime:
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.10.1"
+tokio-process-tools = "0.11.0"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
 ```
 
-The interactive-stdin example further down uses `tokio::io::AsyncWriteExt`, which requires the `io-util` Tokio feature
-in your own crate.
-
-The minimum viable spawn: run a command to completion with a deadline and check its exit status. `stream.discard()`
-routes the child's stdout and stderr to `/dev/null` at the OS level, so no pipe is allocated and no reader task runs in
-the parent. Use this when you only care about whether the process succeeded, not what it wrote.
+Spawn a child and wait for it to exit, collecting its stdout and stderr output as parsed lines while waiting,
+terminating the process the after 30s wait timeout gracefully, waiting at max 5s before falling back to an abrupt kill:
 
 ```rust,no_run
 use std::time::Duration;
 use tokio::process::Command;
-use tokio_process_tools::*;
-
-#[tokio::main]
-async fn main() {
-    let mut process = Process::new(Command::new("ls"))
-        .name(AutoName::program_only())
-        .stdout_and_stderr(|stream| stream.discard())
-        .spawn()
-        .expect("failed to spawn command");
-
-    let status = process
-        .wait_for_completion(Duration::from_secs(30))
-        .await
-        .unwrap()
-        .expect_completed("process should complete");
-
-    println!("exit status: {status:?}");
-}
-```
-
-A discarded stream still implements `OutputStream` (so `process.stdout()` and `process.stderr()` still return
-something), but it does not implement `TrySubscribable`: the consumer-attaching APIs (`wait_for_completion_with_output`,
-`inspect_lines`, `collect_lines`, etc.) are not in scope on a handle whose stream is discarded. If you later decide you
-do want to read the output, swap `discard()` for one of the streaming chains described in the next section.
-
-Code throughout this README uses `use tokio_process_tools::*;` to keep examples short; prefer named imports in
-application code. Byte sizes use the `NumBytes` type, and the `NumBytesExt` trait (re-exported at the crate root) lets
-you write `1.megabytes()`, `16.kilobytes()`, or `512.bytes()` on integer (usize) literals.
-
-## Choosing stream settings
-
-Each stdout/stderr stream is configured along five axes: backend, delivery, replay, collection, and buffering.
-
-**Backend: who consumes the stream?**
-
-- `broadcast()`: Allows for multiple concurrent consumers, e.g. logging plus a line waiter.
-- `single_subscriber()`: Exactly one consumer is allowed to be active at a time. A second consumer started while another
-  is still running fails immediately with `StreamConsumerError::ActiveConsumer`. Reach for this when you only ever read
-  the stream from one place at a time. It turns accidental fanout into a loud error at the point of mistake. Once a
-  consumer is dropped again, a new one can be registered. Just never two at any given time. This implementation may be
-  slightly more performant.
-- `discard()`: No consumption at all. The matching child stdio slot is set to `Stdio::null()`, so the OS drops the
-  bytes; no pipe is allocated and no reader task runs in the parent. The remaining axes (delivery, replay, buffering)
-  are skipped because they have nothing to act on. Reach for this when only the exit status matters; pair it with a
-  consumed stream on the other slot if you still want one stream's output (`.stdout(|s| s.discard()).stderr(|s|
-  s.broadcast()...)` is fine).
-
-**Delivery: what happens when a consumer can't keep up?**
-
-- `reliable_for_active_subscribers()`: When an active consumer's buffer fills, the child is paused (its next write
-  blocks) instead of dropping data. The guarantee is scoped to consumers that are *already attached*: a consumer that
-  arrives after the child has produced output gets nothing unless you also configure a replay policy. Use when
-  completeness of the stream / definitely receiving all output matters more than keeping the child unblocked.
-- `best_effort_delivery()`: Slow consumers may observe gaps. Line consumers drop the in-progress partial line and
-  resync at the next newline. Use when latency matters more than completeness. This never blocks the child.
-
-**Replay: what does a consumer attached after spawn see?**
-
-- `.no_replay()`: Live output only. A consumer that attaches after the child has already printed something will not
-  see it.
-- `.replay_last_bytes(...)` / `.replay_last_chunks(...)` / `.replay_all()`: The library retains output so a late
-  consumer can start from history. The first two cap retention. `.replay_all()` is unbounded and should only be used
-  for trusted output volume.
-
-The typical lifecycle for a long-running service is: spawn with a replay policy, attach any consumers you want, then
-call `seal_output_replay()` to release the retained history. The seal applies to *future* consumers: They start at live
-output. Consumers that were already attached when the seal happens are unaffected, and whatever the delivery policy
-guaranteed them is still there to read. The per-stream variants `seal_stdout_replay()` and `seal_stderr_replay()` cover
-the case where one stream's startup phase ends before the other's.
-
-**Collection: how much memory does the library hold?**
-
-Use bounded `LineCollectionOptions` / `RawCollectionOptions` for untrusted output. Reserve `TrustedUnbounded` for
-processes whose output volume is known and controlled. The bounded variants take a `CollectionOverflowBehavior` that
-decides what to keep when the cap is reached: `DropAdditionalData` (default) keeps the first-retained output and
-discards anything that arrives after the cap is hit, while `DropOldestData` keeps the newest output by evicting older
-retained data, which gives you a ring-buffer-shaped tail.
-
-**Buffering: how big a read, how deep a queue?**
-
-Every chain ends with two buffering knobs:
-
-- `.read_chunk_size(...)` is the size of each `read()` against the child's pipe. Smaller values let a consumer see
-  partial results from large bursts sooner and cap memory. Larger values reduce per-burst syscall and per-chunk
-  overhead.
-- `.max_buffered_chunks(...)` is the depth of the in-process queue between the reader task and the consumer. Larger
-  values absorb more bursty output before backpressure or dropping kicks in (depending on the delivery policy). Smaller
-  values cap memory.
-
-Pass `DEFAULT_READ_CHUNK_SIZE` and `DEFAULT_MAX_BUFFERED_CHUNKS` unless you have measured a reason to tune them. The
-defaults (16 KB and 128 chunks) are tuned for general-purpose streaming. Both knobs must be named at the spawn site:
-the spelled-out values keep the choice visible in code review and stop accidental mismatches between sites that all
-silently rely on a default.
-
-The async line-aware consumers (`inspect_lines_async`, `collect_lines_async`, `collect_lines_into_write`, and friends
-that take an `AsyncLineSink`) materialize every parsed line as an owned `String` before invoking the per-line callback.
-The synchronous line consumers can pass the line as `Cow::Borrowed` straight out of the chunk on the fast path, so they
-avoid the allocation. Prefer the synchronous flavor when per-line work is non-blocking; reach for the async flavor only
-when the per-line callback genuinely needs to `.await`.
-
-### Consumers
-
-tokio-process-tools provides the following consumers out of the box:
-
-- `inspect_lines` / `inspect_chunks` (and their `_async` variants) run a callback per item and discard the data.
-  Reach for these when only the side effect matters: forward to `tracing`, count occurrences, react to a milestone.
-- `collect_lines` / `collect_chunks` (and `_async` variants) retain output in memory for later inspection. Reach for
-  these when a test or caller wants to assert on what the child wrote *after* it has finished and
-  `wait_for_completion_with_output` doesn't fit.
-- `collect_lines_into_write` / `collect_chunks_into_write` (plus `_mapped` variants) forward output to an async
-  writer (a file, a TCP sink, anything `AsyncWrite`). `WriteCollectionOptions` controls writer-failure handling and
-  `LineWriteMode` controls whether parsed lines get the stripped `\n` reattached. See
-  [Stream output to a sink](#stream-output-to-a-sink) for an end-to-end example.
-
-See the [Custom consumer / stream visitor](#custom-consumer--stream-visitor) example for guidance on how to build your
-own consumers.
-
-### Consumer lifecycle
-
-Each `Consumer<S>` handle **owns the spawned task**. Dropping the handle drops the task, which cancels the consumer
-immediately. Bind it to a variable, e.g. `let _consumer = process.stdout().inspect_line(...)`, to silence the
-unused-result warning (if you don't intend to interact with the handle). The `#[must_use]` annotations on every
-consumer-creator is the compiler's reminder of this contract. If your process is long-lived, make sure to store consumer
-handles somewhere, so that they are not dropped.
-
-A `Consumer` exposes three ways to finish. The choice is a trade-off between recovering state (the writer, the
-collected output) and not hanging:
-
-- `wait()` lets the consumer drain naturally. It returns when the stream closes (the child exited and any retained
-  replay has been read out) or the visitor returned `Next::Break`. Use this when there is a natural endpoint, and you
-  want whatever the consumer produced; this is the path that gives you the writer back from a `collect_*_into_write`
-  consumer.
-- `cancel(timeout)` is the bounded cooperative-then-forceful shutdown. The consumer task is signaled to stop at the
-  next safe point. If it observes the cancellation and exits before `timeout` elapses, you get
-  `ConsumerCancelOutcome::Cancelled(sink)` with the sink preserved. If `timeout` elapses first, the task is aborted,
-  and you get `ConsumerCancelOutcome::Aborted` with the sink dropped. Pick the timeout based on how long the
-  consumer might legitimately need to flush.
-- `abort()` is unconditional forceful shutdown. The task's in-flight future is dropped, which means sinks and
-  writers are *not* returned (you cannot recover the file handle, the partially-collected `Vec`, etc.). Reach for
-  this when not getting stuck matters more than recovering state, and you do not want to pay any timeout at all.
-
-## Examples
-
-Patterns past the basic spawn-and-wait shown in the [Quickstart](#quickstart).
-
-### Wait and collect output
-
-Like the Quickstart spawn, but the stdout/stderr that appeared during the run is captured and returned. The collector
-here is attached inside the wait helper, after the child has already started producing output, which is why the stream
-is configured with `replay_last_bytes(...)`. Without that policy, anything the child wrote before the helper attached
-the collector would be lost (see [Core model](#core-model)). The wait timeout covers both process exit and the final
-drain of stdout/stderr.
-
-```rust,no_run
-use std::time::Duration;
-use tokio::process::Command;
-use tokio_process_tools::*;
+use tokio_process_tools::{
+    AutoName, CollectionOverflowBehavior, DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_OUTPUT_EOF_TIMEOUT,
+    DEFAULT_READ_CHUNK_SIZE, GracefulShutdown, LineCollectionOptions, LineOutputOptions, LineParsingOptions,
+    NumBytesExt, Process, ProcessOutput,
+};
 
 #[tokio::main]
 async fn main() {
@@ -246,7 +92,7 @@ async fn main() {
         .stdout_and_stderr(|stream| {
             stream
                 .single_subscriber()
-                .best_effort_delivery()
+                .lossy_without_backpressure()
                 .replay_last_bytes(1.megabytes())
                 .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
                 .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
@@ -254,28 +100,30 @@ async fn main() {
         .spawn()
         .expect("failed to spawn command");
 
-    let line_collection_options = LineCollectionOptions::Bounded {
-        max_bytes: 1.megabytes(),
-        max_lines: 1024,
-        overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
-    };
-    
     let ProcessOutput {
         status,
         stdout,
         stderr,
     } = process
-        .wait_for_completion_with_output(
-            Duration::from_secs(30),
-            LineOutputOptions {
-                line_parsing_options: LineParsingOptions::default(),
-                stdout_collection_options: line_collection_options,
-                stderr_collection_options: line_collection_options,
-            },
+        .wait_for_completion(Duration::from_secs(30))
+        .with_line_output(
+            DEFAULT_OUTPUT_EOF_TIMEOUT,
+            LineParsingOptions::default(),
+            LineOutputOptions::symmetric(LineCollectionOptions::Bounded {
+                max_bytes: 1.megabytes(),
+                max_lines: 1024,
+                overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
+            }),
+        )
+        .or_terminate(
+            GracefulShutdown::builder()
+                .unix_sigterm(Duration::from_secs(5))
+                .windows_ctrl_break(Duration::from_secs(5))
+                .build(),
         )
         .await
         .unwrap()
-        .expect_completed("process should complete");
+        .expect_completed("process should complete before timeout");
 
     println!("exit status: {status:?}");
     println!("stdout lines: {:?}", stdout.lines());
@@ -283,350 +131,206 @@ async fn main() {
 }
 ```
 
-Use `wait_for_completion_with_raw_output()` when the child's output is not UTF-8 line-oriented: binary blobs (image
-conversion, archive tools), framed protocols, or anything where line parsing would corrupt or lose bytes. The shape of
-the call is the same; substitute `RawOutputOptions` for `LineOutputOptions`, `RawCollectionOptions` for
-`LineCollectionOptions`, and read the result as `CollectedBytes { bytes, truncated }` on each stream. No
-`LineParsingOptions` is involved. `RawCollectionOptions` offers the same `Bounded { max_bytes, overflow_behavior }`
-and `TrustedUnbounded` variants as the line equivalent.
+The runnable examples under [`examples/`](examples/) cover the common shapes end-to-end. Each example file explains
+what it shows. Run any of them with `cargo run --example <name>`:
 
-### Wait for readiness from output
+| Example                                                    | What it shows                                                                                             |
+|------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|
+| [`collect_output_lines`](examples/collect_output_lines.rs) | Spawn, wait, collect stdout/stderr as parsed lines. The canonical "spawn + wait + collect" shape.         |
+| [`collect_output_bytes`](examples/collect_output_bytes.rs) | Same as above but for binary / non-line-oriented output.                                                  |
+| [`custom_visitor`](examples/custom_visitor.rs)             | Implement a custom `StreamVisitor` for requirements not fulfillable with the provided visitors.           |
+| [`discard_output`](examples/discard_output.rs)             | Run a child solely for its exit status, or capture one stream while discarding the other at the OS level. |
+| [`interactive_stdin`](examples/interactive_stdin.rs)       | Write to a child's stdin, close it to signal EOF, and collect the echoed output.                          |
+| [`process_naming`](examples/process_naming.rs)             | Shows different process name settings.                                                                    |
+| [`stream_to_file`](examples/stream_to_file.rs)             | Forward output to an `AsyncWrite` sink (here, a file on disk).                                            |
+| [`terminate_on_drop`](examples/terminate_on_drop.rs)       | Opt out of the panic-on-drop guard.                                                                       |
+| [`terminate_on_timeout`](examples/terminate_on_timeout.rs) | Cap the wait, force a graceful shutdown when it times out.                                                |
+| [`wait_for_readiness`](examples/wait_for_readiness.rs)     | Start a service and wait until it logs that it is ready, with logging running concurrently.               |
 
-The classic "start a service in an integration test and wait until it logs that it is ready" pattern. `wait_for_line()`
-is itself a stream consumer with a required timeout, so under `single_subscriber()` it competes with anything else
-reading the stream. Reach for `broadcast()` whenever readiness detection has to coexist with a logger. Pair it with
-replay retention so a waiter attached after spawn can still see startup lines, then `seal_output_replay()` to free that
-history once the service is up.
+## Choosing stream settings
 
-```rust,no_run
-use std::time::Duration;
-use tokio::process::Command;
-use tokio_process_tools::*;
+Each stdout/stderr stream is configured along five axes (backend, delivery, replay, collection, buffering) at spawn
+time. The runnable examples above show common combinations end-to-end; the per-axis reference below explains each knob
+on its own.
 
-#[tokio::main]
-async fn main() {
-    let mut process = Process::new(Command::new("my-web-server"))
-        .name("api")
-        .stdout_and_stderr(|stream| {
-            stream
-                .broadcast()
-                .reliable_for_active_subscribers()
-                .replay_last_bytes(1.megabytes())
-                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-        })
-        .spawn()
-        .expect("failed to spawn server");
+### Axes
 
-    let stdout = process.stdout();
+**Backend.** `broadcast()` for multiple concurrent consumers (e.g. logging plus a line waiter), `single_subscriber()`
+for one active consumer at a time (a second one fails with `StreamConsumerError::ActiveConsumer`; slightly faster, loud
+on accidental fanout), `discard()` to drop the bytes at the OS level via `Stdio::null()` (the remaining axes are
+skipped because they have nothing to act on).
 
-    let _logs = stdout.inspect_lines(
-        |line| {
-            eprintln!("{line}");
-            Next::Continue
-        },
-        LineParsingOptions::default(),
-    );
+**Delivery.** Both options name the trade-off in full: you pick what you get *and* what you pay.
+`reliable_with_backpressure()` keeps active subscribers gap-free by pausing the reader task when their buffer fills,
+which fills the kernel pipe and blocks the child's next write; the reliability is scoped to subscribers already
+attached at the time each chunk is produced, so a late attacher still depends on replay for earlier output.
+`lossy_without_backpressure()` never pauses the reader: when a slow subscriber's buffer fills, the chunk is dropped
+for that subscriber rather than blocking the child, and line consumers discard the in-progress partial line and
+resync at the next newline.
 
-    match stdout
-        .wait_for_line(
-            Duration::from_secs(30),
-            |line| line.contains("Server listening on"),
-            LineParsingOptions::default(),
-        )
-        .await
-    {
-        Ok(WaitForLineResult::Matched) => {}
-        Ok(WaitForLineResult::StreamClosed) => panic!("server exited before becoming ready"),
-        Ok(WaitForLineResult::Timeout) => panic!("server did not become ready in time"),
-        Err(err) => panic!("failed to read stdout: {err}"),
-    }
+**Replay.** Replay retains output the stream has already produced and delivers it to every new subscriber before live
+events resume. Its primary purpose is to close the spawn-to-attach window: the child is running by the time `spawn()`
+returns, so any consumer (even one attached on the very next line) is registered too late to observe the bytes the
+child wrote in between. The same buffer also lets a consumer that attaches much later (a postmortem collector, a
+freshly subscribed log viewer) pick up recent context instead of starting blind. Choose between `.no_replay()` (live
+only; the stream itself does not retain any history for late subscribers), `.replay_last_bytes(...)` /
+`.replay_last_chunks(...)` (capped retention), and `.replay_all()` (unbounded; trusted volume only). Long-running
+services typically spawn with a replay policy, attach consumers, then call `seal_output_replay()` (or per-stream
+`seal_stdout_replay()` / `seal_stderr_replay()`) to release retained history. The seal applies to *future* consumers;
+existing ones keep the snapshot they were given at attach time.
 
-    process.seal_output_replay();
+Prefer an explicit replay policy over relying on whatever the system pipe buffer happens to retain: the policy is
+specified in code and behaves the same across operating systems.
 
-    let _ = process.terminate(GracefulTimeouts::builder()
-        .unix((Duration::from_secs(3), Duration::from_secs(5)))
-        .windows(Duration::from_secs(8))
-        .build()).await;
-}
-```
+**Buffering.** `.read_chunk_size(...)` is the size of each `read()` against the child's pipe;
+`.max_buffered_chunks(...)` is the depth of the in-process queue between the reader task and the consumer. Pass
+`DEFAULT_READ_CHUNK_SIZE` (16 KB) and `DEFAULT_MAX_BUFFERED_CHUNKS` (128) unless you have measured a reason to tune.
+Both knobs must be named at the spawn site so the choice is visible in code review.
 
-### Interactive stdin
+**Collection.** Bounded `LineCollectionOptions` / `RawCollectionOptions` for untrusted output, `TrustedUnbounded` for
+known-volume sources. Bounded variants take a `CollectionOverflowBehavior`: `DropAdditionalData` (default) keeps the
+first-retained output and discards anything past the cap; `DropOldestData` keeps the newest output by evicting older
+data, giving a ring-buffer-shaped tail.
 
-Children always have stdin piped (there is no opt-out), but the library only flushes/closes the pipe when you ask.
-Calling `stdin().close()` lets a child observe EOF before any wait helper runs (some programs only finish on EOF, not
-on idle). Terminal waits and `kill()` close any still-open stdin automatically, so the manual close is only needed
-when the child must see EOF *before* the wait.
+## Visitors and Consumers
 
-`process.stdin()` returns a `&mut Stdin`, an enum with `Open(ChildStdin)` and `Closed` variants. `Stdin::as_mut()`
-projects that into `Option<&mut ChildStdin>`, returning `None` once the slot has transitioned to `Closed` (either
-explicitly via `stdin().close()` or implicitly because a wait helper or `kill()` has already cleaned it up). The
-example below pattern-matches with `if let Some(stdin) = process.stdin().as_mut()` for that reason. The `None` branch
-has no other failure mode in the stdin-is-always-piped contract.
+A streams output can be observed using a `StreamVisitor` / `AsyncStreamVisitor`.
 
-```rust,no_run
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
-use tokio_process_tools::*;
+`stream.consume(visitor)` (and `consume_async` for an async visitor) is the single entry point. The bundled visitor
+families under `tokio_process_tools::visitors` cover common requirements. Consult type-level docs for full information:
 
-#[tokio::main]
-async fn main() {
-    let line_collection = LineCollectionOptions::Bounded {
-        max_bytes: 1.megabytes(),
-        max_lines: 1024,
-        overflow_behavior: CollectionOverflowBehavior::DropAdditionalData,
-    };
+- `visitors::inspect` (`InspectChunks`, `InspectChunksAsync`, `InspectLines`, `InspectLinesAsync`): run a callback per
+  event and discard. Reach for these when only the side effect matters.
+- `visitors::collect` (`CollectChunks`, `CollectChunksAsync`, `CollectLines`, `CollectLinesAsync`): retain output in a
+  caller-supplied `Sink`, with `CollectedBytes` and `CollectedLines` as ready-made sinks. The `fold(sink, step)`
+  constructor reads at the call site like an explicit fold.
+- `visitors::write` (`WriteChunks`, `WriteLines`): forward into an async writer. `passthrough` for identity, `mapped`
+  to transform first. `WriteCollectionOptions` controls writer-failure handling; `LineWriteMode` controls whether
+  parsed lines get the stripped `\n` reattached.
+- `visitors::wait::WaitForLine`: break the parser the first time a predicate accepts a line. The backends'
+  `wait_for_line` helpers wrap this with a `tokio::time::timeout`.
 
-    let mut process = Process::new(Command::new("cat"))
-        .name(AutoName::program_only())
-        .stdout_and_stderr(|stream| {
-            stream
-                .single_subscriber()
-                .best_effort_delivery()
-                .replay_last_bytes(1.megabytes())
-                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-        })
-        .spawn()
-        .expect("failed to spawn command");
+The line-aware variants compose with `ParseLines` (e.g. `ParseLines::inspect(opts, f)`,
+`ParseLines::collect(opts, sink, f)`); see their rustdoc for the trait selection between the sync and async paths. The
+async line-aware variants pay one allocation per line because the parser borrow cannot be held across `.await`; prefer
+the synchronous flavor when the per-line callback is non-blocking.
 
-    if let Some(stdin) = process.stdin().as_mut() {
-        stdin.write_all(b"hello\n").await.unwrap();
-        stdin.write_all(b"world\n").await.unwrap();
-        stdin.flush().await.unwrap();
-    }
+See [`examples/custom_visitor.rs`](examples/custom_visitor.rs) for guidance on building your own visitor by
+implementing `StreamVisitor` or `AsyncStreamVisitor` directly.
 
-    process.stdin().close();
+### Consumer lifecycle
 
-    let output = process
-        .wait_for_completion_with_output(
-            Duration::from_secs(30),
-            LineOutputOptions {
-                line_parsing_options: LineParsingOptions::default(),
-                stdout_collection_options: line_collection,
-                stderr_collection_options: line_collection,
-            },
-        )
-        .await
-        .unwrap()
-        .expect_completed("process should complete");
+Each `Consumer<S>` owns its spawned task. Dropping the handle cancels the consumer immediately. Bind it at least to a
+variable (e.g. `let _consumer = stream.consume(...)`) to silence the `#[must_use]` warning when you do not intend to
+interact with the handle. For long-lived processes, store the handle somewhere so it is not dropped.
 
-    println!("stdout lines: {:?}", output.stdout.lines());
-}
-```
+A consumer exposes three terminal methods, trading off state recovery against promptness:
 
-### Stream output to a sink
+| Method            | Returns                                                                                                                                               | Use when                                                            |
+|-------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------|
+| `wait()`          | the visitor's output (e.g. the writer back from `WriteLines`) when the stream closes or the visitor returns `Next::Break`                             | there is a natural endpoint and you want what the consumer produced |
+| `cancel(timeout)` | `ConsumerCancelOutcome::Cancelled(sink)` if the task observes the cancellation in time, `ConsumerCancelOutcome::Aborted` if the timeout elapses first | bounded cooperative-then-forceful shutdown is acceptable            |
+| `abort()`         | nothing; the in-flight future is dropped, sinks and writers cannot be recovered                                                                       | not getting stuck matters more than recovering state                |
 
-When the child will produce more output than is reasonable to hold in memory (build tools, long-running servers in CI
-logs, or anything you want on disk rather than in `Vec<String>`), point a collector at an `AsyncWrite` sink instead.
-The example below tees stdout into a file. Parsed lines are written one per call, with `LineWriteMode::AppendLf`
-re-attaching the trailing newline that line parsing strips. `WriteCollectionOptions::log_and_continue()` keeps
-collection running if the file write ever fails (disk full, broken pipe to a piped writer, etc.); use `fail_fast()`
-instead when a sink failure should stop the collection.
+## Wait builder
 
-The collector is yours to drive. After the child exits the stream closes, the visitor drains, and `wait()` returns
-the file handle so you can flush or close it deterministically.
+`wait_for_completion(timeout)` returns a staged builder you `.await` to run. It allows to configure three orthogonal
+axes:
 
-This example needs the `fs` Tokio feature in your own crate, in addition to the features listed in the
-[Quickstart](#quickstart).
+- **The wait itself.** `wait_for_completion(timeout)` always closes any still-open stdin first, then waits for process
+  exit within `timeout`.
+- **Output collection.** None (default), `.with_line_output(eof_timeout, options)`, or `.with_raw_output(eof_timeout,
+  options)`. Line collection parses on the fly into a `Vec<String>`-style output; raw collection returns the bytes the
+  child wrote. Collect raw output when the process does not produce UTF-8 line-oriented data.
+- **Graceful termination.** None (default) or `.or_terminate(shutdown)`, which embeds the same configured
+  `GracefulShutdown` from [Graceful shutdown policy](#graceful-shutdown-policy). Gracefully terminates the process
+  should it not exit withing the timeout provided to `wait_for_completion`.
 
-```rust,no_run
-use std::time::Duration;
-use tokio::fs::File;
-use tokio::process::Command;
-use tokio_process_tools::*;
+`eof_timeout` (passed alongside output options) starts after the process has completed (or, with `.or_terminate(...)`,
+after cleanup termination has succeeded). It bounds the post-exit drain of stdout/stderr. The constant
+`DEFAULT_OUTPUT_EOF_TIMEOUT` (3 s) is a reasonable starting point. For trusted, bounded-by-construction output, both
+`LineCollectionOptions` and `RawCollectionOptions` have a `TrustedUnbounded` variant that opts out of memory caps.
 
-#[tokio::main]
-async fn main() {
-    let mut process = Process::new(Command::new("my-noisy-tool"))
-        .name(AutoName::program_only())
-        .stdout_and_stderr(|stream| {
-            stream
-                .broadcast()
-                .reliable_for_active_subscribers()
-                .no_replay()
-                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-        })
-        .spawn()
-        .expect("failed to spawn command");
+## Line parsing
 
-    let log_file = File::create("/tmp/output.log")
-        .await
-        .expect("failed to open log file");
+`LineParsingOptions` controls how chunks are split into lines, and `wait_for_line()` takes the same options so its
+matcher sees the same lines a collector would. The options cap a single line (`max_line_length`), pick what to do with
+overflow (`LineOverflowBehavior::DropAdditionalData` or `EmitAdditionalAsNewLines`), and optionally compact the parser's
+retained buffer capacity (`buffer_compaction_threshold`). See [`LineParsingOptions`] for the full per-field semantics,
+including the `NumBytes::MAX` opt-out for trusted unbounded line parsing.
 
-    let log_collector = process.stdout().collect_lines_into_write(
-        log_file,
-        LineParsingOptions::default(),
-        LineWriteMode::AppendLf,
-        WriteCollectionOptions::log_and_continue(),
-    );
+When chunks drop under `lossy_without_backpressure()`, line parsers conservatively discard the in-progress partial line and
+resynchronize at the next newline rather than splicing across the gap.
 
-    let _status = process
-        .wait_for_completion(Duration::from_secs(60))
-        .await
-        .unwrap()
-        .expect_completed("process should complete");
+## Manual process control
 
-    // Stream is closed now that the child has exited; the collector drains. The outer
-    // `Result` reflects consumer-infrastructure outcomes (task join, stream read), the
-    // inner one reflects whether the writer accepted every byte; with
-    // `log_and_continue()` write failures are logged so the inner result is `Ok` here.
-    let _log_file = log_collector.wait().await.unwrap().unwrap();
-}
-```
+When the wait-and-cleanup helpers do not fit, drive shutdown by hand: `send_interrupt_signal()` and
+`send_terminate_signal()` on Unix, `send_ctrl_break_signal()` on Windows, `terminate()` (escalation up to kill), and
+`kill()` (immediate). Each returns a typed `TerminationError` describing which step failed. The signal-send methods are
+idempotent against a child that has already exited: they reap the status and return `Ok(())` without sending a signal
+at a possibly-recycled PID.
 
-### Timeout and Cleanup
+## Process management
 
-For processes that may hang, `wait_for_completion_or_terminate()` rolls the "interrupt → terminate → kill"
-escalation into the wait so you don't have to sequence cleanup yourself. The three durations correspond to: how long
-to wait for a clean exit, how long to give the child after the interrupt signal, and how long to give it after the
-terminate signal before falling back to `kill()`.
+### Process naming
 
-```rust,no_run
-use std::time::Duration;
-use tokio::process::Command;
-use tokio_process_tools::*;
+A process name is required before stdout/stderr can be configured. The name appears in error messages and tracing
+fields, and the library refuses to spawn anonymous processes because anonymous failures are hard to debug. The default
+automatic name (`AutoName::program_only()`) captures only the program name and is safe for production. An explicit
+label (`"api-worker"`, `format!("agent-{id}")`) is still useful when you want a stable, human-chosen identifier so
+logs and metrics group cleanly across restarts. The richer `AutoName` variants (and `AutoNameSettings` opt-ins) that
+include arguments, environment variables, or the current directory will surface those values in error messages, so
+check redaction before reaching for them.
 
-#[tokio::main]
-async fn main() {
-    let mut process = Process::new(Command::new("potentially-hanging-process"))
-        .name(AutoName::program_only())
-        .stdout_and_stderr(|stream| {
-            stream
-                .broadcast()
-                .best_effort_delivery()
-                .no_replay()
-                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-        })
-        .spawn()
-        .expect("failed to spawn command");
+| Form               | How to construct                                                                  | Notes                                             |
+|--------------------|-----------------------------------------------------------------------------------|---------------------------------------------------|
+| Explicit           | `.name("api-worker")` / `.name(format!("agent-{id}"))`                            | Stable, human-chosen identifier.                  |
+| Safe automatic     | `.name(AutoName::program_only())`                                                 | Program name only; never leaks args, env, or cwd. |
+| Detailed automatic | `.name(AutoName::program_with_args())` / `program_with_env_and_args()` / `full()` | Includes args / env / cwd; check redaction.       |
+| Debug-formatted    | `.name(AutoName::Debug)`                                                          | Full `Command` Debug repr; may include internals. |
+| Custom automatic   | `.name(AutoNameSettings::builder()...build())`                                    | Opt into a specific subset of fields.             |
 
-    match process
-        .wait_for_completion_or_terminate(WaitForCompletionOrTerminateOptions {
-            wait_timeout: Duration::from_secs(30),
-            graceful_timeouts: GracefulTimeouts::builder()
-                .unix((Duration::from_secs(3), Duration::from_secs(5)))
-                .windows(Duration::from_secs(8))
-                .build(),
-        })
-        .await
-    {
-        Ok(WaitForCompletionOrTerminateResult::Completed(status)) => {
-            println!("completed with status: {status:?}");
-        }
-        Ok(WaitForCompletionOrTerminateResult::TerminatedAfterTimeout {
-            result,
-            timeout,
-        }) => {
-            println!("terminated after waiting {timeout:?}; status: {result:?}");
-        }
-        Err(err) => eprintln!("wait or cleanup failed: {err}"),
-    }
-}
-```
+See [`examples/process_naming.rs`](examples/process_naming.rs) for a runnable demonstration.
 
-### Custom consumer / stream visitor
+### Automatic termination on drop
 
-When the built-in `inspect_*` and `collect_*` consumers don't fit, implement [`StreamVisitor`] (sync) or
-[`AsyncStreamVisitor`] (async) directly and attach it with `consume_with` / `consume_with_async`. The cases that pay
-for a custom visitor are: maintaining state across chunks, reacting explicitly to gap notifications, or producing an
-output type the built-ins don't expose. If all you need is a side effect per chunk or per line, reach for
-`inspect_chunks` / `inspect_lines`; the closure form is simpler.
+A live `ProcessHandle` dropped without a successful terminal wait, `terminate()`, or `kill()` runs best-effort cleanup
+and then **panics**. The panic is deliberate: a silent leaked child is much harder to detect than a loud panic, and
+most "I forgot to wait" bugs would otherwise survive into production.
 
-Pick `StreamVisitor` when `on_chunk` can return without `.await`-ing (counters, in-memory state machines, channel
-`try_send`, simple synchronous I/O). Pick `AsyncStreamVisitor` when chunk handling needs to await (network sends,
-async writers, channel `send` with backpressure). Both traits require `Send + 'static`, and both return their final
-value via `into_output(self)` at the end of the consumer task's life.
+For long-lived processes that follow a service's own lifecycle, opt in to `.terminate_on_drop(...)` to swap the panic
+for an async termination attempt during drop. The signature mirrors `terminate(...)` and takes a `GracefulShutdown`.
+Drop runs the termination on Tokio's blocking pool, so `terminate_on_drop` requires a multithreaded Tokio runtime;
+under `#[tokio::test]` opt in to `flavor = "multi_thread"`. If the attempt itself fails, the inner handle still falls
+back to the panic path so the failure is not silent. See
+[`examples/terminate_on_drop.rs`](examples/terminate_on_drop.rs).
 
-The example below tracks how many bytes and chunks the stream produced, plus how many gap events the backend reported.
-`on_gap` is invoked when one or more chunks were dropped between the previous and next observed chunk (only possible
-under `best_effort_delivery()` overflow), and visitors that splice bytes across chunks should treat it as a reset
-signal.
+When the child genuinely needs to outlive the handle (a daemon spawned intentionally), call `must_not_be_terminated()`.
+That suppresses both the kill and the panic on drop. The library still drops its owned stdio, however: the child loses
+access to its piped stdin and the parent loses its stdout/stderr at the same moment. To keep the child *and* its
+`Stdin`/`Stdout`/`Stderr` together, use `ProcessHandle::into_inner()` to take ownership of all four.
 
-```rust,no_run
-use std::time::Duration;
-use tokio::process::Command;
-use tokio_process_tools::*;
+## Graceful shutdown policy
 
-#[derive(Debug, Default)]
-struct ChunkStats {
-    bytes: usize,
-    chunks: usize,
-    gaps: usize,
-}
+For service-like children on either platform,
+`GracefulShutdown::builder().unix_sigterm(Duration::from_secs(5)).windows_ctrl_break(Duration::from_secs(8)).build()`
+is a safe default. The rest of this section explains when to depart from that.
 
-impl StreamVisitor for ChunkStats {
-    type Output = ChunkStats;
+`terminate(...)` always takes a single [`GracefulShutdown`] argument; the signature is identical on every supported
+platform. `GracefulShutdown` itself carries platform-conditional fields, because the underlying graceful-shutdown model
+is platform-conditional:
 
-    fn on_chunk(&mut self, chunk: Chunk) -> Next {
-        self.bytes += chunk.as_ref().len();
-        self.chunks += 1;
-        Next::Continue
-    }
-
-    fn on_gap(&mut self) {
-        self.gaps += 1;
-    }
-
-    fn into_output(self) -> ChunkStats {
-        self
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    let mut process = Process::new(Command::new("ls"))
-        .name(AutoName::program_only())
-        .stdout_and_stderr(|stream| {
-            stream
-                .single_subscriber()
-                .best_effort_delivery()
-                .replay_last_bytes(1.megabytes())
-                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-        })
-        .spawn()
-        .expect("failed to spawn command");
-
-    let counter = process
-        .stdout()
-        .consume_with(ChunkStats::default())
-        .expect("no other consumer is attached yet");
-
-    let _status = process
-        .wait_for_completion(Duration::from_secs(30))
-        .await
-        .unwrap()
-        .expect_completed("process should complete");
-
-    let stats = counter.wait().await.unwrap();
-    println!(
-        "stdout: {} bytes across {} chunks ({} gaps)",
-        stats.bytes, stats.chunks, stats.gaps,
-    );
-}
-```
-
-A few lifecycle quirks worth knowing. `on_gap()` is synchronous in both traits because gap notifications carry no
-data to await on. `on_eof()` is skipped when `on_chunk` returned `Next::Break`, on the assumption that an
-early-break visitor already has its result; cancellation and abort skip `on_eof` for the same reason. Whichever exit
-path was taken, `into_output` always runs, so `Consumer::wait()` and `cancel()` always have a value to yield.
-
-### Termination timeouts
-
-`terminate(...)` always takes a single [`GracefulTimeouts`] argument; the signature is identical
-on every supported platform. `GracefulTimeouts` itself carries platform-conditional fields,
-because the underlying graceful-shutdown model is platform-conditional:
-
-- On Unix it carries `interrupt_timeout` and `terminate_timeout`, matching the 3-phase
-  `SIGINT` -> `SIGTERM` -> `SIGKILL` escalation.
-- On Windows it carries a single `graceful_timeout`, matching the 2-phase
+- On Unix it carries a [`UnixGracefulShutdown`] of one or more phases. Each phase pairs a signal (`SIGINT` or
+  `SIGTERM`) with a per-phase timeout. After the configured phases run, `SIGKILL` is the implicit forceful fallback.
+- On Windows it carries a [`WindowsGracefulShutdown`] with a single `timeout`, matching the 2-phase
   `CTRL_BREAK_EVENT` -> `TerminateProcess` shutdown.
 
-Each user-supplied graceful timeout bounds the post-signal wait of its phase:
+### Timeouts are upper bounds, not delays
+
+Each user-supplied graceful timeout bounds the post-signal wait of its phase. The wait future resolves the instant
+Tokio's SIGCHLD reaper observes the child exit, so handler-less children typically die in microseconds via the kernel's
+default disposition (`Term`) and the configured timeout never fires for them. The timeout only matters when the child
+has installed a handler that takes time to complete.
 
 | Scenario per phase                        | Time spent in this phase                |
 |-------------------------------------------|-----------------------------------------|
@@ -635,20 +339,31 @@ Each user-supplied graceful timeout bounds the post-signal wait of its phase:
 | Signal send fails                         | up to 100 ms fixed grace, then escalate |
 
 The 100 ms grace covers the small window where the child has already exited but Tokio's SIGCHLD reaper has not yet
-observed it (`EPERM` on macOS, `ESRCH` on Linux against a not-yet-reaped process group). It replaces - never adds to -
-the user timeout for a failed phase. Real permission denials still surface as a `TerminationError`.
+observed it; it replaces, never adds to, the user timeout for a failed phase. Real permission denials still surface as
+a [`TerminationError`]. See its rustdoc for the platform error codes involved.
 
 `Duration::from_secs(0)` disables the post-signal wait for that phase. The graceful signal is still sent; the call
-just collapses to "send the signal, do not wait, escalate immediately". On Unix that means each zero-duration phase
-sends its signal (`SIGINT`, then `SIGTERM`) and rolls straight on to the next, eventually arriving at `SIGKILL`. On
-Windows there is only the one phase, so a zero `graceful_timeout` reduces `terminate(...)` to "send
-`CTRL_BREAK_EVENT`, then immediately `TerminateProcess`". Prefer small but non-zero values (e.g. 100 ms to a few
-seconds) so well-behaved children can actually run their handlers.
+collapses to "send the signal, do not wait, escalate immediately". On Unix that means a zero-duration phase rolls
+straight on to the next phase (or to the implicit `SIGKILL` fallback). On Windows there is only the one phase, so
+`timeout = 0` reduces `terminate(...)` to "send `CTRL_BREAK_EVENT`, then immediately `TerminateProcess`". Prefer small
+non-zero values (100 ms to a few seconds) so well-behaved children can run their handlers.
 
-The termination machinery `terminate(...)`, `terminate_on_drop(...)`, `wait_for_completion_or_terminate(...)`,
-`WaitForCompletionOrTerminateOptions` and `GracefulTimeouts` is only available on Unix and Windows. On other targets
-the spawn, wait, output-collection APIs and kill remain available. Graceful-termination control is not made available
-until platform specific signals were implemented.
+### Which signal should I send?
+
+A child can only be gracefully shut down by a signal it has a handler installed for. Without a handler, the kernel's
+default disposition kills the child immediately on both `SIGINT` and `SIGTERM`. The library cannot pick a default
+correct for every child, but the choice is well-trodden:
+
+- **Default for unknown / service-like children: `.unix_sigterm(timeout)`.** `SIGTERM` is the standard Unix shutdown
+  signal: what `kill <pid>` (no args) sends, and what systemd, K8s, Docker, runit, and supervisord all use.
+- **Override to `.unix_sigint(timeout)` for the "I pressed Ctrl-C" semantics:** dev tools, REPLs, watch/reload runners,
+  task runners. This matches tokio's `tokio::signal::ctrl_c()` and Python's `KeyboardInterrupt`.
+
+Combining `SIGINT` and `SIGTERM` as escalation does NOT cover children with unknown signal handlers. Whichever signal
+the child does not handle kills it via kernel default during phase 1, and the second phase never runs. `from_phases`
+is for the narrow case where a single child handles BOTH signals as distinct cooperative stages (for example, `SIGINT`
+"begin draining" and `SIGTERM` "abort drain, exit immediately"). See [`UnixGracefulShutdown::from_phases`] for the full
+discussion.
 
 ### When termination fails
 
@@ -657,233 +372,35 @@ outside, so dropping would leak a process. Recover by retrying `terminate()`, es
 `must_not_be_terminated()` to accept the failure, or propagating the error and letting the panic-on-drop surface the
 leak.
 
-## Further APIs
-
-The Quickstart and Examples cover the common path. The rest of the surface is small but purposeful. Here is when you
-would reach for each piece.
-
-### Wait helper variants
-
-`wait_for_completion_with_output()` and friends come in four combinations: line vs. raw bytes, and plain wait vs.
-wait-or-terminate. Pick the variant that matches what you need:
-
-- Line vs. raw. Line collection parses on the fly and gives you `Vec<String>`-style output; raw collection gives you
-  the bytes the child actually wrote, which matters when output isn't UTF-8 line-oriented.
-- Plain vs. `_or_terminate`. The `_or_terminate` variants embed the same interrupt → terminate → kill escalation
-  shown in [Timeout and Cleanup](#timeout-and-cleanup), so a hung child still gets cleaned up before the helper
-  returns.
-
-Each plain wait helper returns a `WaitForCompletionResult` (`Completed` or `Timeout`); the `_or_terminate` variants
-return `WaitForCompletionOrTerminateResult` (`Completed` or `TerminatedAfterTimeout`). The examples above use
-`.expect_completed(msg)` to panic on the non-completed branch when a timeout would be a hard failure; reach for
-`.into_completed()` instead when the caller should handle both outcomes itself.
-
-When you need output collection *and* hung-child cleanup together, reach for the combined
-`wait_for_completion_with_output_or_terminate()` (or its `_with_raw_output_or_terminate()` sibling). It takes the
-same `LineOutputOptions` / `RawOutputOptions` you would pass to `_with_output`, plus the three durations you would
-pass to `_or_terminate`, with no extra ceremony.
-
-For trusted, bounded-by-construction output, both `LineCollectionOptions` and `RawCollectionOptions` have a
-`TrustedUnbounded` variant that opts out of memory caps.
-
-### Line parsing
-
-`LineParsingOptions` controls how chunks are split into lines and what happens at the limits.
-`wait_for_line()` takes the same `LineParsingOptions` so its matcher sees the same lines a collector would. Three
-fields:
-
-- `max_line_length` (default 16 KB) caps a single line. It must be greater than zero; pass `NumBytes::MAX` explicitly
-  to opt into unbounded line parsing on a trusted source. `LineOverflowBehavior` decides what happens past the cap:
-  `DropAdditionalData` discards bytes until the next newline (default), and `EmitAdditionalAsNewLines` splits the
-  long line into successive emitted lines so no data is lost.
-- `buffer_compaction_threshold` (default `None`) is a steady-state memory knob. The parser's two internal buffers
-  retain capacity for whichever was the largest line they have ever held; setting `Some(n)` forces buffers above `n`
-  to be released between lines. Useful with mostly-small lines and occasional outliers (especially under
-  `NumBytes::MAX`), counterproductive when typical lines are already near the threshold.
-
-When chunks drop under `best_effort_delivery()`, line parsers conservatively discard the in-progress partial line and
-resynchronize at the next newline rather than splicing across the gap. Callers should not assume that a missing
-newline after a gap means "the next line continues the previous one"; treat each post-gap line as fresh.
-
-### Manual process control
-
-When the wait-and-cleanup helpers do not fit, drive shutdown by hand: `send_interrupt_signal()` and
-`send_terminate_signal()` on Unix, `send_ctrl_break_signal()` on Windows, `terminate()` (escalation up to kill), and
-`kill()` (immediate). Each returns a typed `TerminationError` describing which step failed. The signal-send methods
-are idempotent against a child that has already exited: they reap the status and return `Ok(())` without sending a
-signal at a possibly-recycled PID. `seal_stdout_replay()`, `seal_stderr_replay()`, and `seal_output_replay()` end
-replay retention on one stream or both.
-
-## Process management
-
-### Process naming
-
-A process name is required before stdout/stderr can be configured. The name appears in error messages and tracing
-spans, and the library refuses to spawn anonymous processes because anonymous failures are hard to debug.
-
-For production workflows, prefer a stable explicit label (`"api-worker"`, `format!("agent-{id}")`) so logs and
-metrics group cleanly. The `AutoName` variants are convenient for ad-hoc and test code, but the variants that
-include arguments, environment, or current directory will surface those values in error messages, so only use them
-when those values are safe to log.
-
-Canonical naming forms:
-
-- **Explicit label:** `.name("api-worker")` or `.name(format!("agent-{id}"))`. The recommended default.
-- **Safe automatic:** `.name(AutoName::program_only())`. Uses just the program name; no arguments, environment, or
-  path are leaked into errors.
-- **Detailed automatic:** `.name(AutoName::program_with_args())`, `.name(AutoName::program_with_env_and_args())`,
-  `.name(AutoName::full())` (cwd + env + program + args), or `.name(AutoName::Debug)` for the full `Command` debug
-  representation. Useful in tests; check the redaction story before using in production.
-- **Custom automatic:** `.name(AutoNameSettings::builder()...build())` to opt into a specific subset of fields.
-
-```rust,no_run
-use std::time::Duration;
-use tokio::process::Command;
-use tokio_process_tools::*;
-
-#[tokio::main]
-async fn main() {
-    let id = 42;
-    let mut process = Process::new(Command::new("true"))
-        .name(format!("agent-{id}"))
-        .stdout_and_stderr(|stream| {
-            stream
-                .single_subscriber()
-                .best_effort_delivery()
-                .no_replay()
-                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-        })
-        .spawn()
-        .unwrap();
-
-    process
-        .wait_for_completion(Duration::from_secs(30))
-        .await
-        .unwrap()
-        .expect_completed("process should complete");
-}
-```
-
-### Automatic termination on drop
-
-A live `ProcessHandle` that is dropped without a successful terminal wait, `terminate()`, or `kill()` runs best-effort
-cleanup and then **panics**. The panic is deliberate: a silent leak of a child process is much harder to detect than a
-loud panic in tests, and most "I forgot to wait" bugs would otherwise survive into production.
-
-For long-lived processes that follow a service's own lifecycle, opting in to `.terminate_on_drop(...)` swaps the panic
-for an async termination attempt during drop. The signature mirrors `terminate(...)`: two timeouts on Unix, one on
-Windows.
-
-```rust,no_run
-use std::time::Duration;
-use tokio::process::Command;
-use tokio_process_tools::*;
-
-#[tokio::main]
-async fn main() {
-    let timeouts = GracefulTimeouts::builder()
-        .unix((Duration::from_secs(3), Duration::from_secs(5)))
-        .windows(Duration::from_secs(8))
-        .build();
-
-    let _process = Process::new(Command::new("some-command"))
-        .name(AutoName::program_only())
-        .stdout_and_stderr(|stream| {
-            stream
-                .broadcast()
-                .best_effort_delivery()
-                .no_replay()
-                .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-        })
-        .spawn()
-        .unwrap()
-        .terminate_on_drop(timeouts);
-}
-```
-
-`terminate_on_drop` requires a multithreaded Tokio runtime, because drop runs the termination attempt on Tokio's
-blocking pool. If the attempt itself fails, the inner handle still falls back to the panic path so the failure is not
-silent. Under `#[tokio::test]`, this means opting in to the multi-thread flavor:
-
-```rust,no_run
-#[tokio::test(flavor = "multi_thread")]
-async fn test() {
-    // ...
-}
-```
-
-When the child genuinely needs to outlive the handle (e.g. a daemon you spawned intentionally), call
-`must_not_be_terminated()`. That suppresses both the kill and the panic on drop. The library still drops its owned
-stdio, however, so the child loses access to its piped stdin and the parent loses access to its stdout/stderr at the
-same moment.
-
-To keep the child *and* its `Stdin`/`Stdout`/`Stderr` together, use `ProcessHandle::into_inner()` to take ownership of
-all four.
-
 ## Platform support
 
-The termination escalation is per-platform. Both platforms try a graceful step first (so the child can flush, close
-sockets, persist state) and only escalate to an unconditional kill if the child stays alive. Pick the timeouts you
-pass to `terminate()` and the `_or_terminate` helpers based on how long your child legitimately needs at each step.
-Each step targets the child's process group rather than its PID alone, so grandchildren are signaled with the
-leader; see [Subprocess trees](#subprocess-trees) for the spawn-time setup that makes this work.
+Termination escalation is per-platform. Every spawned child is set up as the leader of its own process group, so
+graceful and forceful steps reach the whole subtree rather than only the leaf.
 
-- **Linux/macOS:** 3-phase escalation. `SIGINT` → `SIGTERM` → `SIGKILL`, all delivered to the child's process group
-  via `killpg`. The two distinct graceful signals matter for real children: idiomatic async Rust binaries use
-  `tokio::signal::ctrl_c()` (which on Unix listens only for `SIGINT`), and Python child processes turn `SIGINT` into
-  a `KeyboardInterrupt` exception that runs `try/finally` cleanup, while `SIGTERM` falls through to the runtime's
-  default handler. `GracefulTimeouts` therefore exposes two `Duration`s on Unix
-  (`interrupt_timeout`, `terminate_timeout`).
-- **Windows:** 2-phase shutdown. `CTRL_BREAK_EVENT` to the console process group → `TerminateProcess` on the leader
-  as the kill fallback. Exactly one `CTRL_BREAK_EVENT` is sent. `GracefulTimeouts` therefore exposes a single
-  `graceful_timeout` on Windows.
-- **Other platforms:** the spawn, wait, output-collection, and `kill(...)` APIs remain available - `kill(...)`
-  forwards to Tokio's `Child::start_kill()` and works on every Tokio-supported target. Only the graceful-termination
-  machinery (`terminate(...)`, `terminate_on_drop(...)`, `wait_for_completion_or_terminate(...)`,
-  `WaitForCompletionOrTerminateOptions`, `GracefulTimeouts`, and `send_*_signal(...)`) is gated out, because there is
-  no OS primitive to deliver a graceful signal against. Best-effort cleanup on drop still goes through
-  `Child::start_kill()` too, so unawaited handles do not leak the child.
-
-The Windows path uses `CTRL_BREAK_EVENT` rather than `CTRL_C_EVENT` because `GenerateConsoleCtrlEvent` accepts only
-`CTRL_BREAK_EVENT` for nonzero process groups. `CTRL_C_EVENT` requires `dwProcessGroupId = 0`, which broadcasts to
-the entire console (including this parent process), so it is not usable for targeting a single child group. There is
-no separate `SIGINT` vs. `SIGTERM` distinction on Windows, so the manual signal-send surface is split per platform:
-`send_interrupt_signal()` and `send_terminate_signal()` exist only on Unix, and Windows exposes a single
-`send_ctrl_break_signal()`. The library never delivers two graceful events back to back during `terminate()`.
+- **Linux/macOS:** the child is spawned with `process_group(0)`, making its PID equal to its PGID. The configured
+  `UnixGracefulShutdown` dispatches its signals to the group via `killpg`, then `SIGKILL` runs as the implicit forceful
+  fallback. `send_interrupt_signal()`, `send_terminate_signal()`, `terminate()`, and `kill()` all target the group.
+- **Windows:** the child is spawned with `CREATE_NEW_PROCESS_GROUP` and additionally assigned to an anonymous Job
+  Object after spawn. `CTRL_BREAK_EVENT` is delivered to the console process group via `GenerateConsoleCtrlEvent`; the
+  forceful-kill fallback uses `TerminateJobObject`, which reaches the leader and every descendant the OS has
+  associated with the job. The Job Object is only assigned post-spawn (`tokio::process::Command` does not expose
+  `CREATE_SUSPENDED`), so grandchildren forked in the small window before assignment are not captured by the job and
+  behave like the explicitly-detached descendants below.
+- **Other:** spawn, wait, output-collection, and `kill(...)` remain available; `kill(...)` forwards to Tokio's
+  `Child::start_kill()`. The graceful-termination machinery (`terminate(...)`, `terminate_on_drop(...)`,
+  `.or_terminate(...)`, `GracefulShutdown`, `send_*_signal(...)`) is gated out because there is no OS primitive to
+  deliver a graceful signal against. Best-effort cleanup on drop still goes through `Child::start_kill()`, so un-awaited
+  handles do not leak the child.
 
 > **Windows interop note.** `tokio::signal::ctrl_c()` on Windows registers only for `CTRL_C_EVENT`; it does not catch
 > `CTRL_BREAK_EVENT`. A child Rust binary that listens only on the cross-platform `tokio::signal::ctrl_c()` will not
-> respond to this library's graceful step on Windows and will be terminated forcefully after `graceful_timeout`. To
-> interoperate, such a child should additionally listen on `tokio::signal::windows::ctrl_break()` (or use another
-> shutdown channel like a stdin sentinel, IPC, or a command protocol).
-
-A child that handles neither signal at all on either platform still needs its own graceful shutdown channel (stdin,
-IPC, or a command protocol) to participate in cooperative shutdown.
-
-Signal sends (`send_interrupt_signal` and `send_terminate_signal` on Unix, `send_ctrl_break_signal` on Windows, and
-the equivalent steps inside `terminate()`) check for an already-exited child first and return `Ok(())` without sending
-a signal in that case, so calling them after the child has died is harmless rather than racy.
-
-## Subprocess trees
-
-Every spawned child is set up as the leader of its own process group, so termination signals reach the whole subtree
-rather than only the child the library spawned. If your child fork-execs further processes (an `npm start` that
-launches `node`, a shell wrapper that launches the real binary, a build tool that fans out workers), the grandchildren
-inherit the group and are signaled along with the leader by `send_interrupt_signal()` / `send_terminate_signal()` on
-Unix, `send_ctrl_break_signal()` on Windows, `terminate()`, and `kill()`.
-
-- **Linux/macOS:** the child is spawned with `process_group(0)`, making its PID equal to its PGID. `SIGINT`, `SIGTERM`,
-  and `SIGKILL` are delivered with `killpg`, which targets the whole group.
-- **Windows:** the child is spawned with `CREATE_NEW_PROCESS_GROUP`. `CTRL_BREAK_EVENT` is delivered to that console
-  process group via `GenerateConsoleCtrlEvent`. The forceful-kill fallback (`TerminateProcess`) still targets the
-  leader, so a graceful interrupt window is the right place to let cooperative children unwind.
+> respond to this library's graceful step on Windows and will be terminated forcefully. Such a child should additionally
+> listen on `tokio::signal::windows::ctrl_break()` (or use a stdin sentinel / IPC / command protocol).
 
 A grandchild that explicitly detaches itself (`setsid`/`setpgid` to leave the group, double-fork into init, or its own
-job-object on Windows) is by definition outside the group and will not be signaled. That is correct: such children
-have asked to outlive their parent. If you do not own the leaf, and it leaks descendants of its own, run it under a
-small reaper (`tini` is the usual choice) so the descendants have a designated owner.
+`JobObject` on Windows) is by definition outside the group and will not be signaled. That is correct: such children have
+asked to outlive their parent. If you do not own the leaf, and it leaks descendants of its own, run it under a small
+reaper (`tini` is the usual choice).
 
 ## MSRV
 

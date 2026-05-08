@@ -2,7 +2,9 @@ use super::super::SingleSubscriberOutputStream;
 use super::common::{
     HangingChunkCollector, best_effort_no_replay_options, wait_for_no_active_consumer,
 };
-use crate::{ConsumerCancelOutcome, RawCollectionOptions};
+use crate::output_stream::Consumable;
+use crate::output_stream::visitors::collect::CollectChunks;
+use crate::{CollectedBytes, ConsumerCancelOutcome, RawCollectionOptions};
 use assertr::prelude::*;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -18,13 +20,19 @@ async fn drop_allows_later_collector() {
     );
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     drop(collector);
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
@@ -43,7 +51,10 @@ async fn cancel_allows_later_collector() {
     );
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     assert_that!(
         collector
@@ -57,7 +68,10 @@ async fn cancel_allows_later_collector() {
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
@@ -77,7 +91,7 @@ async fn wait_cancellation_releases_single_subscriber_claim() {
 
     let (entered_tx, entered_rx) = oneshot::channel();
     let collector = stream
-        .collect_chunks_async(Vec::new(), HangingChunkCollector::new(entered_tx))
+        .consume_async(HangingChunkCollector::new(entered_tx))
         .unwrap();
 
     write_half.write_all(b"ready").await.unwrap();
@@ -88,7 +102,10 @@ async fn wait_cancellation_releases_single_subscriber_claim() {
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
@@ -108,7 +125,7 @@ async fn cancel_aborts_hanging_async_collector_after_timeout() {
 
     let (entered_tx, entered_rx) = oneshot::channel();
     let collector = stream
-        .collect_chunks_async(Vec::new(), HangingChunkCollector::new(entered_tx))
+        .consume_async(HangingChunkCollector::new(entered_tx))
         .unwrap();
 
     write_half.write_all(b"ready").await.unwrap();
@@ -119,7 +136,10 @@ async fn cancel_aborts_hanging_async_collector_after_timeout() {
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);
@@ -139,7 +159,7 @@ async fn abort_releases_single_subscriber_claim() {
 
     let (entered_tx, entered_rx) = oneshot::channel();
     let collector = stream
-        .collect_chunks_async(Vec::new(), HangingChunkCollector::new(entered_tx))
+        .consume_async(HangingChunkCollector::new(entered_tx))
         .unwrap();
 
     write_half.write_all(b"ready").await.unwrap();
@@ -149,7 +169,10 @@ async fn abort_releases_single_subscriber_claim() {
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"later").await.unwrap();
     drop(write_half);

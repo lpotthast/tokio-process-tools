@@ -3,19 +3,15 @@
 use crate::WaitForLineResult;
 use crate::output_stream::config::StreamConfig;
 use crate::output_stream::consumer::driver::consume_sync;
-use crate::output_stream::consumer::{spawn_consumer_async, spawn_consumer_sync};
 use crate::output_stream::event::StreamEvent;
-use crate::output_stream::line::adapter::LineAdapter;
+use crate::output_stream::line::adapter::ParseLines;
 use crate::output_stream::policy::{
-    BestEffortDelivery, Delivery, DeliveryGuarantee, NoReplay, Replay, ReplayEnabled,
+    Delivery, DeliveryGuarantee, LossyWithoutBackpressure, NoReplay, Replay, ReplayEnabled,
     ReplayRetention,
 };
-use crate::output_stream::visitors::factories::impl_consumer_factories;
-use crate::output_stream::visitors::wait::WaitForLineSink;
-use crate::output_stream::{OutputStream, Subscription, TrySubscribable};
-use crate::{
-    AsyncStreamVisitor, Consumer, LineParsingOptions, NumBytes, StreamConsumerError, StreamVisitor,
-};
+use crate::output_stream::visitors::wait::WaitForLine;
+use crate::output_stream::{Consumable, OutputStream, Subscribable, Subscription};
+use crate::{LineParsingOptions, NumBytes, StreamConsumerError};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
@@ -26,18 +22,14 @@ use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-/// Per-backend return-type alias used by the [`impl_consumer_factories!`] macro to keep the
-/// macro body backend-agnostic. Single-subscriber factories may fail when a consumer is
-/// already active, so each factory return is wrapped in `Result<_, StreamConsumerError>`.
-type FactoryReturn<T> = Result<T, StreamConsumerError>;
-
 mod reader;
 mod state;
 mod subscription;
 
 use reader::{read_chunked_best_effort, read_chunked_reliable};
 use state::{ActiveSubscriber, ConfiguredShared};
-use subscription::SingleSubscriberSubscription;
+
+pub use subscription::SingleSubscriberSubscription;
 
 impl Subscription for mpsc::Receiver<StreamEvent> {
     fn next_event(&mut self) -> impl Future<Output = Option<StreamEvent>> + Send + '_ {
@@ -53,7 +45,7 @@ impl Subscription for mpsc::Receiver<StreamEvent> {
 /// single-consumer paths, but it is not a categorical throughput replacement for broadcast.
 /// If multiple concurrent consumers are required, use the
 /// `output_stream::backend::broadcast::BroadcastOutputStream`.
-pub struct SingleSubscriberOutputStream<D = BestEffortDelivery, R = NoReplay>
+pub struct SingleSubscriberOutputStream<D = LossyWithoutBackpressure, R = NoReplay>
 where
     D: Delivery,
     R: Replay,
@@ -121,6 +113,8 @@ where
     R: Replay,
 {
     /// Creates a new single-subscriber output stream from an async read stream and typed stream config.
+    #[doc(hidden)]
+    #[must_use]
     pub fn from_stream<S>(stream: S, stream_name: &'static str, options: StreamConfig<D, R>) -> Self
     where
         S: AsyncRead + Unpin + Send + 'static,
@@ -133,7 +127,7 @@ where
         let replay_retention = options.replay_retention();
 
         let stream_reader = match delivery_guarantee {
-            DeliveryGuarantee::BestEffort => tokio::spawn(read_chunked_best_effort(
+            DeliveryGuarantee::LossyWithoutBackpressure => tokio::spawn(read_chunked_best_effort(
                 stream,
                 Arc::clone(&shared),
                 active_rx,
@@ -141,7 +135,7 @@ where
                 replay_retention,
                 stream_name,
             )),
-            DeliveryGuarantee::ReliableForActiveSubscribers => tokio::spawn(read_chunked_reliable(
+            DeliveryGuarantee::ReliableWithBackpressure => tokio::spawn(read_chunked_reliable(
                 stream,
                 Arc::clone(&shared),
                 active_rx,
@@ -169,43 +163,6 @@ where
     #[must_use]
     pub fn replay_retention(&self) -> Option<ReplayRetention> {
         self.options.replay_retention()
-    }
-
-    fn take_subscription(&self) -> Result<SingleSubscriberSubscription, StreamConsumerError> {
-        let shared = &self.configured_shared;
-
-        let (sender, receiver) = mpsc::channel(self.options.max_buffered_chunks);
-        let (id, replay, terminal_event) = {
-            let mut state = shared
-                .state
-                .lock()
-                .expect("single-subscriber state poisoned");
-
-            if state.active_id.is_some() {
-                return Err(StreamConsumerError::ActiveConsumer {
-                    stream_name: self.name,
-                });
-            }
-
-            let replay = if state.replay_sealed || self.options.replay_retention().is_none() {
-                VecDeque::default()
-            } else {
-                state.snapshot_events()
-            };
-            let id = state.attach_subscriber();
-            shared
-                .active_tx
-                .send_replace(Some(Arc::new(ActiveSubscriber { id, sender })));
-            (id, replay, state.terminal_event.clone())
-        };
-
-        Ok(SingleSubscriberSubscription {
-            id,
-            shared: Arc::clone(shared),
-            replay,
-            terminal_event,
-            live_receiver: Some(receiver),
-        })
     }
 }
 
@@ -245,14 +202,58 @@ where
     }
 }
 
-impl<D, R> TrySubscribable for SingleSubscriberOutputStream<D, R>
+impl<D, R> Subscribable for SingleSubscriberOutputStream<D, R>
 where
     D: Delivery,
     R: Replay,
 {
-    fn try_subscribe(&self) -> Result<impl Subscription, StreamConsumerError> {
-        self.take_subscription()
+    type Subscription = SingleSubscriberSubscription;
+    type SubscribeError = StreamConsumerError;
+
+    fn try_subscribe(&self) -> Result<Self::Subscription, Self::SubscribeError> {
+        let shared = &self.configured_shared;
+
+        let (sender, receiver) = mpsc::channel(self.options.max_buffered_chunks);
+        let (id, replay, terminal_event) = {
+            let mut state = shared
+                .state
+                .lock()
+                .expect("single-subscriber state poisoned");
+
+            if state.active_id.is_some() {
+                return Err(StreamConsumerError::ActiveConsumer {
+                    stream_name: self.name,
+                });
+            }
+
+            let replay = if state.replay_sealed || self.options.replay_retention().is_none() {
+                VecDeque::default()
+            } else {
+                state.snapshot_events()
+            };
+            let id = state.attach_subscriber();
+            shared
+                .active_tx
+                .send_replace(Some(Arc::new(ActiveSubscriber { id, sender })));
+            (id, replay, state.terminal_event.clone())
+        };
+
+        Ok(SingleSubscriberSubscription {
+            id,
+            shared: Arc::clone(shared),
+            replay,
+            terminal_event,
+            live_receiver: Some(receiver),
+        })
     }
+}
+
+impl<D, R> Consumable for SingleSubscriberOutputStream<D, R>
+where
+    D: Delivery,
+    R: Replay,
+{
+    type Error = StreamConsumerError;
 }
 
 impl<D, R> SingleSubscriberOutputStream<D, R>
@@ -260,48 +261,6 @@ where
     D: Delivery,
     R: Replay,
 {
-    /// Tries to drive the provided synchronous [`StreamVisitor`] over this stream.
-    ///
-    /// Returns a [`Consumer`] that owns the spawned task driving the visitor. All built-in
-    /// `inspect_*`, `collect_*`, and `wait_for_line` factories construct a built-in visitor and
-    /// call this method internally.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer (single-subscriber
-    /// streams allow only one active consumer or line waiter at a time).
-    pub fn consume_with<V>(&self, visitor: V) -> Result<Consumer<V::Output>, StreamConsumerError>
-    where
-        V: StreamVisitor,
-    {
-        Ok(spawn_consumer_sync(
-            self.name(),
-            self.take_subscription()?,
-            visitor,
-        ))
-    }
-
-    /// Tries to drive the provided asynchronous [`AsyncStreamVisitor`] over this stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamConsumerError`] if the backend rejects the consumer.
-    pub fn consume_with_async<V>(
-        &self,
-        visitor: V,
-    ) -> Result<Consumer<V::Output>, StreamConsumerError>
-    where
-        V: AsyncStreamVisitor,
-    {
-        Ok(spawn_consumer_async(
-            self.name(),
-            self.take_subscription()?,
-            visitor,
-        ))
-    }
-
-    impl_consumer_factories!();
-
     /// Tries to wait for a line that matches the given predicate within `timeout`.
     ///
     /// # Errors
@@ -314,14 +273,14 @@ where
     pub fn wait_for_line(
         &self,
         timeout: Duration,
-        predicate: impl Fn(Cow<'_, str>) -> bool + Send + Sync + 'static,
+        predicate: impl Fn(Cow<'_, str>) -> bool + Send + 'static,
         options: LineParsingOptions,
     ) -> Result<
         impl Future<Output = Result<WaitForLineResult, crate::StreamReadError>> + Send + 'static,
         StreamConsumerError,
     > {
-        let subscription = self.take_subscription()?;
-        let visitor = LineAdapter::new(options, WaitForLineSink::new(predicate));
+        let subscription = self.try_subscribe()?;
+        let visitor = ParseLines::new(options, WaitForLine::new(predicate));
         Ok(async move {
             let (_term_sig_tx, term_sig_rx) = tokio::sync::oneshot::channel::<()>();
             match tokio::time::timeout(timeout, consume_sync(subscription, visitor, term_sig_rx))

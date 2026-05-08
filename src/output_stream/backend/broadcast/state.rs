@@ -338,7 +338,7 @@ pub(super) async fn append_event<D, R>(
     };
 
     match options.delivery_guarantee() {
-        DeliveryGuarantee::ReliableForActiveSubscribers => {
+        DeliveryGuarantee::ReliableWithBackpressure => {
             let mut stale_subscribers = Vec::new();
             for (id, sender) in subscribers {
                 let SubscriberSender::Reliable(sender) = sender else {
@@ -356,7 +356,7 @@ pub(super) async fn append_event<D, R>(
                 }
             }
         }
-        DeliveryGuarantee::BestEffort => {
+        DeliveryGuarantee::LossyWithoutBackpressure => {
             let mut stale_subscribers = Vec::new();
             for (id, sender) in subscribers {
                 let SubscriberSender::BestEffort(queue) = sender else {
@@ -385,8 +385,8 @@ mod tests {
 
     fn best_effort_options(
         retention: ReplayRetention,
-    ) -> StreamConfig<crate::BestEffortDelivery, ReplayEnabled> {
-        let builder = StreamConfig::builder().best_effort_delivery();
+    ) -> StreamConfig<crate::LossyWithoutBackpressure, ReplayEnabled> {
+        let builder = StreamConfig::builder().lossy_without_backpressure();
         match retention {
             ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
             ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
@@ -460,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn reliable_append_waits_for_slow_subscriber_capacity() {
         let options = StreamConfig::builder()
-            .reliable_for_active_subscribers()
+            .reliable_with_backpressure()
             .no_replay()
             .read_chunk_size(1.bytes())
             .max_buffered_chunks(1)

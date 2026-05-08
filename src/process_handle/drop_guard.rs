@@ -1,10 +1,25 @@
+use super::ProcessHandle;
 #[cfg(any(unix, windows))]
-use super::termination::GracefulTimeouts;
-use super::{DropMode, ProcessHandle};
+use super::termination::GracefulShutdown;
 use crate::output_stream::OutputStream;
 use crate::panic_on_drop::PanicOnDrop;
 #[cfg(any(unix, windows))]
 use crate::terminate_on_drop::TerminateOnDrop;
+
+/// Drop-time behavior selected by the lifecycle methods on [`ProcessHandle`].
+///
+/// The state machine has two reachable states because every public lifecycle entry point either
+/// keeps both safeguards on (`Armed`) or turns both off (`Disarmed`). There is no "panic only,
+/// no cleanup" or "cleanup only, no panic" combination: the panic guard makes sense only when
+/// paired with the kill that signals the misuse.
+#[derive(Debug)]
+pub(crate) enum DropMode {
+    /// Cleanup is attempted on drop and the panic guard fires when it does.
+    Armed { panic: PanicOnDrop },
+
+    /// Both cleanup and the panic guard are off. Drop is a no-op for this handle's lifecycle.
+    Disarmed,
+}
 
 impl<Stdout, Stderr> Drop for ProcessHandle<Stdout, Stderr>
 where
@@ -15,12 +30,12 @@ where
         match &self.drop_mode {
             DropMode::Armed { .. } => {
                 // We want users to explicitly await or terminate spawned processes.
-                // If not done so, kill the process group now to have some sort of last-resort
-                // cleanup. The panic guard will additionally raise a panic when this method
-                // returns, signalling the misuse loudly. Targeting the group (rather than the
-                // child's PID alone) catches any grandchildren the child has fork-execed, which
-                // is the same invariant the explicit `kill()` path upholds.
-                if let Err(err) = drop_kill(&mut self.child) {
+                // If not done so, kill the process group/job now to have some sort of
+                // last-resort cleanup. The panic guard will additionally raise a panic when this
+                // method returns, signaling the misuse loudly. Targeting the group/job (rather
+                // than the child's PID alone) catches any grandchildren the child has spawned,
+                // which is the same invariant the explicit `kill()` path upholds.
+                if let Err(err) = self.send_kill_signal() {
                     tracing::warn!(
                         process = %self.name,
                         error = %err,
@@ -98,21 +113,23 @@ where
         self.drop_mode = DropMode::Disarmed;
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_drop_armed(&self) -> bool {
+    /// Test-only inspector: whether the drop guard is currently armed.
+    #[doc(hidden)]
+    pub fn is_drop_armed(&self) -> bool {
         matches!(&self.drop_mode, DropMode::Armed { panic } if panic.is_armed())
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_drop_disarmed(&self) -> bool {
+    /// Test-only inspector: whether the drop guard has been disarmed.
+    #[doc(hidden)]
+    pub fn is_drop_disarmed(&self) -> bool {
         matches!(self.drop_mode, DropMode::Disarmed)
     }
 
     /// Wrap this process handle in a `TerminateOnDrop` instance, terminating the controlled process
     /// automatically when this handle is dropped.
     ///
-    /// `timeouts` carries the same per-platform graceful budget as [`Self::terminate`]; see
-    /// [`GracefulTimeouts`] for how to construct it.
+    /// `shutdown` carries the same per-platform graceful policy as [`Self::terminate`]; see
+    /// [`GracefulShutdown`] for how to construct it.
     ///
     /// **SAFETY: This only works when your code is running in a multithreaded tokio runtime!**
     ///
@@ -120,28 +137,11 @@ where
     /// configured) `must_be_terminated` logic, raising a panic when a process was neither awaited
     /// nor terminated before being dropped.
     #[cfg(any(unix, windows))]
-    pub fn terminate_on_drop(self, timeouts: GracefulTimeouts) -> TerminateOnDrop<Stdout, Stderr> {
+    pub fn terminate_on_drop(self, shutdown: GracefulShutdown) -> TerminateOnDrop<Stdout, Stderr> {
         TerminateOnDrop {
             process_handle: self,
-            timeouts,
+            shutdown,
         }
-    }
-}
-
-fn drop_kill(child: &mut tokio::process::Child) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        match child.id() {
-            Some(pid) => crate::signal::send_kill_to_process_group(pid),
-            None => child.start_kill(),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // Tokio's `Child::start_kill` works on every platform, so the Drop best-effort cleanup
-        // remains available even on targets where the rest of the termination machinery is gated
-        // out (anything that is neither `cfg(unix)` nor `cfg(windows)`).
-        child.start_kill()
     }
 }
 
@@ -151,176 +151,4 @@ fn armed_panic_guard() -> PanicOnDrop {
         "The process was not terminated.",
         "Successfully call `wait_for_completion`, `terminate`, or `kill`, or call `must_not_be_terminated` before the type is dropped!",
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::long_running_command;
-    use crate::{
-        BestEffortDelivery, BroadcastOutputStream, DEFAULT_MAX_BUFFERED_CHUNKS,
-        DEFAULT_READ_CHUNK_SIZE, NoReplay,
-    };
-    use assertr::prelude::*;
-    use std::time::Duration;
-
-    fn spawn_long_running_process()
-    -> ProcessHandle<BroadcastOutputStream<BestEffortDelivery, NoReplay>> {
-        crate::Process::new(long_running_command(Duration::from_secs(5)))
-            .name("long-running")
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn must_be_terminated_is_idempotent_when_already_armed() {
-        let mut process = spawn_long_running_process();
-
-        process.must_be_terminated();
-        assert_that!(process.is_drop_armed()).is_true();
-
-        process.kill().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn must_be_terminated_re_arms_safeguards_after_opt_out() {
-        let mut process = spawn_long_running_process();
-
-        process.must_not_be_terminated();
-        assert_that!(process.is_drop_disarmed()).is_true();
-
-        process.must_be_terminated();
-        assert_that!(process.is_drop_armed()).is_true();
-
-        process.kill().await.unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn must_not_be_terminated_lets_child_outlive_dropped_handle() {
-        use nix::errno::Errno;
-        use nix::sys::signal::{self, Signal};
-        use nix::sys::wait::waitpid;
-        use nix::unistd::Pid;
-
-        let mut process = spawn_long_running_process();
-        let pid = process.id().unwrap();
-
-        process.must_not_be_terminated();
-        assert_that!(process.is_drop_disarmed()).is_true();
-        drop(process);
-
-        let pid = Pid::from_raw(pid.cast_signed());
-        assert_that!(signal::kill(pid, None).is_ok()).is_true();
-
-        signal::kill(pid, Signal::SIGKILL).unwrap();
-        match waitpid(pid, None) {
-            Ok(_) | Err(Errno::ECHILD) => {}
-            Err(err) => {
-                assert_that!(err).fail(format_args!("waitpid failed: {err}"));
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn must_not_be_terminated_still_closes_stdin_on_drop() {
-        use nix::errno::Errno;
-        use nix::sys::wait::waitpid;
-        use nix::unistd::Pid;
-        use std::fs;
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().unwrap();
-        let output_file = temp_dir.path().join("stdin-result.txt");
-        let output_file = output_file.to_str().unwrap().replace('\'', "'\"'\"'");
-
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(format!("cat >/dev/null; printf eof > '{output_file}'"));
-
-        let mut process = crate::Process::new(cmd)
-            .name("sh")
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .unwrap();
-        let pid = Pid::from_raw(process.id().unwrap().cast_signed());
-
-        process.must_not_be_terminated();
-        drop(process);
-
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || waitpid(pid, None)),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        {
-            Ok(_) | Err(Errno::ECHILD) => {}
-            Err(err) => {
-                assert_that!(err).fail(format_args!("waitpid failed: {err}"));
-            }
-        }
-
-        assert_that!(fs::read_to_string(temp_dir.path().join("stdin-result.txt")).unwrap())
-            .is_equal_to("eof");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn must_not_be_terminated_still_closes_stdout_pipe_on_drop() {
-        use nix::errno::Errno;
-        use nix::sys::wait::waitpid;
-        use nix::unistd::Pid;
-
-        let mut cmd = tokio::process::Command::new("yes");
-        cmd.arg("tick");
-
-        let mut process = crate::Process::new(cmd)
-            .name("yes")
-            .stdout_and_stderr(|stream| {
-                stream
-                    .broadcast()
-                    .best_effort_delivery()
-                    .no_replay()
-                    .read_chunk_size(DEFAULT_READ_CHUNK_SIZE)
-                    .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
-            })
-            .spawn()
-            .unwrap();
-        let pid = Pid::from_raw(process.id().unwrap().cast_signed());
-
-        process.must_not_be_terminated();
-        drop(process);
-
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || waitpid(pid, None)),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        {
-            Ok(_) | Err(Errno::ECHILD) => {}
-            Err(err) => {
-                assert_that!(err).fail(format_args!("waitpid failed: {err}"));
-            }
-        }
-    }
 }

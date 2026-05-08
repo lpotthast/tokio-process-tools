@@ -1,19 +1,26 @@
-//! User-replaceable convenience layer: built-in
-//! [`StreamVisitor`](crate::StreamVisitor) and [`AsyncStreamVisitor`](crate::AsyncStreamVisitor)
-//! implementations plus the factory macro that wires them as inherent methods on each backend.
+//! Bundled [`StreamVisitor`](crate::StreamVisitor) and
+//! [`AsyncStreamVisitor`](crate::AsyncStreamVisitor) implementations covering the most common
+//! consumption patterns.
 //!
-//! `consume_with(my_visitor)` is enough to use the library; everything in this module is sugar
-//! for the common cases. Each submodule corresponds to one family of visitors:
-//! - [`collect`] retains observed output in a sink (`Vec`, `CollectedBytes`, `CollectedLines`, ...).
-//! - [`inspect`] observes output without retaining it.
-//! - [`write`] forwards observed output to an `AsyncWrite` sink.
-//! - [`wait`] watches for a single matching line and returns.
+//! `consume(my_visitor)` / `consume_async(my_visitor)` on any
+//! [`Consumable`](crate::Consumable) stream is the only entry point. Construct one of the
+//! visitors below (or your own) and pass it. Each submodule corresponds to one family:
 //!
-//! [`factories`] holds the `impl_consumer_factories!` macro that emits the `inspect_*` /
-//! `collect_*` inherent methods on each backend.
+//! - [`crate::visitors::collect`] retains observed output in a sink (`CollectedBytes`,
+//!   `CollectedLines`, or any user [`Sink`](crate::Sink)).
+//! - [`crate::visitors::inspect`] observes output without retaining it.
+//! - [`crate::visitors::write`] forwards observed output to an `AsyncWrite` sink.
+//! - [`crate::visitors::wait`] watches for a single matching line and returns whether it was
+//!   seen.
 
-pub(crate) mod collect;
-pub(crate) mod factories;
-pub(crate) mod inspect;
-pub(crate) mod wait;
-pub(crate) mod write;
+/// Visitors that retain observed output in a sink.
+pub mod collect;
+
+/// Visitors that observe output without retaining it.
+pub mod inspect;
+
+/// Visitor that waits for a single matching line.
+pub mod wait;
+
+/// Visitors that forward observed output to an async writer.
+pub mod write;

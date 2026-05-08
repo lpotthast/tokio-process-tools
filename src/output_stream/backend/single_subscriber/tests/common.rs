@@ -1,10 +1,11 @@
 use super::super::SingleSubscriberOutputStream;
 use super::super::state::ConfiguredShared;
-use crate::AsyncChunkCollector;
+use crate::AsyncStreamVisitor;
 use crate::output_stream::event::{Chunk, StreamEvent};
 use crate::output_stream::policy::{Delivery, Replay};
 use crate::{Next, NumBytes};
 use crate::{NumBytesExt, ReplayRetention, StreamConfig};
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -20,7 +21,7 @@ pub(super) fn best_effort_no_replay_options_with(
     max_buffered_chunks: usize,
 ) -> StreamConfig {
     StreamConfig::builder()
-        .best_effort_delivery()
+        .lossy_without_backpressure()
         .no_replay()
         .read_chunk_size(read_chunk_size)
         .max_buffered_chunks(max_buffered_chunks)
@@ -29,8 +30,8 @@ pub(super) fn best_effort_no_replay_options_with(
 
 pub(super) fn reliable_replay_options(
     replay_retention: ReplayRetention,
-) -> StreamConfig<crate::ReliableDelivery, crate::ReplayEnabled> {
-    let builder = StreamConfig::builder().reliable_for_active_subscribers();
+) -> StreamConfig<crate::ReliableWithBackpressure, crate::ReplayEnabled> {
+    let builder = StreamConfig::builder().reliable_with_backpressure();
     match replay_retention {
         ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
         ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
@@ -104,13 +105,17 @@ impl HangingChunkCollector {
     }
 }
 
-impl AsyncChunkCollector<Vec<u8>> for HangingChunkCollector {
-    async fn collect<'a>(&'a mut self, _chunk: Chunk, _seen: &'a mut Vec<u8>) -> Next {
+impl AsyncStreamVisitor for HangingChunkCollector {
+    type Output = ();
+
+    fn on_chunk(&mut self, _chunk: Chunk) -> impl Future<Output = Next> + Send + '_ {
         if let Some(entered_tx) = self.entered_tx.take() {
             entered_tx.send(()).unwrap();
         }
-        std::future::pending::<Next>().await
+        std::future::pending::<Next>()
     }
+
+    fn into_output(self) {}
 }
 
 pub(super) struct PendingWrite {

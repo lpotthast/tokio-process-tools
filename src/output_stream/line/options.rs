@@ -34,14 +34,13 @@ pub struct LineParsingOptions {
     /// When reached, further data won't be appended to the current line.
     /// The line will be emitted in its current state.
     ///
-    /// **Must be greater than zero** for any line-consuming visitor (`inspect_lines`,
-    /// `collect_lines`, `wait_for_line`, `collect_lines_into_write`, `collect_lines_into_vec`).
+    /// **Must be greater than zero** for any line-consuming visitor built via
+    /// [`ParseLines`](crate::ParseLines) (and the backends' `wait_for_line` helpers).
     /// Constructing such a consumer with `max_line_length = 0` panics. If you want effectively
-    /// unbounded line parsing — i.e. accept arbitrarily long lines from a trusted source —
-    /// pass [`NumBytes::MAX`] explicitly instead of zero. Remember that a malicious or
-    /// misbehaving stream that writes endless data without a line break would otherwise hold
-    /// memory until the process runs out: the explicit `MAX` makes that decision visible at
-    /// the call site.
+    /// unbounded line parsing, i.e. accept arbitrarily long lines from a trusted source, pass
+    /// [`NumBytes::MAX`] explicitly instead of zero. Remember that a malicious or misbehaving
+    /// stream that writes endless data without a line break would otherwise hold memory until
+    /// the process runs out: the explicit `MAX` makes that decision visible at the call site.
     ///
     /// Defaults to [`DEFAULT_MAX_LINE_LENGTH`].
     pub max_line_length: NumBytes,
@@ -76,9 +75,11 @@ pub struct LineParsingOptions {
     /// setting if max consumption is not an issue on your system.
     ///
     /// Compaction reduces the parser's *steady-state* memory after outliers; it does not change
-    /// the peak. Peak memory is bounded by [`max_line_length`](Self::max_line_length) regardless
-    /// of this setting. Compaction is also best-effort: a partially-buffered line that has not
-    /// yet finished may briefly retain over-threshold capacity until the line completes.
+    /// the peak. Peak per-parser memory is roughly `2 ×
+    /// `[`max_line_length`](Self::max_line_length) regardless of this setting (the in-progress
+    /// line and the most-recently emitted line each retain capacity). Compaction is also
+    /// best-effort: a partially-buffered line that has not yet finished may briefly retain
+    /// over-threshold capacity until the line completes.
     ///
     /// Defaults to `None`.
     pub buffer_compaction_threshold: Option<NumBytes>,
@@ -99,9 +100,8 @@ impl Default for LineParsingOptions {
 pub(crate) fn assert_max_line_length_non_zero(options: &LineParsingOptions) {
     assert!(
         options.max_line_length.bytes() > 0,
-        "LineParsingOptions::max_line_length must be greater than zero. \
-         If you want effectively unbounded line parsing, pass `NumBytes::MAX` (or another \
-         large explicit value) — zero is never a valid configuration for line-consuming \
-         visitors."
+        "LineParsingOptions::max_line_length must be greater than zero. If you want effectively \
+        unbounded line parsing, pass `NumBytes::MAX` (or another large explicit value). Zero is \
+        never a valid configuration for line-consuming visitors."
     );
 }

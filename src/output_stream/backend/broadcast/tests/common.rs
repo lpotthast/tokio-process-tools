@@ -9,8 +9,8 @@
 use super::super::BroadcastOutputStream;
 use crate::output_stream::policy::{Delivery, Replay};
 use crate::{
-    BestEffortDelivery, NumBytes, NumBytesExt, ReliableDelivery, ReplayEnabled, ReplayRetention,
-    StreamConfig,
+    LossyWithoutBackpressure, NumBytes, NumBytesExt, ReliableWithBackpressure, ReplayEnabled,
+    ReplayRetention, StreamConfig,
 };
 use bytes::Bytes;
 use std::io;
@@ -26,7 +26,8 @@ pub(super) fn default_stream_sizing() -> (NumBytes, usize) {
     (8.bytes(), 2)
 }
 
-pub(super) fn best_effort_no_replay_options() -> StreamConfig<BestEffortDelivery, crate::NoReplay> {
+pub(super) fn best_effort_no_replay_options()
+-> StreamConfig<LossyWithoutBackpressure, crate::NoReplay> {
     let (read_chunk_size, max_buffered_chunks) = default_stream_sizing();
     best_effort_no_replay_options_with(read_chunk_size, max_buffered_chunks)
 }
@@ -34,16 +35,17 @@ pub(super) fn best_effort_no_replay_options() -> StreamConfig<BestEffortDelivery
 pub(super) fn best_effort_no_replay_options_with(
     read_chunk_size: NumBytes,
     max_buffered_chunks: usize,
-) -> StreamConfig<BestEffortDelivery, crate::NoReplay> {
+) -> StreamConfig<LossyWithoutBackpressure, crate::NoReplay> {
     StreamConfig::builder()
-        .best_effort_delivery()
+        .lossy_without_backpressure()
         .no_replay()
         .read_chunk_size(read_chunk_size)
         .max_buffered_chunks(max_buffered_chunks)
         .build()
 }
 
-pub(super) fn reliable_no_replay_options() -> StreamConfig<ReliableDelivery, crate::NoReplay> {
+pub(super) fn reliable_no_replay_options() -> StreamConfig<ReliableWithBackpressure, crate::NoReplay>
+{
     let (read_chunk_size, max_buffered_chunks) = default_stream_sizing();
     reliable_no_replay_options_with(read_chunk_size, max_buffered_chunks)
 }
@@ -51,9 +53,9 @@ pub(super) fn reliable_no_replay_options() -> StreamConfig<ReliableDelivery, cra
 pub(super) fn reliable_no_replay_options_with(
     read_chunk_size: NumBytes,
     max_buffered_chunks: usize,
-) -> StreamConfig<ReliableDelivery, crate::NoReplay> {
+) -> StreamConfig<ReliableWithBackpressure, crate::NoReplay> {
     StreamConfig::builder()
-        .reliable_for_active_subscribers()
+        .reliable_with_backpressure()
         .no_replay()
         .read_chunk_size(read_chunk_size)
         .max_buffered_chunks(max_buffered_chunks)
@@ -62,7 +64,7 @@ pub(super) fn reliable_no_replay_options_with(
 
 pub(super) fn reliable_options(
     replay_retention: ReplayRetention,
-) -> StreamConfig<ReliableDelivery, ReplayEnabled> {
+) -> StreamConfig<ReliableWithBackpressure, ReplayEnabled> {
     let (read_chunk_size, max_buffered_chunks) = default_stream_sizing();
     reliable_options_with(replay_retention, read_chunk_size, max_buffered_chunks)
 }
@@ -71,8 +73,8 @@ pub(super) fn reliable_options_with(
     replay_retention: ReplayRetention,
     read_chunk_size: NumBytes,
     max_buffered_chunks: usize,
-) -> StreamConfig<ReliableDelivery, ReplayEnabled> {
-    let builder = StreamConfig::builder().reliable_for_active_subscribers();
+) -> StreamConfig<ReliableWithBackpressure, ReplayEnabled> {
+    let builder = StreamConfig::builder().reliable_with_backpressure();
     match replay_retention {
         ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
         ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),
@@ -85,7 +87,7 @@ pub(super) fn reliable_options_with(
 
 pub(super) fn best_effort_options(
     replay_retention: ReplayRetention,
-) -> StreamConfig<BestEffortDelivery, ReplayEnabled> {
+) -> StreamConfig<LossyWithoutBackpressure, ReplayEnabled> {
     let (read_chunk_size, max_buffered_chunks) = default_stream_sizing();
     best_effort_options_with(replay_retention, read_chunk_size, max_buffered_chunks)
 }
@@ -94,8 +96,8 @@ pub(super) fn best_effort_options_with(
     replay_retention: ReplayRetention,
     read_chunk_size: NumBytes,
     max_buffered_chunks: usize,
-) -> StreamConfig<BestEffortDelivery, ReplayEnabled> {
-    let builder = StreamConfig::builder().best_effort_delivery();
+) -> StreamConfig<LossyWithoutBackpressure, ReplayEnabled> {
+    let builder = StreamConfig::builder().lossy_without_backpressure();
     match replay_retention {
         ReplayRetention::LastChunks(chunks) => builder.replay_last_chunks(chunks),
         ReplayRetention::LastBytes(bytes) => builder.replay_last_bytes(bytes),

@@ -18,8 +18,9 @@ use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
 use tokio_process_tools::{
-    BestEffortDelivery, BroadcastOutputStream, DEFAULT_MAX_BUFFERED_CHUNKS, NoReplay, NumBytesExt,
-    ReliableDelivery, ReplayEnabled, SingleSubscriberOutputStream, StreamConfig,
+    BroadcastOutputStream, DEFAULT_MAX_BUFFERED_CHUNKS, LossyWithoutBackpressure, NoReplay,
+    NumBytesExt, ReliableWithBackpressure, ReplayEnabled, SingleSubscriberOutputStream,
+    StreamConfig,
 };
 
 pub const BENCH_STREAM_NAME: &str = "bench";
@@ -311,7 +312,7 @@ pub fn line_stats(chunks: &Payload) -> LineStats {
 pub fn single_stream_best_effort<R>(
     reader: R,
     read_chunk_size: usize,
-) -> SingleSubscriberOutputStream<BestEffortDelivery, NoReplay>
+) -> SingleSubscriberOutputStream<LossyWithoutBackpressure, NoReplay>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -319,7 +320,7 @@ where
         reader,
         BENCH_STREAM_NAME,
         StreamConfig::builder()
-            .best_effort_delivery()
+            .lossy_without_backpressure()
             .no_replay()
             .read_chunk_size(read_chunk_size.bytes())
             .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)
@@ -331,7 +332,7 @@ where
 pub fn single_stream_reliable<R>(
     reader: R,
     read_chunk_size: usize,
-) -> SingleSubscriberOutputStream<ReliableDelivery, NoReplay>
+) -> SingleSubscriberOutputStream<ReliableWithBackpressure, NoReplay>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -339,7 +340,7 @@ where
         reader,
         BENCH_STREAM_NAME,
         StreamConfig::builder()
-            .reliable_for_active_subscribers()
+            .reliable_with_backpressure()
             .no_replay()
             .read_chunk_size(read_chunk_size.bytes())
             .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)
@@ -351,7 +352,7 @@ where
 pub fn broadcast_stream_best_effort<R>(
     reader: R,
     read_chunk_size: usize,
-) -> BroadcastOutputStream<BestEffortDelivery, NoReplay>
+) -> BroadcastOutputStream<LossyWithoutBackpressure, NoReplay>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -359,7 +360,7 @@ where
         reader,
         BENCH_STREAM_NAME,
         StreamConfig::builder()
-            .best_effort_delivery()
+            .lossy_without_backpressure()
             .no_replay()
             .read_chunk_size(read_chunk_size.bytes())
             .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)
@@ -371,7 +372,7 @@ where
 pub fn broadcast_stream_reliable<R>(
     reader: R,
     read_chunk_size: usize,
-) -> BroadcastOutputStream<ReliableDelivery, NoReplay>
+) -> BroadcastOutputStream<ReliableWithBackpressure, NoReplay>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -379,7 +380,7 @@ where
         reader,
         BENCH_STREAM_NAME,
         StreamConfig::builder()
-            .reliable_for_active_subscribers()
+            .reliable_with_backpressure()
             .no_replay()
             .read_chunk_size(read_chunk_size.bytes())
             .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)
@@ -391,7 +392,7 @@ where
 pub fn broadcast_stream_best_effort_replay<R>(
     reader: R,
     read_chunk_size: usize,
-) -> BroadcastOutputStream<BestEffortDelivery, ReplayEnabled>
+) -> BroadcastOutputStream<LossyWithoutBackpressure, ReplayEnabled>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -399,7 +400,7 @@ where
         reader,
         BENCH_STREAM_NAME,
         StreamConfig::builder()
-            .best_effort_delivery()
+            .lossy_without_backpressure()
             .replay_all()
             .read_chunk_size(read_chunk_size.bytes())
             .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)
@@ -411,7 +412,7 @@ where
 pub fn broadcast_stream_reliable_replay<R>(
     reader: R,
     read_chunk_size: usize,
-) -> BroadcastOutputStream<ReliableDelivery, ReplayEnabled>
+) -> BroadcastOutputStream<ReliableWithBackpressure, ReplayEnabled>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -419,7 +420,7 @@ where
         reader,
         BENCH_STREAM_NAME,
         StreamConfig::builder()
-            .reliable_for_active_subscribers()
+            .reliable_with_backpressure()
             .replay_all()
             .read_chunk_size(read_chunk_size.bytes())
             .max_buffered_chunks(THROUGHPUT_MAX_BUFFERED_CHUNKS)

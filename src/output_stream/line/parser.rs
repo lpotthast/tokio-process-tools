@@ -1,7 +1,7 @@
 //! Stateful line parser that splits arbitrary byte chunks into lines.
 //!
-//! The parser exposes one primitive — [`LineParser::next_line`] — that both the sync and async
-//! sides of [`LineAdapter`](super::adapter::LineAdapter) drive. A single state machine handles
+//! The parser exposes one primitive ([`LineParser::next_line`]) that both the sync and async
+//! sides of [`ParseLines`](super::adapter::ParseLines) drive. A single state machine handles
 //! the chunk-spanning, max-line-length, and gap cases for both paths.
 
 use super::options::{LineOverflowBehavior, LineParsingOptions};
@@ -69,7 +69,7 @@ impl LineParser {
     /// The returned [`Cow`] borrows from the chunk slice when the line fits entirely in this
     /// call and no partial line was already buffered (zero-allocation fast path), and borrows
     /// from the parser's internal emitted-line slot otherwise. Either way, drop the `Cow`
-    /// before the next call — the borrow checker enforces this through the `&'a mut self`
+    /// before the next call. The borrow checker enforces this through the `&'a mut self`
     /// signature.
     pub fn next_line<'a, 'b>(
         &'a mut self,
@@ -156,7 +156,7 @@ impl LineParser {
 
     /// Flushes any unterminated trailing line at EOF.
     ///
-    /// Returns `None` when there is nothing to flush — the buffer is empty, or the parser is
+    /// Returns `None` when there is nothing to flush: the buffer is empty, or the parser is
     /// in `DiscardUntilNewline` mode (a gap or overflow truncation is still draining and the
     /// buffered remainder is conservatively dropped). Otherwise returns the buffered line as a
     /// [`Cow`] borrowing from the parser's emitted-line slot.
@@ -179,7 +179,7 @@ impl LineParser {
     /// `self.line_buffer` is intentionally **only** replaced when empty: a non-empty `line_buffer`
     /// holds partial-line bytes accumulated from earlier chunks of the in-progress line, and we
     /// must not drop those bytes mid-line. As a consequence, an over-sized `line_buffer` that
-    /// happens to carry a small partial line stays pinned until the in-progress line emits — at
+    /// happens to carry a small partial line stays pinned until the in-progress line emits, at
     /// which point swap-and-clear in `emit_buffered_line` rebalances the two slots and the next
     /// `next_line` call reclaims the excess. The peak memory bound (`2 × max_line_length`) is the
     /// same whether or not compaction is enabled; compaction only improves the steady-state
@@ -205,7 +205,7 @@ impl LineParser {
     /// cleared (length to 0, capacity retained) so the next line accumulates without
     /// allocating. Both buffers therefore behave as high-water-mark caches: each can grow up
     /// to `LineParsingOptions::max_line_length` and stays at that size for the parser's
-    /// lifetime — no per-line allocator churn after the warm-up.
+    /// lifetime. No per-line allocator churn after the warm-up.
     ///
     /// The bytes live in `self.emitted` until the next emission swaps them out, which is
     /// exactly long enough for the returned `Cow` to remain valid until the caller drops it.
@@ -754,7 +754,7 @@ mod tests {
             let options = unbounded_options(None);
 
             // Swap-and-clear ping-pongs capacity between the two buffers each emission, so
-            // the meaningful invariant is on the *larger* of the two — not on either buffer
+            // the meaningful invariant is on the *larger* of the two, not on either buffer
             // individually. The larger of the two is what bounds the next-line cost: as long
             // as it stays >= 200 bytes, no reallocation is needed when a 200-byte line shows
             // up again.
@@ -795,7 +795,7 @@ mod tests {
             // get re-emitted on its own; the assertion below catches that.
             let options = unbounded_options(Some(4.bytes()));
 
-            // Feed a partial line — no newline yet, so it stays buffered.
+            // Feed a partial line; no newline yet, so it stays buffered.
             let mut bytes: &[u8] = b"abcdefgh";
             assert_that!(parser.next_line(&mut bytes, options).is_none()).is_true();
             assert_that!(parser.line_buffer.len()).is_equal_to(8);

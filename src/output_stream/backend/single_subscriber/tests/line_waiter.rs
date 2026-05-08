@@ -1,6 +1,8 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::{best_effort_no_replay_options, wait_for_no_active_consumer};
-use crate::{LineParsingOptions, RawCollectionOptions, WaitForLineResult};
+use crate::output_stream::Consumable;
+use crate::output_stream::visitors::collect::CollectChunks;
+use crate::{CollectedBytes, LineParsingOptions, RawCollectionOptions, WaitForLineResult};
 use assertr::prelude::*;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -26,7 +28,10 @@ async fn timeout_allows_later_collector() {
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"ready\n").await.unwrap();
     drop(write_half);

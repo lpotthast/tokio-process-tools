@@ -14,32 +14,44 @@ pub trait Delivery:
     fn guarantee(self) -> DeliveryGuarantee;
 }
 
-/// Best-effort stream delivery marker.
+/// Lossy stream delivery marker that never applies backpressure to the child.
 ///
-/// Slow active consumers may observe gaps or dropped output when bounded buffers overflow.
+/// **Mechanism:** The reader task keeps draining the child's pipe regardless of consumer pace. When
+/// a subscriber's buffer fills, the chunk is dropped for that subscriber rather than pausing the
+/// child.
+///
+/// **Cost:** Slow active consumers may observe gaps or dropped output. Line-aware consumers
+/// discard the in-progress partial line and resync at the next newline rather than splicing across
+/// the gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BestEffortDelivery;
+pub struct LossyWithoutBackpressure;
 
-impl sealed::DeliverySealed for BestEffortDelivery {}
+impl sealed::DeliverySealed for LossyWithoutBackpressure {}
 
-impl Delivery for BestEffortDelivery {
+impl Delivery for LossyWithoutBackpressure {
     fn guarantee(self) -> DeliveryGuarantee {
-        DeliveryGuarantee::BestEffort
+        DeliveryGuarantee::LossyWithoutBackpressure
     }
 }
 
-/// Reliable active-subscriber stream delivery marker.
+/// Reliable stream delivery marker that applies backpressure to the child to keep active
+/// subscribers gap-free.
 ///
-/// Active consumers apply backpressure when their buffers are full. Consumers that attach later
-/// still depend on replay settings for earlier output.
+/// **Mechanism:** When an active subscriber's buffer is full, the reader task waits before reading
+/// more from the child's pipe. The kernel pipe then fills and the child's next write blocks. This
+/// is the cost paid for reliability.
+///
+/// **Scope:** The guarantee applies only to subscribers that are *currently attached* when each
+/// chunk is produced. Subscribers that attach later do not retroactively receive earlier chunks
+/// from this delivery policy; that is what the replay axis is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReliableDelivery;
+pub struct ReliableWithBackpressure;
 
-impl sealed::DeliverySealed for ReliableDelivery {}
+impl sealed::DeliverySealed for ReliableWithBackpressure {}
 
-impl Delivery for ReliableDelivery {
+impl Delivery for ReliableWithBackpressure {
     fn guarantee(self) -> DeliveryGuarantee {
-        DeliveryGuarantee::ReliableForActiveSubscribers
+        DeliveryGuarantee::ReliableWithBackpressure
     }
 }
 
@@ -99,14 +111,22 @@ impl Replay for ReplayEnabled {
 }
 
 /// Runtime delivery behavior used by typed stream modes.
+///
+/// The two variants describe the same trade-off as the typed [`LossyWithoutBackpressure`] and
+/// [`ReliableWithBackpressure`] markers. Active subscribers either get every chunk at the cost of
+/// pausing the child when their buffer is full, or they tolerate dropped chunks so the child is
+/// never blocked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryGuarantee {
-    /// Keep reading output and emit gaps or drop output for slow consumers when bounded buffers
-    /// overflow.
-    BestEffort,
+    /// Keep reading output and drop chunks for slow subscribers when bounded buffers overflow.
+    /// The child is never blocked by consumer pace.
+    LossyWithoutBackpressure,
 
-    /// Wait for active consumers before reading more output when bounded buffers are full.
-    ReliableForActiveSubscribers,
+    /// Wait for active subscribers before reading more output when bounded buffers are full. The
+    /// child's next write blocks once the kernel pipe fills. The reliability scope is limited to
+    /// subscribers attached at the time each chunk is produced; late attachers depend on the
+    /// replay axis for earlier output.
+    ReliableWithBackpressure,
 }
 
 /// Replay history retained by replay-enabled streams.

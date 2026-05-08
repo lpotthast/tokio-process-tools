@@ -2,20 +2,23 @@ use super::super::BroadcastOutputStream;
 use super::common::{
     best_effort_options_with, line_collection_options, reliable_options, wait_for_bytes_ingested,
 };
+use crate::output_stream::Consumable;
 use crate::output_stream::event::StreamEvent;
 use crate::output_stream::event::tests::StreamEventAssertions;
+use crate::output_stream::line::adapter::ParseLines;
 use crate::{
-    BestEffortDelivery, LineParsingOptions, Next, NumBytesExt, ReplayEnabled, ReplayRetention,
-    StreamConfig, WaitForLineResult,
+    CollectedLines, LineParsingOptions, LossyWithoutBackpressure, Next, NumBytesExt, ReplayEnabled,
+    ReplayRetention, StreamConfig, Subscribable, WaitForLineResult,
 };
 use assertr::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use unwrap_infallible::UnwrapInfallible;
 
 fn best_effort_replay_options(
     max_buffered_chunks: usize,
-) -> StreamConfig<BestEffortDelivery, ReplayEnabled> {
+) -> StreamConfig<LossyWithoutBackpressure, ReplayEnabled> {
     best_effort_options_with(ReplayRetention::All, 1.bytes(), max_buffered_chunks)
 }
 
@@ -106,7 +109,7 @@ async fn explicit_replay_after_seal_ignores_history_retained_for_active_subscrib
         "custom",
         reliable_options(ReplayRetention::All),
     );
-    let _active = stream.subscribe();
+    let _active = stream.try_subscribe().unwrap_infallible();
 
     write_half.write_all(b"old\n").await.unwrap();
     write_half.flush().await.unwrap();
@@ -130,8 +133,13 @@ async fn active_subscribers_still_receive_unread_tail_data_after_seal() {
         "custom",
         reliable_options(ReplayRetention::All),
     );
-    let collector =
-        stream.collect_lines_into_vec(LineParsingOptions::default(), line_collection_options());
+    let collector = stream
+        .consume(ParseLines::collect(
+            LineParsingOptions::default(),
+            CollectedLines::new(),
+            CollectedLines::line_collector(line_collection_options()),
+        ))
+        .unwrap_infallible();
 
     write_half.write_all(b"tail\n").await.unwrap();
     drop(write_half);
@@ -152,13 +160,15 @@ async fn waiter_created_before_seal_can_match_replayed_startup_line() {
     );
     let logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let logs_in_task = Arc::clone(&logs);
-    let _logger = stream.inspect_lines(
-        move |line| {
-            logs_in_task.lock().unwrap().push(line.into_owned());
-            Next::Continue
-        },
-        LineParsingOptions::default(),
-    );
+    let _logger = stream
+        .consume(ParseLines::inspect(
+            LineParsingOptions::default(),
+            move |line| {
+                logs_in_task.lock().unwrap().push(line.into_owned());
+                Next::Continue
+            },
+        ))
+        .unwrap_infallible();
 
     write_half.write_all(b"ready\n").await.unwrap();
     write_half.flush().await.unwrap();
@@ -180,7 +190,7 @@ async fn slow_best_effort_replay_subscriber_observes_gap_then_newer_live_data() 
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream =
         BroadcastOutputStream::from_stream(read_half, "custom", best_effort_replay_options(2));
-    let mut subscriber = stream.subscribe();
+    let mut subscriber = stream.try_subscribe().unwrap_infallible();
 
     write_half.write_all(b"abcde").await.unwrap();
     write_half.flush().await.unwrap();
@@ -201,7 +211,7 @@ async fn best_effort_replay_delivers_terminal_after_pending_gap() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream =
         BroadcastOutputStream::from_stream(read_half, "custom", best_effort_replay_options(1));
-    let mut subscriber = stream.subscribe();
+    let mut subscriber = stream.try_subscribe().unwrap_infallible();
 
     write_half.write_all(b"ab").await.unwrap();
     drop(write_half);
@@ -220,13 +230,13 @@ async fn late_best_effort_replay_subscriber_receives_retained_history_after_acti
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream =
         BroadcastOutputStream::from_stream(read_half, "custom", best_effort_replay_options(1));
-    let _slow_active_subscriber = stream.subscribe();
+    let _slow_active_subscriber = stream.try_subscribe().unwrap_infallible();
 
     write_half.write_all(b"abc").await.unwrap();
     write_half.flush().await.unwrap();
     wait_for_bytes_ingested(&stream, 3).await;
 
-    let mut late_subscriber = stream.subscribe();
+    let mut late_subscriber = stream.try_subscribe().unwrap_infallible();
     assert_recv_chunk(late_subscriber.recv().await, b"a");
     assert_recv_chunk(late_subscriber.recv().await, b"b");
     assert_recv_chunk(late_subscriber.recv().await, b"c");

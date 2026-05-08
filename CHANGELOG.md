@@ -7,6 +7,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-08
+
+### Added
+
+- `UnixGracefulShutdown`, `UnixGracefulPhase`, `UnixGracefulSignal`, and `WindowsGracefulShutdown`.
+- Convenience shortcuts on `GracefulShutdownBuilder`: `unix_sigterm(d)`, `unix_sigint(d)`, `windows_ctrl_break(d)`.
+- `DEFAULT_OUTPUT_EOF_TIMEOUT`, the default post-termination grace period for output collectors to observe EOF.
+- `ProcessHandle::name()` accessor returning the process name configured at spawn time.
+- `LineOutputOptions::symmetric(LineCollectionOptions)` and `RawOutputOptions::symmetric(RawCollectionOptions)`
+  convenience constructors for the common case where stdout and stderr share the same collection options.
+- An `examples/` directory with self-contained runnable examples covering output collection, stdin usage, custom
+  visitors, process naming, streaming to a file, termination and readiness detection.
+- New ergonomic visitor constructors to keep call sites short: `CollectChunks::fold(sink, step)`,
+  `CollectChunksAsync::fold(sink, collector)`, `ParseLines::inspect(opts, f)` / `ParseLines::inspect_async(opts, f)` /
+  `ParseLines::collect(opts, sink, f)` / `ParseLines::collect_async(opts, sink, c)`,
+  `WriteChunks::passthrough(name, writer, opts)` /`WriteChunks::mapped(name, writer, opts, mapper)`,
+  `WriteLines::passthrough(name, writer, opts, mode)`, `CollectedBytes::collector(opts)` and
+  `CollectedLines::line_collector(opts)` for the closure halves.
+
+### Fixed
+
+- **Windows:** `kill()` and the forceful-kill fallback inside `terminate()` now reach the entire spawned process tree
+  via a Windows Job Object (`AssignProcessToJobObject` + `TerminateJobObject`). Previously these paths called
+  `tokio::process::Child::start_kill()`, which only invokes `TerminateProcess` on the leader's PID and orphaned any
+  grandchildren the child had spawned. The graceful `CTRL_BREAK_EVENT` step in `terminate()` already reached the
+  console process group; only the forceful step had this gap. The JobObject is created without
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so `into_inner()` and `must_not_be_terminated()` continue to allow the child
+  to outlive the dropped handle.
+- Fixed stale rustdoc on `ProcessHandle::stdout` / `stderr` claiming concurrent single-subscriber consumers panic.
+  They already returned a `StreamConsumerError::ActiveConsumer` error instead.
+- Fixed a contradiction in `LineParsingOptions::buffer_compaction_threshold` rustdoc: peak per-parser memory is
+  roughly `2 × max_line_length`, not bounded by `max_line_length`. The doc now states the `~2x` factor consistently.
+
+### Changed
+
+- **Breaking:** Renamed the delivery axis so each option encodes both the guarantee and the cost it pays:
+  `reliable_for_active_subscribers()` is now `reliable_with_backpressure()` and `best_effort_delivery()` is now
+  `lossy_without_backpressure()`. The marker types follow: `ReliableDelivery` -> `ReliableWithBackpressure`,
+  `BestEffortDelivery` -> `LossyWithoutBackpressure`. The `DeliveryGuarantee` enum variants follow as well:
+  `ReliableForActiveSubscribers` -> `ReliableWithBackpressure`, `BestEffort` -> `LossyWithoutBackpressure`. No
+  semantics change. Existing call sites pick the same backend behavior under the new names. Migration is a mechanical
+  rename across spawn-time configuration sites.
+- **Breaking:** Renamed `GracefulTimeouts` to `GracefulShutdown` and replaced its flat `Duration` fields with
+  `unix: UnixGracefulShutdown` and `windows: WindowsGracefulShutdown`. Renamed `GracefulTimeoutsBuilder` to
+  `GracefulShutdownBuilder`; its `.unix(...)` and `.windows(...)` setters now take the new sequence types. The
+  `both(d)` helper has been removed. The prior fixed `SIGINT` -> `SIGTERM` -> `SIGKILL` behavior was not actually
+  defensive against heterogeneous children: pick `unix_sigterm(d)` for service-like children (recommended) or
+  `unix_sigint(d)` for CLI-style children, and reach for `unix(UnixGracefulShutdown::from_phases([...]))` only for the
+  rare cooperative-protocol case. See the [`UnixGracefulShutdown`] rustdoc and the README "What signal should I send?"
+  section for the rationale.
+- **Breaking:** Fused the six `wait_for_completion*` helpers on `ProcessHandle` into a single staged builder.
+  `wait_for_completion(timeout)` now returns a type-state enabled `WaitForCompletion`. Chain
+  `.with_line_output(eof_timeout, line_parsing_options, options)` or `.with_raw_output(eof_timeout, options)` for
+  output collection and/or `.or_terminate(shutdown)` for graceful cleanup on timeout, then `.await` the builder (it
+  implements `IntoFuture`). Output configuration must come before `.or_terminate(...)`; each axis can be configured
+  at most once. The separate `eof_timeout: Duration` parameter bounds the post-termination stdout/stderr EOF drain.
+- **Breaking:** `LineOutputOptions` no longer carries `LineParsingOptions` as a field. Parsing options are now passed
+  separately to `wait_for_completion(...).with_line_output(eof_timeout, line_parsing_options, options)`.
+- **Breaking:** On Windows, `Process::spawn` can now fail with the new `SpawnError::JobAttachmentFailed` variant when
+  the post-spawn `CreateJobObjectW`, `OpenProcess`, or `AssignProcessToJobObject` call fails. The just-spawned child
+  is killed before the error is returned so it is not leaked.
+- **Breaking:** Flattened `TerminationAttemptError` from `phase: TerminationAttemptPhase` plus
+  `operation: TerminationAttemptOperation` to a single `action: TerminationAction` field. Removed
+  `TerminationAttemptPhase` and `TerminationAttemptOperation`.
+- **Breaking:** Renamed `TrySubscribable` to `Subscribable` and gave it an associated `Subscription` type in place of
+  the previous return-position `impl Trait`. External impls must add `type Subscription = ...;` to specify the
+  concrete handle returned by `try_subscribe`. The three built-in subscription types (`BroadcastSubscription`,
+  `SingleSubscriberSubscription`, `ImmediateEof`) are now re-exported from the crate root as opaque handles.
+- **Breaking:** Introduced the new `Consumable` trait owning `consume(visitor)` / `consume_async(visitor)`, replacing
+  the previous inherent `consume_with` / `consume_with_async` on each backend. Both methods have default impls keyed
+  on `Self: OutputStream`, so backend impls only specify `type Error = ...;`. `Consumable::Error` carries a
+  `From<Self::SubscribeError>` bound so the default impls can propagate subscription failures. `Consumable` is
+  re-exported from the crate root.
+- **Breaking:** Renamed the line-aware visitor surface to drop the `Sink` suffix, and renamed `LineAdapter` to
+  `ParseLines`: `LineSink` is now `LineVisitor`, `AsyncLineSink` is `AsyncLineVisitor`,
+  `CollectLineSink` / `CollectLineSinkAsync` are `CollectLines` / `CollectLinesAsync`,
+  `InspectLineSink` / `InspectLineSinkAsync` are `InspectLines` / `InspectLinesAsync`, `WaitForLineSink` is
+  `WaitForLine`, and `WriteLineSink` is `WriteLines`. The trait-implementing types are now named after the action
+  ("collect lines") rather than the inner trait, matching the existing chunk-side names (`CollectChunks`,
+  `InspectChunks`, `WriteChunks`).
+- **Breaking:** `CollectChunksAsync` and `CollectLinesAsync` now take a closure in place of `Chunk` for the line
+  variant, matching the call-site ergonomics of the sync `CollectChunks` / `CollectLines` visitors. The boxed future
+  incurs one allocation per observed event. For hot paths or stateful collectors that need to avoid the allocation,
+  implement`AsyncStreamVisitor` / `AsyncLineVisitor` directly.
+- **Breaking:** Visitor *types* moved under `tokio_process_tools::visitors` (`InspectChunks`, `InspectChunksAsync`,
+  `InspectLines`, `InspectLinesAsync`, `CollectChunks`, `CollectChunksAsync`, `CollectLines`, `CollectLinesAsync`,
+  `WriteChunks`, `WriteLines`, `WaitForLine`). Removed the flat crate-root re-exports of these types. Configuration
+  and result types stay flat-re-exported (`LineWriteMode`, `WriteCollectionOptions`, `SinkWriteError*`,
+  `CollectedBytes`, `CollectedLines`, `RawCollectionOptions`, `LineCollectionOptions`, `CollectionOverflowBehavior`).
+- Promoted `InspectChunks`, `InspectChunksAsync`, `CollectChunks`, `CollectChunksAsync`, and `WriteChunks` from
+  `pub(crate)` to `pub`. Made `CollectedBytes::push_chunk`, `CollectedLines::push_line`, and
+  `WriteCollectionOptions::into_error_handler` public so external visitors can compose them.
+- Relaxed the predicate bound on `wait_for_line(...)` (on both backends) and on `WaitForLine` from
+  `Fn(...) -> bool + Send + Sync + 'static` to `Fn(...) -> bool + Send + 'static`.
+- Marked the `into_output` trait methods on `StreamVisitor`, `AsyncStreamVisitor`, `LineVisitor`, and
+  `AsyncLineVisitor` as `#[must_use]` so a custom visitor implementor that drops the produced value at the call site
+  gets a lint warning.
+- `DiscardedOutputStream` now implements `Subscribable` and `Consumable` (both with `Error = Infallible`). Its
+  subscription emits a single `StreamEvent::Eof` and then closes. Visitors consumed against a discarded stream observe
+  zero chunks and terminate immediately.
+
+### Removed
+
+- **Breaking:** Removed `wait_for_completion_with_output`
+- **Breaking:** Removed `wait_for_completion_with_raw_output`
+- **Breaking:** Removed `wait_for_completion_with_output_or_terminate`
+- **Breaking:** Removed `wait_for_completion_with_raw_output_or_terminate`
+- **Breaking:** Removed `WaitForCompletionOrTerminateOptions`
+- **Breaking:** Removed the inherent `inspect_*`, `collect_*`, and `*_into_write*` factory methods on
+  `BroadcastOutputStream` and `SingleSubscriberOutputStream`. Construct the corresponding visitor under
+  `tokio_process_tools::visitors` and pass it to `stream.consume(...)` / `stream.consume_async(...)` directly.
+- **Breaking:** Removed the `AsyncChunkCollector` and `AsyncLineCollector` traits.
+
 ## [0.10.1] - 2026-05-04
 
 ### Added
@@ -610,7 +723,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added process state helpers such as `id()` and `is_running()`.
 - Added `collect_into_*` helpers on `OutputStream`.
 
-[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.0...HEAD
+
+[0.11.0]: https://github.com/lpotthast/tokio-process-tools/compare/v0.10.1...v0.11.0
 
 [0.10.1]: https://github.com/lpotthast/tokio-process-tools/compare/v0.10.0...v0.10.1
 

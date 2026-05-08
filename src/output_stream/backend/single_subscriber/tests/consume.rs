@@ -1,5 +1,6 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::best_effort_no_replay_options;
+use crate::output_stream::Consumable;
 use crate::output_stream::event::Chunk;
 use crate::{AsyncStreamVisitor, Next, StreamVisitor};
 use assertr::prelude::*;
@@ -24,7 +25,7 @@ impl StreamVisitor for CountChunks {
 }
 
 #[tokio::test]
-async fn consume_with_runs_a_custom_sync_visitor_until_break() {
+async fn consume_runs_a_custom_sync_visitor_until_break() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream = SingleSubscriberOutputStream::from_stream(
         read_half,
@@ -32,7 +33,7 @@ async fn consume_with_runs_a_custom_sync_visitor_until_break() {
         best_effort_no_replay_options(),
     );
 
-    let consumer = stream.consume_with(CountChunks { count: 0 }).unwrap();
+    let consumer = stream.consume(CountChunks { count: 0 }).unwrap();
     write_half.write_all(b"first").await.unwrap();
 
     // The visitor returns `Next::Break` on the first chunk, so the consumer must terminate
@@ -62,7 +63,7 @@ impl AsyncStreamVisitor for ForwardChunksAsync {
 }
 
 #[tokio::test]
-async fn consume_with_async_runs_a_custom_async_visitor_to_eof() {
+async fn consume_async_runs_a_custom_async_visitor_to_eof() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let stream = SingleSubscriberOutputStream::from_stream(
         read_half,
@@ -72,7 +73,7 @@ async fn consume_with_async_runs_a_custom_async_visitor_to_eof() {
 
     let (forwarded_tx, mut forwarded_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let consumer = stream
-        .consume_with_async(ForwardChunksAsync { tx: forwarded_tx })
+        .consume_async(ForwardChunksAsync { tx: forwarded_tx })
         .unwrap();
 
     write_half.write_all(b"alpha").await.unwrap();
@@ -81,8 +82,8 @@ async fn consume_with_async_runs_a_custom_async_visitor_to_eof() {
 
     consumer.wait().await.unwrap();
 
-    // Chunk boundaries are not preserved through `tokio::io::duplex` — the bytes may arrive in
-    // one or several chunks — but the concatenation matches the bytes we wrote.
+    // Chunk boundaries are not preserved through `tokio::io::duplex` (the bytes may arrive in
+    // one or several chunks), but the concatenation matches the bytes we wrote.
     let mut all_bytes = Vec::new();
     while let Some(bytes) = forwarded_rx.recv().await {
         all_bytes.extend_from_slice(&bytes);

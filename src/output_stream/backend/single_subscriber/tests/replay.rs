@@ -3,11 +3,13 @@ use super::common::{
     best_effort_no_replay_options, reliable_replay_options, wait_for_bytes_ingested,
     wait_for_no_active_consumer, wait_for_terminal,
 };
+use crate::output_stream::Consumable;
 use crate::output_stream::event::StreamEvent;
+use crate::output_stream::visitors::collect::CollectChunks;
 use crate::test_support::ReadErrorAfterBytes;
 use crate::{
-    ConsumerError, LineParsingOptions, NumBytesExt, RawCollectionOptions, ReplayRetention,
-    StreamConfig, WaitForLineResult,
+    CollectedBytes, ConsumerError, LineParsingOptions, NumBytesExt, RawCollectionOptions,
+    ReplayRetention, StreamConfig, WaitForLineResult,
 };
 use assertr::prelude::*;
 use std::io;
@@ -29,7 +31,10 @@ async fn typed_no_replay_starts_consumer_at_live_output() {
     wait_for_bytes_ingested(&stream, 3).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"live").await.unwrap();
     write_half.flush().await.unwrap();
@@ -53,7 +58,10 @@ async fn typed_replay_all_delivers_pre_consumer_output_before_live_output() {
     wait_for_bytes_ingested(&stream, 3).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     write_half.write_all(b"live").await.unwrap();
     write_half.flush().await.unwrap();
@@ -86,7 +94,10 @@ async fn configured_subscription_snapshots_replay_buffer_from_shared_state() {
     }
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
 
     {
@@ -115,7 +126,10 @@ async fn no_replay_discards_output_between_consumers() {
     );
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     assert_that!(
         collector
@@ -133,7 +147,10 @@ async fn no_replay_discards_output_between_consumers() {
     wait_for_bytes_ingested(&stream, 4).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     drop(write_half);
 
@@ -151,7 +168,10 @@ async fn replay_retains_output_between_consumers() {
     );
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     assert_that!(
         collector
@@ -169,7 +189,10 @@ async fn replay_retains_output_between_consumers() {
     wait_for_bytes_ingested(&stream, 4).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     drop(write_half);
 
@@ -187,7 +210,10 @@ async fn replay_retention_limits_later_consumer() {
     );
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     assert_that!(
         collector
@@ -205,7 +231,10 @@ async fn replay_retention_limits_later_consumer() {
     wait_for_bytes_ingested(&stream, 6).await;
 
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
     drop(write_half);
 
@@ -226,7 +255,10 @@ async fn later_consumer_observes_eof() {
     assert_that!(wait_for_terminal(&stream).await).is_equal_to(StreamEvent::Eof);
 
     let bytes = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap()
         .wait()
         .await
@@ -245,7 +277,10 @@ async fn later_consumer_observes_read_error() {
     let _ = wait_for_terminal(&stream).await;
 
     match stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap()
         .wait()
         .await
@@ -284,7 +319,10 @@ async fn configured_subscription_after_seal_starts_live_with_empty_shared_replay
 
     stream.seal_replay();
     let collector = stream
-        .collect_chunks_into_vec(RawCollectionOptions::TrustedUnbounded)
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
         .unwrap();
 
     {
@@ -307,7 +345,7 @@ async fn configured_subscription_after_seal_starts_live_with_empty_shared_replay
 async fn typed_wait_after_seal_starts_live() {
     let (read_half, mut write_half) = tokio::io::duplex(64);
     let options = StreamConfig::builder()
-        .reliable_for_active_subscribers()
+        .reliable_with_backpressure()
         .replay_all()
         .read_chunk_size(4.bytes())
         .max_buffered_chunks(4)

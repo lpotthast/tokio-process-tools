@@ -12,6 +12,18 @@ use thiserror::Error;
 use crate::ConsumerError;
 
 /// Errors that can occur when terminating a process.
+///
+/// # Brief grace window after a failed signal send
+///
+/// During each graceful phase of [`crate::ProcessHandle::terminate`], if the signal send itself
+/// fails (`EPERM` on macOS, `ESRCH` on Linux against a not-yet-reaped process group on Unix; the
+/// equivalent `ERROR_INVALID_HANDLE` / `ERROR_ACCESS_DENIED` window on Windows), the library
+/// applies a fixed 100 ms grace and re-checks for child exit before escalating. This covers the
+/// small race where the child has already exited but Tokio's SIGCHLD reaper has not yet observed
+/// it. The 100 ms grace replaces, never adds to, the user timeout for that phase. Real permission
+/// denials and other genuine signal failures still surface here as `SignalFailed` or
+/// `TerminationFailed` with the underlying `io::Error` preserved on each
+/// [`TerminationAttemptError`].
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum TerminationError {
@@ -77,93 +89,40 @@ impl fmt::Display for DisplayAttemptErrors<'_> {
     }
 }
 
-struct DisplaySignalNameSuffix(Option<&'static str>);
-
-impl fmt::Display for DisplaySignalNameSuffix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Some(signal_name) = self.0 else {
-            return Ok(());
-        };
-
-        write!(f, " for {signal_name}")
-    }
-}
-
-/// A failed operation recorded while attempting to terminate a process.
+/// A failed action recorded while attempting to terminate a process.
 #[derive(Debug, Error)]
-#[error(
-    "{phase} {operation} failed{}: {source}",
-    DisplaySignalNameSuffix(*.signal_name)
-)]
+#[error("{action} failed")]
 #[non_exhaustive]
 pub struct TerminationAttemptError {
-    /// Termination phase where the failure happened.
-    pub phase: TerminationAttemptPhase,
-    /// Operation that failed during the phase.
-    pub operation: TerminationAttemptOperation,
-    /// Platform signal involved in the failed operation, when applicable.
-    pub signal_name: Option<&'static str>,
+    /// Action that failed while attempting termination.
+    pub action: TerminationAction,
     /// Original source error.
     #[source]
     pub source: Box<dyn Error + Send + Sync + 'static>,
 }
 
-/// Termination phase where an attempt error was recorded.
+/// Termination action that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum TerminationAttemptPhase {
-    /// Initial process status check before any termination signal is sent.
-    Preflight,
-
-    /// Graceful interrupt phase.
-    ///
-    /// Only emitted on Unix, where this is the `SIGINT` step that begins the graceful escalation.
-    /// Windows has no targetable `SIGINT` analogue: `GenerateConsoleCtrlEvent` cannot deliver
-    /// `CTRL_C_EVENT` to a single child group, and `CTRL_BREAK_EVENT` is harsher than a Unix
-    /// interrupt, so Windows skips this phase and goes straight to [`Self::Terminate`].
-    Interrupt,
-
-    /// Graceful terminate phase.
-    ///
-    /// On Unix this is the `SIGTERM` step that follows the `SIGINT` phase. On Windows this
-    /// represents the single `CTRL_BREAK_EVENT` graceful step (the only console control event
-    /// `GenerateConsoleCtrlEvent` can target at a nonzero process group); it sits in this phase
-    /// rather than [`Self::Interrupt`] because `CTRL_BREAK_EVENT` is closer in severity to
-    /// `SIGTERM` than to `SIGINT`.
-    Terminate,
-
-    /// Forceful kill phase.
-    Kill,
-}
-
-impl fmt::Display for TerminationAttemptPhase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Preflight => f.write_str("preflight"),
-            Self::Interrupt => f.write_str("interrupt"),
-            Self::Terminate => f.write_str("terminate"),
-            Self::Kill => f.write_str("kill"),
-        }
-    }
-}
-
-/// Termination operation that failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TerminationAttemptOperation {
+pub enum TerminationAction {
     /// Checking whether the process has already exited failed.
     CheckStatus,
-    /// Sending a graceful or forceful termination signal failed.
-    SendSignal,
-    /// Waiting for the process to exit after a termination signal failed.
+
+    /// Sending a signal failed.
+    SendSignal {
+        /// The name of the dispatched signal.
+        signal_name: &'static str,
+    },
+
+    /// Waiting for the process to exit failed.
     WaitForExit,
 }
 
-impl fmt::Display for TerminationAttemptOperation {
+impl fmt::Display for TerminationAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CheckStatus => f.write_str("status check"),
-            Self::SendSignal => f.write_str("signal send"),
+            Self::SendSignal { signal_name } => write!(f, "send signal {signal_name}"),
             Self::WaitForExit => f.write_str("exit wait"),
         }
     }
@@ -174,7 +133,7 @@ impl fmt::Display for TerminationAttemptOperation {
 #[non_exhaustive]
 pub enum WaitError {
     /// A general IO error occurred.
-    #[error("IO error occurred while waiting for process '{process_name}': {source}")]
+    #[error("IO error occurred while waiting for process '{process_name}'")]
     IoError {
         /// The name of the process.
         process_name: Cow<'static, str>,
@@ -186,6 +145,8 @@ pub enum WaitError {
 
 /// Result of waiting for a process to complete within an explicit timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "Discarding the result hides whether the process completed or the wait timed out; \
+              match on the variants or call `into_completed`/`expect_completed`."]
 pub enum WaitForCompletionResult<T = ExitStatus> {
     /// The process completed before the timeout elapsed.
     Completed(T),
@@ -215,18 +176,12 @@ impl<T> WaitForCompletionResult<T> {
     pub fn expect_completed(self, message: &str) -> T {
         self.into_completed().expect(message)
     }
-
-    /// Maps a completed value while preserving timeout outcomes.
-    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> WaitForCompletionResult<U> {
-        match self {
-            Self::Completed(value) => WaitForCompletionResult::Completed(f(value)),
-            Self::Timeout { timeout } => WaitForCompletionResult::Timeout { timeout },
-        }
-    }
 }
 
 /// Result of waiting for a process to complete, terminating it if the wait times out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "Discarding the result hides whether the process completed naturally or was \
+              terminated after the wait timeout; match on the variants or call `into_result`."]
 pub enum WaitForCompletionOrTerminateResult<T = ExitStatus> {
     /// The process completed before the wait timeout elapsed.
     Completed(T),
@@ -288,7 +243,7 @@ impl<T> WaitForCompletionOrTerminateResult<T> {
 pub enum WaitOrTerminateError {
     /// Waiting failed, but the subsequent cleanup termination succeeded.
     #[error(
-        "Waiting for process '{process_name}' failed with '{wait_error}', then cleanup termination completed with status {termination_status}"
+        "Waiting for process '{process_name}' failed; cleanup termination completed with status {termination_status}"
     )]
     WaitFailed {
         /// The name of the process.
@@ -301,22 +256,20 @@ pub enum WaitOrTerminateError {
     },
 
     /// Waiting failed, and the subsequent cleanup termination also failed.
-    #[error(
-        "Waiting for process '{process_name}' failed with '{wait_error}', then cleanup termination also failed: {termination_error}"
-    )]
+    #[error("Termination of process '{process_name}' failed after '{wait_error}'.")]
     TerminationFailed {
         /// The name of the process.
         process_name: Cow<'static, str>,
         /// The original error returned while waiting for the process.
-        #[source]
         wait_error: Box<WaitError>,
         /// The error returned while trying to terminate the process after the wait failure.
+        #[source]
         termination_error: TerminationError,
     },
 
     /// Waiting timed out, and the subsequent cleanup termination failed.
     #[error(
-        "Process '{process_name}' did not complete within {timeout:?}, then cleanup termination failed: {termination_error}"
+        "Process '{process_name}' did not complete within {timeout:?}; cleanup termination failed"
     )]
     TerminationAfterTimeoutFailed {
         /// The name of the process.
@@ -332,19 +285,18 @@ pub enum WaitOrTerminateError {
 /// Errors that can occur when waiting for a process while collecting its output, with or
 /// without automatic termination on timeout.
 ///
-/// `WaitFailed` is emitted by APIs without automatic termination
-/// (`wait_for_completion_with_output`, `wait_for_completion_with_raw_output`).
-/// `WaitOrTerminateFailed` is emitted by the `*_or_terminate` variants. The remaining variants
-/// can be emitted by either family.
+/// `WaitFailed` is emitted from staged-builder chains without `.or_terminate(...)`.
+/// `WaitOrTerminateFailed` is emitted from chains that include `.or_terminate(...)`. The
+/// remaining variants can be emitted by either family.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum WaitWithOutputError {
     /// Waiting for the process failed.
-    #[error("Waiting for process completion failed: {0}")]
+    #[error("Waiting for process completion failed")]
     WaitFailed(#[from] WaitError),
 
     /// Waiting with automatic termination failed.
-    #[error("Wait-or-terminate operation failed: {0}")]
+    #[error("Wait-or-terminate operation failed")]
     WaitOrTerminateFailed(#[from] WaitOrTerminateError),
 
     /// Output collection did not complete before the operation timeout elapsed.
@@ -357,7 +309,7 @@ pub enum WaitWithOutputError {
     },
 
     /// Collecting stdout or stderr failed.
-    #[error("Output collection for process '{process_name}' failed: {source}")]
+    #[error("Output collection for process '{process_name}' failed")]
     OutputCollectionFailed {
         /// The name of the process.
         process_name: Cow<'static, str>,
@@ -367,13 +319,13 @@ pub enum WaitWithOutputError {
     },
 
     /// Starting stdout or stderr output collection failed.
-    #[error("Output collection for process '{process_name}' could not start: {source}")]
+    #[error("Output collection for process '{process_name}' could not start")]
     OutputCollectionStartFailed {
         /// The name of the process.
         process_name: Cow<'static, str>,
         /// The stream consumer error that prevented output collection from starting.
         #[source]
-        source: StreamConsumerError,
+        source: Box<dyn Error + Send + Sync + 'static>,
     },
 }
 
@@ -382,11 +334,31 @@ pub enum WaitWithOutputError {
 #[non_exhaustive]
 pub enum SpawnError {
     /// Failed to spawn the process.
-    #[error("Failed to spawn process '{process_name}': {source}")]
+    #[error("Failed to spawn process '{process_name}'")]
     SpawnFailed {
         /// The name or description of the process being spawned.
         process_name: Cow<'static, str>,
         /// The underlying IO error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Failed to attach the spawned child to a Windows Job Object.
+    ///
+    /// On Windows, the crate creates an anonymous Job Object after spawn and assigns the child to
+    /// it so that [`crate::ProcessHandle::kill`] (and the forceful-kill fallback inside
+    /// [`crate::ProcessHandle::terminate`]) can reach the entire process tree via
+    /// `TerminateJobObject`. If the post-spawn `CreateJobObjectW`, `OpenProcess`, or
+    /// `AssignProcessToJobObject` call fails, the just-spawned child is killed and the spawn is
+    /// rejected with this error rather than handed back without process-tree termination
+    /// guarantees.
+    #[cfg(windows)]
+    #[error("Failed to attach spawned process '{process_name}' to a Windows Job Object")]
+    JobAttachmentFailed {
+        /// The name or description of the process being spawned.
+        process_name: Cow<'static, str>,
+        /// The underlying IO error from the failed `CreateJobObjectW`, `OpenProcess`, or
+        /// `AssignProcessToJobObject` call.
         #[source]
         source: io::Error,
     },
@@ -416,7 +388,7 @@ impl StreamConsumerError {
 
 /// Error emitted when an output stream cannot be read to completion.
 #[derive(Debug, Clone, Error)]
-#[error("Could not read from stream '{stream_name}': {source}")]
+#[error("Could not read from stream '{stream_name}'")]
 pub struct StreamReadError {
     stream_name: &'static str,
     #[source]
@@ -474,4 +446,27 @@ pub enum WaitForLineResult {
 
     /// The timeout elapsed before a matching line was observed or the stream ended.
     Timeout,
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use assertr::prelude::*;
+
+    pub(crate) fn assert_attempt_error(
+        attempt_error: &TerminationAttemptError,
+        expected_action: TerminationAction,
+        expected_kind: io::ErrorKind,
+        expected_message: &str,
+    ) {
+        assert_that!(attempt_error.action).is_equal_to(expected_action);
+
+        let io_error = attempt_error
+            .source
+            .downcast_ref::<io::Error>()
+            .expect("diagnostic should preserve the original io::Error");
+
+        assert_that!(io_error.kind()).is_equal_to(expected_kind);
+        assert_that!(io_error.to_string().as_str()).contains(expected_message);
+    }
 }
