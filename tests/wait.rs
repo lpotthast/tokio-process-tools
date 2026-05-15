@@ -117,10 +117,6 @@ async fn or_terminate_returns_wait_failure_after_cleanup() {
         }
     };
 
-    // `code().is_none()` is Unix-only: Windows reports `Some(_)` from `GetExitCodeProcess` even
-    // for signal-terminated processes. `!success()` is the platform-agnostic check.
-    #[cfg(unix)]
-    assert_that!(termination_status.code()).is_none();
     assert_that!(termination_status.success()).is_false();
 
     let WaitError::IoError { source, .. } = *wait_error else {

@@ -168,11 +168,11 @@ async fn terminate_stops_process() {
     let ran_for = started_at.duration_until(&terminated_at);
     assert_that!(ran_for.as_secs_f32()).is_close_to(0.1, 0.5);
 
-    // `code().is_none()` is Unix-only: Windows reports `Some(_)` from `GetExitCodeProcess` even
-    // for signal-terminated processes. `!success()` is the platform-agnostic check.
-    #[cfg(unix)]
-    assert_that!(exit_status.code()).is_none();
+    // The helper installs a graceful-signal handler and exits via `process::exit(1)`, so the
+    // child reports a clean exit with code 1 on both platforms.
+    assert_that!(exit_status.code()).is_equal_to(Some(1));
     assert_that!(exit_status.success()).is_false();
+
     assert_that!(handle.is_drop_disarmed()).is_true();
 }
 
