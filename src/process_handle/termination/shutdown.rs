@@ -103,6 +103,22 @@ impl GracefulShutdown {
             _state: PhantomData,
         }
     }
+
+    /// Upper bound on wall-clock time spent in graceful phases before the implicit forceful kill.
+    ///
+    /// On Unix this is the sum of every [`UnixGracefulPhase`]'s timeout in the configured sequence.
+    /// On Windows it is the single [`WindowsGracefulShutdown::timeout`].
+    #[must_use]
+    pub fn total_timeout(&self) -> Duration {
+        #[cfg(unix)]
+        {
+            self.unix.total_timeout()
+        }
+        #[cfg(windows)]
+        {
+            self.windows.timeout
+        }
+    }
 }
 
 /// Typestate marker indicating that the Unix-side sequence has not been provided yet.
@@ -414,6 +430,13 @@ impl UnixGracefulShutdown {
     pub fn phases(&self) -> &[UnixGracefulPhase] {
         &self.phases
     }
+
+    /// Sum of every phase's timeout: the upper bound on wall-clock time spent in graceful phases
+    /// before the implicit kill.
+    #[must_use]
+    pub fn total_timeout(&self) -> Duration {
+        self.phases.iter().map(|p| p.timeout).sum()
+    }
 }
 
 /// Single-phase Windows graceful-shutdown sequence.
@@ -509,6 +532,44 @@ mod tests {
         #[should_panic(expected = "UnixGracefulShutdown must contain at least one phase")]
         fn from_phases_panics_on_empty_input() {
             let _ = UnixGracefulShutdown::from_phases(std::iter::empty());
+        }
+
+        #[test]
+        fn total_timeout_sums_every_phase() {
+            let sequence = UnixGracefulShutdown::from_phases([
+                UnixGracefulPhase::interrupt(Duration::from_secs(1)),
+                UnixGracefulPhase::terminate(Duration::from_secs(2)),
+                UnixGracefulPhase::terminate(Duration::from_millis(500)),
+            ]);
+
+            assert_that!(sequence.total_timeout()).is_equal_to(Duration::from_millis(3_500));
+        }
+
+        #[test]
+        fn total_timeout_of_single_phase_equals_that_phase() {
+            let sequence = UnixGracefulShutdown::terminate_only(Duration::from_secs(7));
+
+            assert_that!(sequence.total_timeout()).is_equal_to(Duration::from_secs(7));
+        }
+    }
+
+    mod total_timeout {
+        use super::*;
+
+        #[test]
+        fn reflects_active_platform_budget() {
+            let shutdown = GracefulShutdown::builder()
+                .unix(UnixGracefulShutdown::from_phases([
+                    UnixGracefulPhase::interrupt(Duration::from_secs(1)),
+                    UnixGracefulPhase::terminate(Duration::from_secs(4)),
+                ]))
+                .windows(WindowsGracefulShutdown::new(Duration::from_secs(7)))
+                .build();
+
+            #[cfg(unix)]
+            assert_that!(shutdown.total_timeout()).is_equal_to(Duration::from_secs(5));
+            #[cfg(windows)]
+            assert_that!(shutdown.total_timeout()).is_equal_to(Duration::from_secs(7));
         }
     }
 }

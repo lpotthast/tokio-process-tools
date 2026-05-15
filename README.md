@@ -69,7 +69,7 @@ Add `tokio-process-tools` to your `Cargo.toml` and ensure you are using a multit
 
 ```toml
 [dependencies]
-tokio-process-tools = "0.11.1"
+tokio-process-tools = "0.11.2"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
 ```
 

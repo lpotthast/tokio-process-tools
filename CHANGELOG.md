@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-05-15
+
+### Added
+
+- `GracefulShutdown::total_timeout()` and `UnixGracefulShutdown::total_timeout()` accessors returning the upper bound on
+  wall-clock time spent in graceful phases before the implicit forceful kill. Useful for callers that forward a
+  `GracefulShutdown` to a downstream tool and need to bound their own wait on that tool's termination with some
+  headroom on top.
+
 ## [0.11.1] - 2026-05-15
 
 ### Fixed
@@ -738,7 +747,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added process state helpers such as `id()` and `is_running()`.
 - Added `collect_into_*` helpers on `OutputStream`.
 
-[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.2...HEAD
+
+[0.11.2]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.1...v0.11.2
 
 [0.11.1]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.0...v0.11.1
 
