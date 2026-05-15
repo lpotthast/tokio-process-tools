@@ -183,8 +183,49 @@ pub fn spawn_immediately_exiting_process()
         .unwrap()
 }
 
+#[cfg(not(windows))]
 pub fn immediately_exiting_command() -> tokio::process::Command {
     ScriptedOutput::builder().build()
+}
+
+/// Windows uses `cmd.exe /D /Q /C exit` rather than the no-op `ScriptedOutput` because PowerShell
+/// cold start is ~500 ms on a typical Windows host and the preflight-reap tests sleep only 50 ms
+/// before asserting that the child has already exited. cmd.exe starts much faster, comfortably
+/// under the sleep budget. `/D` disables `AutoRun`, `/Q` turns echo off — both shave further start
+/// time and keep the child output deterministic.
+#[cfg(windows)]
+pub fn immediately_exiting_command() -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("cmd.exe");
+    cmd.args(["/D", "/Q", "/C", "exit"]);
+    cmd
+}
+
+/// Builds a command that copies its stdin to stdout and exits once stdin reaches EOF.
+#[cfg(not(windows))]
+pub fn echoes_stdin_until_eof_command() -> tokio::process::Command {
+    tokio::process::Command::new("cat")
+}
+
+/// Builds a command that copies its stdin to stdout and exits once stdin reaches EOF.
+#[cfg(windows)]
+pub fn echoes_stdin_until_eof_command() -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::Out.Write([Console]::In.ReadToEnd())",
+    ]);
+    cmd
+}
+
+/// Builds a long-running command that exits promptly on the platform's graceful-termination signal.
+/// Runs the `graceful_shutdown_test_child` helper binary defined under `tests/bin/`. It installs a
+/// `CTRL_BREAK_EVENT` console-control handler on Windows and a `SIGTERM`/`SIGINT` handler on Unix,
+/// so the graceful phase of `terminate(...)` reliably observes a fast natural exit on both
+/// platforms.
+pub fn signal_responsive_long_running_command() -> tokio::process::Command {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_graceful_shutdown_test_child"))
 }
 
 /// Builds a command that naturally exits after approximately `duration`.
@@ -288,27 +329,7 @@ impl ScriptedOutputBuilder {
     #[cfg(windows)]
     pub fn build(self) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("powershell.exe");
-        let mut script = String::new();
-
-        push_powershell_stream_script(
-            &mut script,
-            "TOKIO_PROCESS_TOOLS_SCRIPTED_STDOUT",
-            &self.stdout,
-            "Out",
-        );
-        push_powershell_stream_script(
-            &mut script,
-            "TOKIO_PROCESS_TOOLS_SCRIPTED_STDERR",
-            &self.stderr,
-            "Error",
-        );
-        script.push_str("$TOKIO_PROCESS_TOOLS_SCRIPTED_STDOUT_THREAD.Start()\n");
-        script.push_str("$TOKIO_PROCESS_TOOLS_SCRIPTED_STDERR_THREAD.Start()\n");
-        script.push_str("$TOKIO_PROCESS_TOOLS_SCRIPTED_STDOUT_THREAD.Join()\n");
-        script.push_str("$TOKIO_PROCESS_TOOLS_SCRIPTED_STDERR_THREAD.Join()\n");
-
-        set_scripted_output_env(&mut cmd, "TOKIO_PROCESS_TOOLS_SCRIPTED_STDOUT", self.stdout);
-        set_scripted_output_env(&mut cmd, "TOKIO_PROCESS_TOOLS_SCRIPTED_STDERR", self.stderr);
+        let script = build_powershell_script(&self.stdout, &self.stderr);
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()]);
         cmd
     }
@@ -336,29 +357,21 @@ fn push_unix_stream_script(
     actions: &[ScriptedOutputAction],
     stderr: bool,
 ) {
+    use std::fmt::Write;
+
     script.push_str("(\n");
     if actions.is_empty() {
         script.push_str(":\n");
     }
+    let redirect = if stderr { " >&2" } else { "" };
     for (index, action) in actions.iter().enumerate() {
         if !action.delay.is_zero() {
-            script.push_str("sleep ");
-            script.push_str(&unix_duration(action.delay));
-            script.push('\n');
+            writeln!(script, "sleep {}", unix_duration(action.delay)).unwrap();
         }
-        script.push_str("printf '%s' \"$");
-        script.push_str(prefix);
-        script.push('_');
-        script.push_str(&index.to_string());
-        script.push('"');
-        if stderr {
-            script.push_str(" >&2");
-        }
-        script.push('\n');
+        writeln!(script, "printf '%s' \"${prefix}_{index}\"{redirect}").unwrap();
     }
-    script.push_str(") &\n");
-    script.push_str(prefix);
-    script.push_str("_PID=$!\n");
+    writeln!(script, ") &").unwrap();
+    writeln!(script, "{prefix}_PID=$!").unwrap();
 }
 
 #[cfg(not(windows))]
@@ -366,37 +379,55 @@ fn unix_duration(duration: Duration) -> String {
     format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos())
 }
 
+/// Build a single-threaded PowerShell script that emits the stdout and stderr actions in their
+/// configured absolute-time order. The tests only assert intra-stream ordering and at-or-after
+/// relative timing, never inter-stream interleaving at the same absolute time.
 #[cfg(windows)]
-fn push_powershell_stream_script(
-    script: &mut String,
-    prefix: &str,
-    actions: &[ScriptedOutputAction],
-    console_stream: &str,
-) {
-    script.push('$');
-    script.push_str(prefix);
-    script.push_str("_THREAD = [System.Threading.Thread]::new([System.Threading.ThreadStart] {\n");
-    for (index, action) in actions.iter().enumerate() {
-        if !action.delay.is_zero() {
-            script.push_str("Start-Sleep -Milliseconds ");
-            script.push_str(&powershell_duration_millis(action.delay));
-            script.push('\n');
+fn build_powershell_script(
+    stdout_actions: &[ScriptedOutputAction],
+    stderr_actions: &[ScriptedOutputAction],
+) -> String {
+    use std::fmt::Write;
+
+    // Merge both streams into one sorted timeline keyed by absolute offset from script start.
+    let mut events = Vec::<(Duration, &str, &'static str)>::new();
+    for (actions, stream) in [(stdout_actions, "Out"), (stderr_actions, "Error")] {
+        let mut offset = Duration::ZERO;
+        for action in actions {
+            offset += action.delay;
+            events.push((offset, action.text.as_str(), stream));
         }
-        script.push_str("[Console]::");
-        script.push_str(console_stream);
-        script.push_str(".Write($env:");
-        script.push_str(prefix);
-        script.push('_');
-        script.push_str(&index.to_string());
-        script.push_str(")\n");
     }
-    script.push_str("})\n");
+    // Stable sort preserves stdout-before-stderr when two events share an absolute offset.
+    events.sort_by_key(|(offset, _, _)| *offset);
+
+    let mut script = String::new();
+    let mut last_offset = Duration::ZERO;
+    for (event_offset, text, stream) in events {
+        let sleep_duration = event_offset.saturating_sub(last_offset);
+        if !sleep_duration.is_zero() {
+            write!(
+                script,
+                "Start-Sleep -Milliseconds {};",
+                powershell_duration_millis(sleep_duration),
+            )
+            .unwrap();
+        }
+        // Single-quoted PowerShell strings need only `'` -> `''` escaping; newlines are preserved
+        // verbatim through both Windows command-line encoding and PS string parsing.
+        let escaped = text.replace('\'', "''");
+        write!(script, "[Console]::{stream}.Write('{escaped}');").unwrap();
+        last_offset = event_offset;
+    }
+    // PowerShell refuses an empty `-Command` argument, so always end with something.
+    script.push_str("exit 0");
+    script
 }
 
 #[cfg(windows)]
 fn powershell_duration_millis(duration: Duration) -> String {
     let millis = duration.as_millis();
-    let rounded_millis = if duration.subsec_nanos() % 1_000_000 == 0 {
+    let rounded_millis = if duration.subsec_nanos().is_multiple_of(1_000_000) {
         millis
     } else {
         millis + 1

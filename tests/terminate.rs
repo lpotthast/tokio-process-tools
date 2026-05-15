@@ -149,7 +149,7 @@ async fn canceled_terminate_keeps_drop_guards_armed() {
 #[tokio::test]
 async fn terminate_stops_process() {
     let started_at = jiff::Zoned::now();
-    let mut handle = Process::new(long_running_command(Duration::from_secs(5)))
+    let mut handle = Process::new(signal_responsive_long_running_command())
         .name("long-running")
         .stdout_and_stderr(|stream| {
             stream
@@ -168,6 +168,9 @@ async fn terminate_stops_process() {
     let ran_for = started_at.duration_until(&terminated_at);
     assert_that!(ran_for.as_secs_f32()).is_close_to(0.1, 0.5);
 
+    // `code().is_none()` is Unix-only: Windows reports `Some(_)` from `GetExitCodeProcess` even
+    // for signal-terminated processes. `!success()` is the platform-agnostic check.
+    #[cfg(unix)]
     assert_that!(exit_status.code()).is_none();
     assert_that!(exit_status.success()).is_false();
     assert_that!(handle.is_drop_disarmed()).is_true();

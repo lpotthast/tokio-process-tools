@@ -47,13 +47,26 @@ impl PanicOnDrop {
 
 impl Drop for PanicOnDrop {
     fn drop(&mut self) {
-        if self.is_armed() {
-            let backtrace = backtrace::Backtrace::capture();
-            panic!(
-                "Resource '{}' should not have been dropped at this point!\n\nErr: {}\n\nHelp: {}\n\nBacktrace: {:#?}",
-                self.resource_name, self.error_msg, self.help_msg, backtrace,
-            );
+        if !self.is_armed() {
+            return;
         }
+        let backtrace = backtrace::Backtrace::capture();
+        let message = format!(
+            "Resource '{}' should not have been dropped at this point!\n\nErr: {}\n\nHelp: {}\n\nBacktrace: {:#?}",
+            self.resource_name, self.error_msg, self.help_msg, backtrace,
+        );
+        // If the current thread is already unwinding from an earlier panic, raising a second one
+        // from this Drop impl would `abort` the process. That could hide the original failure and
+        // potentially crashes test binaries instead of letting the test framework report the first
+        // panic cleanly (e.g. a panic raised by a failed assertion).
+        // Emit a warning so the cleanup-omission is still surfaced, then leave unwinding to the
+        // panic that's already in flight.
+        if std::thread::panicking() {
+            tracing::warn!(message);
+            tracing::warn!("Suppressing PanicOnDrop because the thread is already panicking");
+            return;
+        }
+        panic!("{message}");
     }
 }
 
@@ -62,44 +75,21 @@ mod tests {
     use super::*;
     use assertr::assert_that_type;
     use assertr::prelude::*;
-    use std::panic;
-    use std::sync::Mutex;
 
     #[test]
     fn needs_drop() {
         assert_that_type::<PanicOnDrop>().needs_drop();
     }
 
-    /// Serialize panic-hook manipulation so concurrent tests don't see each other's silenced hook.
-    static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
-
-    fn run_silently(f: impl FnOnce() + std::panic::UnwindSafe) -> std::thread::Result<()> {
-        let _guard = PANIC_HOOK_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev_hook = panic::take_hook();
-        panic::set_hook(Box::new(|_info| {}));
-        let result = panic::catch_unwind(f);
-        panic::set_hook(prev_hook);
-        result
-    }
-
     #[test]
     fn armed_drop_panics_with_expected_message() {
-        let result = run_silently(|| {
+        assert_that_panic_by(|| {
             let _guard = PanicOnDrop::new("ResourceX", "must be defused", "call defuse()");
-        });
-
-        let payload = result.expect_err("dropping an armed PanicOnDrop must panic");
-        let message = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&'static str>().copied())
-            .expect("panic payload should be a string");
-
-        assert_that!(message).contains("ResourceX");
-        assert_that!(message).contains("must be defused");
-        assert_that!(message).contains("call defuse()");
+        })
+        .has_type::<String>()
+        .contains("ResourceX")
+        .contains("must be defused")
+        .contains("call defuse()");
     }
 
     #[test]
@@ -116,5 +106,18 @@ mod tests {
         guard.defuse();
         guard.defuse();
         assert_that!(guard.is_armed()).is_false();
+    }
+
+    #[test]
+    fn drop_during_panic_suppresses_secondary_panic() {
+        // If this test reached a double-panic, the process would `abort` via Rust's no-double-panic
+        // rule and `cargo test` would exit non-zero with no FAILED line. Reaching the assertions
+        // below is itself part of the contract: only the first panic must escape.
+        assert_that_panic_by(|| {
+            let _guard = PanicOnDrop::new("ResourceX", "must be defused", "call defuse()");
+            panic!("first panic, the guard drops while unwinding from this");
+        })
+        .has_type::<&str>()
+        .is_equal_to("first panic, the guard drops while unwinding from this");
     }
 }

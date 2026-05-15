@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-05-15
+
+### Fixed
+
+- `PanicOnDrop` (used by `ProcessHandle`'s armed drop guard) no longer panics from its `Drop` impl when the current
+  thread is already unwinding from another panic. A second panic during unwinding would abort the process, potentially
+  masking an original failure. In that case, the failure to clean up a process is reported via `tracing::warn!` instead
+  if panicking from the `Drop` impl. The first panic continues to unwind normally. The non-panicking-context behavior is
+  unchanged.
+- Strengthened and de-flaked the integration test suite: preflight-reap tests now verify their named ordering via the
+  `send_signal_with_reaper` seam, the graceful-termination tests use a new `graceful_shutdown_test_child` helper binary
+  that installs a real `CTRL_BREAK_EVENT` / `SIGTERM` handler so the graceful path is exercised cross-platform (the
+  previous `ping` and `Start-Sleep` placeholders did not respond to `CTRL_BREAK_EVENT` on Windows), and the
+  scripted-output and stdin helpers are now platform-portable.
+
 ## [0.11.0] - 2026-05-08
 
 ### Added
@@ -723,7 +738,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added process state helpers such as `id()` and `is_running()`.
 - Added `collect_into_*` helpers on `OutputStream`.
 
-[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.1...HEAD
+
+[0.11.1]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.0...v0.11.1
 
 [0.11.0]: https://github.com/lpotthast/tokio-process-tools/compare/v0.10.1...v0.11.0
 

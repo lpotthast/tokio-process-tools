@@ -1,6 +1,6 @@
 [package]
 name = "tokio-process-tools"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 rust-version = "1.89.0"
 repository = "https://github.com/lpotthast/tokio-process-tools"
@@ -33,6 +33,12 @@ nix = { version = "0.31.2", default-features = false, features = ["signal", "pro
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
+[features]
+default = []
+# Internal feature that activates the test-helper binaries and any dev-only dependency features they rely on. Not meant
+# for downstream use. Auto-enabled during `cargo test` via the self dev-dependency below.
+__test-helpers = ["tokio/signal"]
+
 [dev-dependencies]
 assertr = "0.6.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
@@ -42,6 +48,16 @@ tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["fs"] }
 tokio-test = "0.4.5"
 tracing-test = "0.2.6"
+# Dependency on self. Enables `__test-helpers` to build addtional binaries located under tests/bin.
+tokio-process-tools = { path = ".", features = ["__test-helpers"] }
+
+[[bin]]
+name = "graceful_shutdown_test_child"
+path = "tests/bin/graceful_shutdown_test_child.rs"
+required-features = ["__test-helpers"]
+test = false
+bench = false
+doc = false
 
 [[bench]]
 name = "chunk_delivery"

@@ -26,7 +26,7 @@ unsafe impl Send for JobObject {}
 unsafe impl Sync for JobObject {}
 
 impl JobObject {
-    /// Creates an anonymous JobObject and assigns the spawned child to it.
+    /// Creates an anonymous `JobObject` and assigns the spawned child to it.
     ///
     /// On Windows 8 and later, processes the child subsequently spawns are automatically
     /// associated with the same job (unless a descendant explicitly opts out via

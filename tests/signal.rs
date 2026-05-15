@@ -7,7 +7,6 @@ use assertr::prelude::*;
 use common::*;
 use std::io;
 use std::process::ExitStatus;
-use std::time::Duration;
 use tokio_process_tools::{TerminationAction, TerminationError};
 
 fn successful_exit_status() -> ExitStatus {
@@ -30,46 +29,88 @@ mod preflight_reap {
     #[cfg(unix)]
     #[tokio::test]
     async fn interrupt_reaps_already_exited_child_before_signalling() {
-        let mut process = spawn_immediately_exiting_process();
+        let mut process = spawn_long_running_process();
+        let mut signal_attempts = 0;
+        let mut reap_attempts = 0;
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let result = process.send_signal_with_reaper(
+            "SIGINT",
+            |_| {
+                signal_attempts += 1;
+                Ok(())
+            },
+            |_| {
+                reap_attempts += 1;
+                // Lie about process being dead.
+                Ok(Some(successful_exit_status()))
+            },
+        );
 
-        assert_that!(process.id()).is_some();
-
-        process.send_interrupt_signal().unwrap();
-
-        assert_that!(process.id()).is_none();
+        assert_that!(result).is_ok();
+        assert_that!(signal_attempts).is_equal_to(0);
+        assert_that!(reap_attempts).is_equal_to(1);
         assert_that!(process.is_drop_disarmed()).is_true();
+
+        // Fake reap left the process alive. We must kill it here.
+        process.kill().await.unwrap();
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn terminate_reaps_already_exited_child_before_signalling() {
-        let mut process = spawn_immediately_exiting_process();
+        let mut process = spawn_long_running_process();
+        let mut signal_attempts = 0;
+        let mut reap_attempts = 0;
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let result = process.send_signal_with_reaper(
+            "SIGTERM",
+            |_| {
+                signal_attempts += 1;
+                Ok(())
+            },
+            |_| {
+                reap_attempts += 1;
+                // Lie about process being dead.
+                Ok(Some(successful_exit_status()))
+            },
+        );
 
-        assert_that!(process.id()).is_some();
-
-        process.send_terminate_signal().unwrap();
-
-        assert_that!(process.id()).is_none();
+        assert_that!(result).is_ok();
+        assert_that!(signal_attempts).is_equal_to(0);
+        assert_that!(reap_attempts).is_equal_to(1);
         assert_that!(process.is_drop_disarmed()).is_true();
+
+        // Fake reap left the process alive. We must kill it here.
+        process.kill().await.unwrap();
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn ctrl_break_reaps_already_exited_child_before_signalling() {
-        let mut process = spawn_immediately_exiting_process();
+        let mut process = spawn_long_running_process();
+        let mut signal_attempts = 0;
+        let mut reap_attempts = 0;
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let result = process.send_signal_with_reaper(
+            "CTRL_BREAK_EVENT",
+            |_| {
+                signal_attempts += 1;
+                Ok(())
+            },
+            |_| {
+                reap_attempts += 1;
+                // Lie about process being dead.
+                Ok(Some(successful_exit_status()))
+            },
+        );
 
-        assert_that!(process.id()).is_some();
-
-        process.send_ctrl_break_signal().unwrap();
-
-        assert_that!(process.id()).is_none();
+        assert_that!(result).is_ok();
+        assert_that!(signal_attempts).is_equal_to(0);
+        assert_that!(reap_attempts).is_equal_to(1);
         assert_that!(process.is_drop_disarmed()).is_true();
+
+        // Fake reap left the process alive. We must kill it here.
+        process.kill().await.unwrap();
     }
 
     #[tokio::test]
@@ -97,6 +138,7 @@ mod preflight_reap {
                     1 => Ok(None),
                     2 => {
                         process.must_not_be_terminated();
+                        // Lie about process being dead.
                         Ok(Some(successful_exit_status()))
                     }
                     _ => panic!("unexpected reap attempt"),
@@ -109,6 +151,7 @@ mod preflight_reap {
         assert_that!(reap_attempts).is_equal_to(2);
         assert_that!(process.is_drop_disarmed()).is_true();
 
+        // Fake reap left the process alive. We must kill it here.
         process.kill().await.unwrap();
     }
 }

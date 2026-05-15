@@ -79,16 +79,17 @@ shutdown logic.
 
 A live armed `ProcessHandle` that is dropped without a successful terminal wait, `terminate*`, or `kill` performs
 best-effort cleanup and then **panics**. The opt-out paths are explicit: `wait_for_completion*`, `terminate*`, `kill`,
-`.terminate_on_drop(...)`, `into_inner()`, or `must_not_be_terminated()`. This is deliberate; do not soften it to a
+`.terminate_on_drop(...)`, `into_inner()`, or `must_not_be_terminated()`. This is deliberate. Do not soften it to a
 silent leak.
 
 `TerminateOnDrop` (in `src/terminate_on_drop.rs` + `src/async_drop.rs`) drives async termination from synchronous
-`Drop` and **requires a multi-threaded Tokio runtime**. Tests that exercise it must use
-`#[tokio::test(flavor = "multi_thread")]`; the single-threaded runtime cannot drive that path.
+`Drop` and **requires a multithreaded Tokio runtime**. Tests that exercise it must use
+`#[tokio::test(flavor = "multi_thread")]`. The single-threaded runtime cannot drive that path.
 
 `PanicOnDrop` is the misuse guard for the armed-handle case. If `terminate()` returns `Err`, the guard stays armed on
 purpose so the failure is loud rather than silent. Recover by retrying, escalating to `kill()`, or calling
-`must_not_be_terminated()` to acknowledge.
+`must_not_be_terminated()` to acknowledge. One exception: if the thread is already unwinding from another panic when
+the guard drops, it logs via `tracing::warn!` instead of raising a second panic
 
 ## Stdin invariants
 

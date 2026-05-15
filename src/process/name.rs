@@ -336,10 +336,20 @@ mod tests {
     #[test]
     fn auto_name_debug_uses_command_debug_string() {
         let cmd = command_with_args_env_and_current_dir();
-
-        assert_that!(generated_name(ProcessName::Auto(AutoName::Debug), &cmd)).is_equal_to(
-            "Command { std: cd \"./\" && FOO=\"foo\" \"ls\" \"-la\", kill_on_drop: false }",
-        );
+        let actual = generated_name(ProcessName::Auto(AutoName::Debug), &cmd);
+        // For historical reasons / inconsistencies, the Windows `Command` internals do not print
+        // environment variables and directory changes in their `Debug` implementation.
+        #[cfg(windows)]
+        {
+            assert_that!(actual)
+                .is_equal_to("Command { std: \"ls\" \"-la\", kill_on_drop: false }");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_that!(actual).is_equal_to(
+                "Command { std: cd \"./\" && FOO=\"foo\" \"ls\" \"-la\", kill_on_drop: false }",
+            );
+        }
     }
 
     #[test]

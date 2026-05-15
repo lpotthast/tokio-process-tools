@@ -98,7 +98,8 @@ mod with_line_output {
 
     #[tokio::test]
     async fn closes_stdin_before_waiting() {
-        let mut process = spawn_broadcast_with_replay("cat", tokio::process::Command::new("cat"));
+        let mut process =
+            spawn_broadcast_with_replay("echo-stdin", echoes_stdin_until_eof_command());
 
         let Some(stdin) = process.stdin().as_mut() else {
             assert_that!(process.stdin().is_open()).fail("stdin should start open");
