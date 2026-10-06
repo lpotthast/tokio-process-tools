@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.3] - 2026-10-06
+
+### Added
+
+- `ProcessHandle::start_kill()`, the synchronous first half of `kill()`: sends the forceful kill to the process group
+  (Job Object on Windows) without waiting for the exit, and needs no Tokio runtime. A successful call disarms the drop
+  cleanup and panic guards. It is a last resort for synchronous contexts that cannot drive graceful termination, e.g. a
+  `Drop` implementation running after the Tokio runtime is gone. A graceful `terminate()` should always be attempted
+  first.
 
 ## [0.11.2] - 2026-05-15
 
@@ -108,8 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ParseLines`: `LineSink` is now `LineVisitor`, `AsyncLineSink` is `AsyncLineVisitor`,
   `CollectLineSink` / `CollectLineSinkAsync` are `CollectLines` / `CollectLinesAsync`,
   `InspectLineSink` / `InspectLineSinkAsync` are `InspectLines` / `InspectLinesAsync`, `WaitForLineSink` is
-  `WaitForLine`, and `WriteLineSink` is `WriteLines`. The trait-implementing types are now named after the action
-  ("collect lines") rather than the inner trait, matching the existing chunk-side names (`CollectChunks`,
+  `WaitForLine`, and `WriteLineSink` is `WriteLines`. The trait-implementing types are now named after the action (
+  "collect lines") rather than the inner trait, matching the existing chunk-side names (`CollectChunks`,
   `InspectChunks`, `WriteChunks`).
 - **Breaking:** `CollectChunksAsync` and `CollectLinesAsync` now take a closure in place of `Chunk` for the line
   variant, matching the call-site ergonomics of the sync `CollectChunks` / `CollectLines` visitors. The boxed future
@@ -747,7 +755,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added process state helpers such as `id()` and `is_running()`.
 - Added `collect_into_*` helpers on `OutputStream`.
 
-[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.3...HEAD
+
+[0.11.3]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.2...v0.11.3
 
 [0.11.2]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.1...v0.11.2
 

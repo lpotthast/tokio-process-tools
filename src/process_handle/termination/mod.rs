@@ -92,6 +92,63 @@ where
 
         Ok(())
     }
+
+    /// Sends the forceful kill without waiting for the process to exit. The synchronous first
+    /// half of [`kill`](Self::kill), mirroring [`tokio::process::Child::start_kill`]. Most users
+    /// should call [`ProcessHandle::terminate`] instead.
+    ///
+    /// A forceful kill gives the process no chance to clean up (flush files, end its own
+    /// children, release locks), so it must be the last resort. Always attempt graceful
+    /// termination first: await [`terminate`](Self::terminate), or, from a synchronous context
+    /// such as a `Drop` implementation, hand the handle to a task that awaits it. Reach for
+    /// `start_kill` only where neither is possible, for example when no Tokio runtime is left to
+    /// drive the graceful shutdown.
+    ///
+    /// Like `kill`, this targets the whole process group (the Job Object on Windows), so
+    /// grandchildren are not orphaned, and it closes any still-open stdin first. It needs no
+    /// Tokio runtime.
+    ///
+    /// A successful call disarms the drop cleanup and panic guards: the kill was delivered, so
+    /// dropping the handle afterward neither signals again nor panics. The exit status is not
+    /// reaped. Await [`wait_for_completion`](Self::wait_for_completion) to observe it, or drop the
+    /// handle and leave the exited child to Tokio's best-effort orphan reaping on Unix.
+    ///
+    /// A process that has already exited counts as killed, even when delivering the signal failed
+    /// for that reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminationError`] if the kill could not be delivered to a process that is still
+    /// running or whose state could not be determined. The guards stay armed, so dropping the
+    /// handle retries the kill and panics. Call
+    /// [`must_not_be_terminated`](Self::must_not_be_terminated) to accept the failure instead.
+    pub fn start_kill(&mut self) -> Result<(), TerminationError> {
+        self.stdin().close();
+
+        if let Err(err) = self.send_kill_signal() {
+            let mut diagnostics = TerminationDiagnostics::default();
+            diagnostics.record(
+                TerminationAction::SendSignal {
+                    signal_name: KILL_LABEL,
+                },
+                err,
+            );
+            // The OS rejects signals to a group whose leader exited but was not reaped yet
+            // (`ESRCH` on Linux, `EPERM` on macOS). Unlike `terminate`, a synchronous call cannot
+            // wait out a grace period, so it reaps once to tell that apart from a real failure.
+            match self.try_reap_exit_status() {
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(diagnostics.into_termination_failed(self.name.clone())),
+                Err(reap_error) => {
+                    diagnostics.record(TerminationAction::CheckStatus, reap_error);
+                    return Err(diagnostics.into_termination_failed(self.name.clone()));
+                }
+            }
+        }
+
+        self.must_not_be_terminated();
+        Ok(())
+    }
 }
 
 // Graceful-termination methods. Only available on Unix and Windows because they rely on platform

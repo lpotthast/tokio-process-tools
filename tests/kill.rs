@@ -166,3 +166,44 @@ fn grandchild_is_gone(pid: u32) -> bool {
 fn grandchild_is_gone(pid: u32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_err()
 }
+
+#[tokio::test]
+async fn start_kill_disarms_guards_without_reaping() {
+    let mut process = spawn_long_running_process();
+
+    process.start_kill().unwrap();
+
+    assert_that!(process.stdin().is_open()).is_false();
+    assert_that!(process.is_drop_disarmed()).is_true();
+    let status = process
+        .wait_for_completion(Duration::from_secs(2))
+        .await
+        .unwrap()
+        .expect_completed("a killed process should exit");
+    assert_that!(status.success()).is_false();
+}
+
+#[test]
+fn start_kill_needs_no_runtime() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut process = runtime.block_on(async { spawn_long_running_process() });
+    // Shut the runtime down: killing and dropping the handle below run without one.
+    drop(runtime);
+
+    process.start_kill().unwrap();
+
+    drop(process);
+}
+
+#[tokio::test]
+async fn start_kill_succeeds_after_the_process_exited() {
+    let mut process = spawn_immediately_exiting_process();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    process.start_kill().unwrap();
+
+    assert_that!(process.is_drop_disarmed()).is_true();
+}
