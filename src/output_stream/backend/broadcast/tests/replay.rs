@@ -23,8 +23,8 @@ fn best_effort_replay_options(
 }
 
 fn assert_recv_chunk(maybe_event: Option<StreamEvent>, expected: &[u8]) {
-    assert_that!(maybe_event)
-        .is_some()
+    assert_that_owned!(maybe_event)
+        .get_some()
         .is_chunk()
         .is_equal_to(expected);
 }
@@ -147,7 +147,7 @@ async fn active_subscribers_still_receive_unread_tail_data_after_seal() {
     stream.seal_replay();
 
     let collected = collector.wait().await.unwrap();
-    assert_that!(collected.lines().iter().map(String::as_str)).contains_exactly(["tail"]);
+    assert_that_owned!(collected.lines().iter().map(String::as_str)).contains_exactly(["tail"]);
 }
 
 #[tokio::test]
@@ -198,11 +198,11 @@ async fn slow_best_effort_replay_subscriber_observes_gap_then_newer_live_data() 
     drop(write_half);
 
     assert_that!(subscriber.recv().await)
-        .is_some()
+        .get_some()
         .is_equal_to(StreamEvent::Gap);
     assert_recv_chunk(subscriber.recv().await, b"e");
     assert_that!(subscriber.recv().await)
-        .is_some()
+        .get_some()
         .is_equal_to(StreamEvent::Eof);
 }
 
@@ -218,10 +218,10 @@ async fn best_effort_replay_delivers_terminal_after_pending_gap() {
     wait_for_bytes_ingested(&stream, 2).await;
 
     assert_that!(subscriber.recv().await)
-        .is_some()
+        .get_some()
         .is_equal_to(StreamEvent::Gap);
     assert_that!(subscriber.recv().await)
-        .is_some()
+        .get_some()
         .is_equal_to(StreamEvent::Eof);
 }
 

@@ -150,7 +150,7 @@ mod tests {
             .is_chunk()
             .is_equal_to(b"ef");
         assert_that!(state.terminal.as_ref().map(|event| &event.event))
-            .is_some()
+            .get_some()
             .is_equal_to(&StreamEvent::Eof);
     }
 }

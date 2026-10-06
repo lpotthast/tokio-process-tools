@@ -297,10 +297,10 @@ mod tests {
         append_event(&shared, options, StreamEvent::Eof).await;
 
         assert_that!(subscription.recv().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::Gap);
         assert_that!(subscription.recv().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::Eof);
     }
 
@@ -315,7 +315,7 @@ mod tests {
         let mut subscription = subscribe(&shared, options);
         assert_next_chunk(&mut subscription, b"tail").await;
         assert_that!(subscription.recv().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::Eof);
     }
 
@@ -389,7 +389,7 @@ mod tests {
         assert_next_chunk(&mut subscription, b"replay").await;
         assert_next_chunk(&mut subscription, b"live").await;
         assert_that!(subscription.recv().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::Eof);
     }
 }

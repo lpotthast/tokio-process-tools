@@ -113,7 +113,7 @@ mod tests {
             ])
             .await;
             assert_that!(result)
-                .is_ok()
+                .get_ok()
                 .is_equal_to(WaitForLineResult::Matched);
         }
 
@@ -125,7 +125,7 @@ mod tests {
             ])
             .await;
             assert_that!(result)
-                .is_ok()
+                .get_ok()
                 .is_equal_to(WaitForLineResult::Matched);
         }
 
@@ -137,7 +137,7 @@ mod tests {
             ])
             .await;
             assert_that!(result)
-                .is_ok()
+                .get_ok()
                 .is_equal_to(WaitForLineResult::StreamClosed);
         }
 
@@ -151,7 +151,7 @@ mod tests {
             ])
             .await;
             assert_that!(result)
-                .is_ok()
+                .get_ok()
                 .is_equal_to(WaitForLineResult::StreamClosed);
         }
 
@@ -201,7 +201,7 @@ mod tests {
             .await;
 
             assert_that!(result)
-                .is_ok()
+                .get_ok()
                 .is_equal_to(WaitForLineResult::Matched);
         }
     }

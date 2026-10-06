@@ -304,9 +304,9 @@ mod tests {
     impl AsyncLineVisitor for CollectingAsyncSink {
         type Output = ();
 
-        async fn on_line(&mut self, line: Cow<'_, str>) -> Next {
+        fn on_line(&mut self, line: Cow<'_, str>) -> impl Future<Output = Next> {
             self.seen.lock().unwrap().push(line.into_owned());
-            Next::Continue
+            std::future::ready(Next::Continue)
         }
 
         fn into_output(self) -> Self::Output {}

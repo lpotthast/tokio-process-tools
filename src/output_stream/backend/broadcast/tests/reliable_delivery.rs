@@ -32,7 +32,8 @@ async fn block_until_subscribers_catch_up_preserves_all_output_for_active_subscr
     drop(write_half);
 
     let collected = collector.wait().await.unwrap();
-    assert_that!(collected.lines().iter().map(String::as_str)).contains_exactly(["a", "b", "c"]);
+    assert_that_owned!(collected.lines().iter().map(String::as_str))
+        .contains_exactly(["a", "b", "c"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -71,6 +72,6 @@ async fn block_until_subscribers_catch_up_gated_multi_subscriber_collection_comp
     .await;
 
     assert_that!(result)
-        .is_ok()
+        .get_ok()
         .is_equal_to(total_bytes * subscriber_count);
 }

@@ -100,7 +100,7 @@ mod is_running {
                 assert_that!(process).fail("process should not be running anymore");
             }
             RunningState::Terminated(exit_status) => {
-                assert_that!(exit_status.code()).is_some().is_equal_to(0);
+                assert_that!(exit_status.code()).get_some().is_equal_to(0);
                 assert_that!(exit_status.success()).is_true();
             }
             RunningState::Uncertain(_) => {

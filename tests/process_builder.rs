@@ -55,8 +55,8 @@ where
         .expect_completed("process should complete");
 
     assert_that!(output.status.success()).is_true();
-    assert_that!(output.stdout.lines().iter().map(String::as_str)).contains_exactly(["out"]);
-    assert_that!(output.stderr.lines().iter().map(String::as_str)).contains_exactly(["err"]);
+    assert_that_owned!(output.stdout.lines().iter().map(String::as_str)).contains_exactly(["out"]);
+    assert_that_owned!(output.stderr.lines().iter().map(String::as_str)).contains_exactly(["err"]);
 }
 
 mod shared_config {

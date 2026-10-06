@@ -95,10 +95,10 @@ mod tests {
         drop(sender);
 
         assert_that!(subscription.next_event().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::chunk(b"old"));
         assert_that!(subscription.next_event().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::chunk(b"live"));
         assert_that!(subscription.next_event().await).is_none();
     }
@@ -122,10 +122,10 @@ mod tests {
             .unwrap();
 
         assert_that!(subscription.next_event().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::chunk(b"old"));
         assert_that!(subscription.next_event().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::Eof);
         assert_that!(subscription.next_event().await).is_none();
     }
@@ -150,7 +150,7 @@ mod tests {
         );
 
         assert_that!(subscription.next_event().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::Gap);
         match subscription.next_event().await {
             Some(StreamEvent::ReadError(err)) => {
@@ -162,7 +162,7 @@ mod tests {
             }
         }
         assert_that!(subscription.next_event().await)
-            .is_some()
+            .get_some()
             .is_equal_to(StreamEvent::Eof);
         assert_that!(subscription.next_event().await).is_none();
     }
@@ -179,7 +179,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("single-subscriber state poisoned");
-            assert_that!(state.active_id).is_some().is_equal_to(id);
+            assert_that!(state.active_id).get_some().is_equal_to(id);
         }
 
         drop(subscription);

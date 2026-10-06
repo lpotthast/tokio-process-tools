@@ -40,7 +40,7 @@ default = []
 __test-helpers = ["tokio/signal"]
 
 [dev-dependencies]
-assertr = "0.6.0"
+assertr = "0.7.1"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 jiff = "0.2.16"
 proptest = { version = "1.5.0", default-features = false, features = ["std", "bit-set"] }

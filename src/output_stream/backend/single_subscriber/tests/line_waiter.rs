@@ -61,7 +61,7 @@ async fn subscribes_before_polling() {
     drop(write_half);
 
     assert_that!(waiter.await)
-        .is_ok()
+        .get_ok()
         .is_equal_to(WaitForLineResult::Matched);
 }
 
@@ -85,6 +85,6 @@ async fn stream_drop_closes_waiting_line_waiters() {
 
     let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;
     assert_that!(result)
-        .is_ok()
+        .get_ok()
         .is_equal_to(Ok(WaitForLineResult::StreamClosed));
 }
