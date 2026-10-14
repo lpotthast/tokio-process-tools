@@ -163,7 +163,7 @@ mod tests {
 
         let outcome = inspector.cancel(Duration::from_secs(1)).await.unwrap();
 
-        assert_that!(matches!(outcome, ConsumerCancelOutcome::Cancelled(()))).is_true();
+        assert_that!(outcome).is_matching(pattern!(ConsumerCancelOutcome::Cancelled(())));
     }
 
     mod inspect_lines {
@@ -196,17 +196,10 @@ mod tests {
                 ParseLines::inspect(LineParsingOptions::default(), |_line| Next::Continue),
             );
 
-            match inspector.wait().await {
-                Err(ConsumerError::StreamRead { source }) => {
-                    assert_that!(source.stream_name()).is_equal_to("custom");
-                    assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-                }
-                other => {
-                    assert_that!(&other).fail(format_args!(
-                        "expected inspector stream read error, got {other:?}"
-                    ));
-                }
-            }
+            assert_that!(inspector.wait().await).err().is_matching(pattern!(
+                ConsumerError::StreamRead { source }
+                    if source.stream_name() == "custom" && source.kind() == io::ErrorKind::BrokenPipe
+            ));
         }
 
         #[tokio::test]
@@ -312,7 +305,7 @@ mod tests {
             inspector.wait().await.unwrap();
 
             let seen = seen.lock().unwrap().clone();
-            assert_that!(seen).is_equal_to(vec![b"ab".to_vec(), b"cd".to_vec(), b"ef".to_vec()]);
+            assert_that!(seen).contains_exactly([b"ab", b"cd", b"ef"]);
         }
     }
 

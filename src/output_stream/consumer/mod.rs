@@ -1,8 +1,7 @@
 //! Tokio runtime adapter. Drives a [`StreamVisitor`](crate::StreamVisitor) over a
 //! [`Subscription`](crate::output_stream::Subscription) on a tokio task and exposes the
-//! [`Consumer<S>`] handle with cooperative-cancel / abort semantics. Required machinery;
-//! tokio-bound by construction. The visitor traits this module drives are runtime-agnostic and
-//! live one level up at [`crate::output_stream::visitor`].
+//! [`Consumer<S>`] handle with cooperative-cancel / abort semantics. The visitor traits this
+//! module drives are runtime-agnostic and live one level up at [`crate::output_stream::visitor`].
 
 pub(crate) mod driver;
 
@@ -17,11 +16,11 @@ use tokio::time::{Instant, sleep_until};
 
 /// Errors that the [`Consumer`] infrastructure itself can raise while driving its stream.
 ///
-/// These describe failures of the consumer task: joining, or reading the underlying stream.
-/// Visitor-specific failures (for example, a write-backed visitor's sink rejecting bytes) live
-/// in the visitor's own [`StreamVisitor::Output`](crate::StreamVisitor::Output) /
-/// [`AsyncStreamVisitor::Output`](crate::AsyncStreamVisitor::Output) type, not here. So a
-/// writer-backed consumer's `wait` returns
+/// These describe failures of the consumer task itself: joining it, or reading the underlying
+/// stream. Visitor-specific failures (for example, a write-backed visitor's sink rejecting bytes)
+/// live in the visitor's own [`StreamVisitor::Output`](crate::StreamVisitor::Output) /
+/// [`AsyncStreamVisitor::Output`](crate::AsyncStreamVisitor::Output) type, not here. A
+/// writer-backed consumer's `wait` therefore returns
 /// `Result<Result<W, SinkWriteError>, ConsumerError>`: the outer result is what `ConsumerError`
 /// describes, the inner is the writer visitor's own outcome.
 #[derive(Debug, Error)]
@@ -79,7 +78,7 @@ impl<S: Sink> ConsumerCancelOutcome<S> {
     /// Returns the sink from a cooperative cancellation, panicking with `message` if the timeout
     /// elapsed and the task was aborted instead.
     ///
-    /// Useful in tests where cooperative cancellation is expected to win the race; production
+    /// Useful in tests where cooperative cancellation is expected to win the race. Production
     /// code should match on the outcome explicitly.
     ///
     /// # Panics
@@ -105,14 +104,15 @@ impl<S: Sink> ConsumerCancelOutcome<S> {
 /// The type parameter `S` is the visitor's output (a sink, a writer, `()`, or another value
 /// the visitor returns when the stream ends).
 ///
-/// For proper cleanup, call
-/// - `wait()`, which waits for the consumer task to complete.
-/// - `cancel(timeout)`, which asks the consumer to stop, waits for cooperative completion, and
-///   aborts the task if the timeout elapses first.
-/// - `abort()`, which forcefully aborts the consumer task.
+/// For proper cleanup, call one of:
 ///
-/// If not cleaned up, the termination signal will be sent when dropping this consumer,
-/// but the task will be aborted (forceful, not waiting for its regular completion).
+/// - [`wait`](Self::wait), which waits for the consumer task to complete.
+/// - [`cancel`](Self::cancel), which asks the consumer to stop, waits for cooperative completion,
+///   and aborts the task if the timeout elapses first.
+/// - [`abort`](Self::abort), which forcefully aborts the consumer task.
+///
+/// A consumer dropped without any of these still receives the cooperative stop signal, but its
+/// task is then aborted immediately instead of being awaited, and the visitor's output is lost.
 pub struct Consumer<S: Sink> {
     /// The name of the stream this consumer operates on.
     pub(crate) stream_name: &'static str,
@@ -219,8 +219,8 @@ impl<S: Sink> Consumer<S> {
     /// 2. The underlying stream is closed (by receiving an EOF / final read of 0 bytes).
     /// 3. The first `Next::Break` is observed.
     ///
-    /// If none of these may occur in your case, this can hang forever. `wait` also waits for any
-    /// in-flight async visitor callback or writer call to complete.
+    /// If none of these can occur in your case, this future never resolves. `wait` also waits for
+    /// any in-flight async visitor callback or writer call to complete.
     ///
     /// The stdout/stderr streams naturally close when the process is terminated, so `wait`ing
     /// on a consumer after termination is fine:
@@ -297,7 +297,7 @@ impl<S: Sink> Consumer<S> {
     ///
     /// Returns [`ConsumerCancelOutcome::Cancelled`] with the sink when the consumer observes
     /// cancellation and exits normally before the timeout. Returns
-    /// [`ConsumerCancelOutcome::Aborted`] when the timeout elapses; in that case the task is
+    /// [`ConsumerCancelOutcome::Aborted`] when the timeout elapses. In that case the task is
     /// aborted, any pending callback/write future is dropped, and the sink/writer is not returned.
     ///
     /// Cancellation is still cooperative until the timeout boundary: an in-flight async callback
@@ -392,13 +392,8 @@ mod tests {
 
         let outcome = consumer.cancel(Duration::from_secs(1)).await.unwrap();
 
-        match outcome {
-            ConsumerCancelOutcome::Cancelled(bytes) => {
-                assert_that!(bytes).is_empty();
-            }
-            ConsumerCancelOutcome::Aborted => {
-                assert_that!(()).fail("expected cooperative cancellation");
-            }
-        }
+        assert_that!(outcome).is_matching(
+            pattern!(ConsumerCancelOutcome::<Vec<u8>>::Cancelled(bytes) if bytes.is_empty()),
+        );
     }
 }

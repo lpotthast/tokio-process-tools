@@ -19,8 +19,9 @@ async fn dropping_fast_stream_closes_waiting_subscribers() {
 
     let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;
     assert_that!(result)
-        .get_ok()
-        .is_equal_to(Ok(WaitForLineResult::StreamClosed));
+        .ok()
+        .ok()
+        .is_equal_to(WaitForLineResult::StreamClosed);
 }
 
 #[tokio::test]
@@ -41,6 +42,7 @@ async fn dropping_fanout_replay_stream_closes_waiting_subscribers() {
 
     let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;
     assert_that!(result)
-        .get_ok()
-        .is_equal_to(Ok(WaitForLineResult::StreamClosed));
+        .ok()
+        .ok()
+        .is_equal_to(WaitForLineResult::StreamClosed);
 }

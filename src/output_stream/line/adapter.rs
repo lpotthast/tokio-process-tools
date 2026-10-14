@@ -3,10 +3,10 @@
 //!
 //! Each line-aware visitor ([`InspectLines`], [`CollectLines`],
 //! [`crate::visitors::wait::WaitForLine`], [`crate::visitors::write::WriteLines`],
-//! plus their async twins) collapses to an inner  [`LineVisitor`] / [`AsyncLineVisitor`] that only
-//! describes the per-line action. Adding a new line-aware visitor is now "implement [`LineVisitor`]
-//! (or [`AsyncLineVisitor`]) and compose with [`ParseLines`]," not "re-derive the parser plumbing
-//! for the seventh time."
+//! plus their async twins) collapses to an inner [`LineVisitor`] / [`AsyncLineVisitor`] that only
+//! describes the per-line action. The parser plumbing (chunk handling, gap resets, EOF flushing)
+//! lives here once, so a new line-aware visitor only has to implement [`LineVisitor`] (or
+//! [`AsyncLineVisitor`]) and compose with [`ParseLines`].
 //!
 //! A single [`ParseLines<S>`] struct serves both the sync and async paths: it carries two
 //! trait impls ([`StreamVisitor`] when `S: LineVisitor`, [`AsyncStreamVisitor`] when
@@ -20,7 +20,7 @@
 //! Encoding the `max_line_length > 0` invariant as a `NonZero*` newtype was rejected on
 //! ergonomic grounds: every caller of `LineParsingOptions` would inherit the wrapper, even
 //! when they construct it from a known-non-zero literal. The runtime assert lives in
-//! [`super::options`] as the single source of that check; the constraint is documented on
+//! [`super::options`] as the single source of that check, and the constraint is documented on
 //! [`LineParsingOptions::max_line_length`].
 
 use super::options::{LineParsingOptions, assert_max_line_length_non_zero};
@@ -36,7 +36,7 @@ use std::future::Future;
 
 /// Per-line action selected by the [`StreamVisitor`] impl of [`ParseLines`].
 ///
-/// Implementors only describe what should happen for each parsed line; chunk parsing, gap
+/// Implementors only describe what should happen for each parsed line. Chunk parsing, gap
 /// handling, and EOF flushing are carried by the adapter.
 pub trait LineVisitor: Send + 'static {
     /// Final value produced once the adapter is finished. Returned via
@@ -47,12 +47,12 @@ pub trait LineVisitor: Send + 'static {
     fn on_line(&mut self, line: Cow<'_, str>) -> Next;
 
     /// Invoked after the adapter resets the parser following a stream gap. The default does
-    /// nothing; override when the inner sink keeps line-spanning state that the gap
+    /// nothing. Override it when the inner sink keeps line-spanning state that the gap
     /// invalidates.
     fn on_gap(&mut self) {}
 
     /// Invoked once the adapter finishes flushing any trailing line at EOF. The default does
-    /// nothing; override for sinks that want a finalization hook beyond the last `on_line`
+    /// nothing. Override it for sinks that want a finalization hook beyond the last `on_line`
     /// call.
     fn on_eof(&mut self) {}
 
@@ -74,8 +74,8 @@ pub trait LineVisitor: Send + 'static {
 /// of the chunk on the fast path, so it avoids a per-line allocation when the line fits in the
 /// current chunk. The allocation is the cost of holding the parser's borrow across an `.await`,
 /// which Rust does not allow because the next iteration re-borrows the parser. Prefer
-/// [`LineVisitor`] (composed via [`ParseLines::inspect`] / [`ParseLines::collect`]) when
-/// per-line work is non-blocking, and you want the zero-copy fast path; reach for
+/// [`LineVisitor`] (composed via [`ParseLines::inspect`] / [`ParseLines::collect`]) when the
+/// per-line work is non-blocking and you want the zero-copy fast path. Reach for
 /// [`AsyncLineVisitor`] only when the per-line work genuinely needs to await.
 pub trait AsyncLineVisitor: Send + 'static {
     /// Final value produced once the adapter is finished.
@@ -85,10 +85,10 @@ pub trait AsyncLineVisitor: Send + 'static {
     /// parsing.
     fn on_line<'a>(&'a mut self, line: Cow<'a, str>) -> impl Future<Output = Next> + Send + 'a;
 
-    /// Synchronous gap hook; default no-op. See [`LineVisitor::on_gap`].
+    /// Synchronous gap hook, a no-op by default. See [`LineVisitor::on_gap`].
     fn on_gap(&mut self) {}
 
-    /// Asynchronous EOF hook; default no-op. Invoked after the adapter has flushed any
+    /// Asynchronous EOF hook, a no-op by default. Invoked after the adapter has flushed any
     /// trailing line through `on_line`.
     fn on_eof(&mut self) -> impl Future<Output = ()> + Send + '_ {
         async {}
@@ -116,7 +116,7 @@ impl<S> ParseLines<S> {
     /// # Panics
     ///
     /// Panics if `options.max_line_length` is zero. See
-    /// [`LineParsingOptions::max_line_length`] for the rationale; pass
+    /// [`LineParsingOptions::max_line_length`] for the rationale, and pass
     /// [`crate::NumBytes::MAX`] for effectively-unbounded line parsing.
     pub fn new(options: LineParsingOptions, inner: S) -> Self {
         assert_max_line_length_non_zero(&options);

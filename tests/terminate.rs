@@ -9,7 +9,7 @@ use std::io;
 use std::time::Duration;
 use tokio_process_tools::{
     DEFAULT_MAX_BUFFERED_CHUNKS, DEFAULT_READ_CHUNK_SIZE, NumBytesExt, Process, ProcessHandle,
-    WindowsGracefulShutdown,
+    WaitForLineResult, WindowsGracefulShutdown,
 };
 
 #[cfg(unix)]
@@ -121,7 +121,7 @@ async fn canceled_terminate_keeps_drop_guards_armed() {
         )
         .await;
 
-    assert_that!(result.is_err()).is_true();
+    assert_that!(result).is_err();
     assert_that!(process.is_drop_armed()).is_true();
 
     process.kill().await.unwrap();
@@ -140,7 +140,7 @@ async fn canceled_terminate_keeps_drop_guards_armed() {
     )
     .await;
 
-    assert_that!(result.is_err()).is_true();
+    assert_that!(result).is_err();
     assert_that!(process.is_drop_armed()).is_true();
 
     process.kill().await.unwrap();
@@ -161,7 +161,21 @@ async fn terminate_stops_process() {
         })
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Wait until the helper reports that its graceful-signal handler is installed; terminating
+    // earlier races the installation and the child dies from the raw signal instead of exiting
+    // through its handler.
+    let readiness = handle
+        .stdout()
+        .wait_for_line(
+            Duration::from_secs(5),
+            |line| line == "ready",
+            line_parsing_options(),
+        )
+        .await
+        .unwrap();
+    assert_that!(readiness).is_equal_to(WaitForLineResult::Matched);
+
     let exit_status = handle.terminate(default_graceful_shutdown()).await.unwrap();
     let terminated_at = jiff::Zoned::now();
 
@@ -170,7 +184,7 @@ async fn terminate_stops_process() {
 
     // The helper installs a graceful-signal handler and exits via `process::exit(1)`, so the
     // child reports a clean exit with code 1 on both platforms.
-    assert_that!(exit_status.code()).is_equal_to(Some(1));
+    assert_that!(exit_status.code()).some().is_equal_to(1);
     assert_that!(exit_status.success()).is_false();
 
     assert_that!(handle.is_drop_disarmed()).is_true();
@@ -318,11 +332,9 @@ async fn handler_less_child_exits_in_milliseconds_under_long_timeout() {
     let exit_status = handle.terminate(shutdown).await.unwrap();
     let elapsed = started.elapsed();
 
-    assert_that!(elapsed < Duration::from_secs(2))
-        .with_detail_message(format!(
-            "handler-less child should exit within milliseconds, took {elapsed:?}"
-        ))
-        .is_true();
+    assert_that!(elapsed)
+        .with_detail_message("handler-less child should exit within milliseconds")
+        .is_less_than(Duration::from_secs(2));
     assert_that!(exit_status.success()).is_false();
     assert_that!(handle.is_drop_disarmed()).is_true();
 }

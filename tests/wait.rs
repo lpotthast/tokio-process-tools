@@ -55,10 +55,7 @@ async fn wait_for_completion_closes_stdin_before_waiting() {
 
     let collector = collect_lines_into_vec(process.stdout()).unwrap_infallible();
 
-    let Some(stdin) = process.stdin().as_mut() else {
-        assert_that!(process.stdin().is_open()).fail("stdin should start open");
-        return;
-    };
+    let stdin = process.stdin().as_mut().expect("stdin should start open");
     stdin.write_all(b"wait closes stdin\n").await.unwrap();
     stdin.flush().await.unwrap();
 
@@ -72,8 +69,7 @@ async fn wait_for_completion_closes_stdin_before_waiting() {
     assert_that!(process.stdin().is_open()).is_false();
 
     let collected = collector.wait().await.unwrap();
-    assert_that!(collected.lines().len()).is_equal_to(1);
-    assert_that!(collected[0].as_str()).is_equal_to("wait closes stdin");
+    assert_that!(collected.lines()).contains_exactly(["wait closes stdin"]);
 }
 
 #[cfg(any(unix, windows))]
@@ -110,20 +106,16 @@ async fn or_terminate_returns_wait_failure_after_cleanup() {
             ..
         }) => (wait_error, termination_status),
         other => {
-            assert_that!(&other).fail(format_args!(
-                "expected wait failure preserved after successful cleanup, got {other:?}"
-            ));
-            return;
+            panic!("expected wait failure preserved after successful cleanup, got {other:?}");
         }
     };
 
     assert_that!(termination_status.success()).is_false();
 
     let WaitError::IoError { source, .. } = *wait_error else {
-        assert_that!(()).fail("expected WaitError::IoError variant");
-        return;
+        panic!("expected WaitError::IoError variant");
     };
-    assert_that!(source.to_string().as_str()).is_equal_to("synthetic wait failure");
+    assert_that!(source).has_display_value("synthetic wait failure");
 }
 
 #[cfg(any(unix, windows))]
@@ -153,10 +145,7 @@ async fn wait_for_completion_or_terminate_terminates_after_timeout() {
             result
         }
         other @ WaitForCompletionOrTerminateResult::Completed(_) => {
-            assert_that!(&other).fail(format_args!(
-                "expected timeout-driven termination, got {other:?}"
-            ));
-            return;
+            panic!("expected timeout-driven termination, got {other:?}");
         }
     };
 

@@ -185,10 +185,10 @@ impl<H> WriteCollectionOptions<H> {
     }
 }
 
-/// Asynchronous [`StreamVisitor`](AsyncStreamVisitor) that runs each observed chunk
-/// through `mapper`, writes the resulting bytes via `writer`, and routes failures through
-/// `error_handler`. The visitor surfaces the writer (or the first sink write error) via
-/// [`AsyncStreamVisitor::into_output`](AsyncStreamVisitor::into_output).
+/// [`AsyncStreamVisitor`] that runs each observed chunk through `mapper`, writes the resulting
+/// bytes via `writer`, and routes failures through `error_handler`. The visitor surfaces the
+/// writer (or the first sink write error) via
+/// [`into_output`](AsyncStreamVisitor::into_output).
 ///
 /// The two common shapes have dedicated constructors:
 /// - [`WriteChunks::passthrough`] writes each chunk's raw bytes unchanged.
@@ -199,7 +199,7 @@ impl<H> WriteCollectionOptions<H> {
 /// [`builder`](Self::builder) directly.
 ///
 /// `WriteChunks` is [`AsyncStreamVisitor`]-only because the underlying writer is
-/// [`AsyncWriteExt`]. There is no synchronous counterpart; reach for
+/// [`AsyncWriteExt`]. There is no synchronous counterpart. Reach for
 /// [`CollectChunks`](crate::visitors::collect::CollectChunks) (with a sink that performs the
 /// blocking write) if you need a sync chunk-level visitor.
 #[derive(TypedBuilder)]
@@ -705,15 +705,9 @@ mod tests {
             WriteCollectionOptions::fail_fast(),
         );
 
-        match collector.wait().await {
-            Ok(Err(err)) => {
-                assert_that!(err.stream_name()).is_equal_to("custom");
-                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-            }
-        }
+        assert_that!(collector.wait().await).is_matching(pattern!(
+            Ok(Err(err @ SinkWriteError { .. })) if err.stream_name() == "custom" && err.source().kind() == io::ErrorKind::BrokenPipe
+        ));
 
         let handled_count = Arc::new(Mutex::new(0_usize));
         let count_for_handler = Arc::clone(&handled_count);
@@ -754,14 +748,9 @@ mod tests {
         )
         .wait()
         .await;
-        match line_error {
-            Ok(Err(err)) => {
-                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected line write error, got {other:?}"));
-            }
-        }
+        assert_that!(line_error).is_matching(pattern!(
+            Ok(Err(err @ SinkWriteError { .. })) if err.source().kind() == io::ErrorKind::BrokenPipe
+        ));
 
         let delimiter_error = collect_lines_into_write(
             "custom",
@@ -777,16 +766,9 @@ mod tests {
         )
         .wait()
         .await;
-        match delimiter_error {
-            Ok(Err(err)) => {
-                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::WriteZero);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!(
-                    "expected delimiter write error, got {other:?}"
-                ));
-            }
-        }
+        assert_that!(delimiter_error).is_matching(pattern!(
+            Ok(Err(err @ SinkWriteError { .. })) if err.source().kind() == io::ErrorKind::WriteZero
+        ));
     }
 
     #[tokio::test]
@@ -807,7 +789,7 @@ mod tests {
         );
 
         let writer = collector.wait().await.unwrap().unwrap();
-        assert_that!(writer.bytes).is_equal_to(b"Cargo.lockCargo.tomlREADME.mdsrctarget".to_vec());
+        assert_that!(writer.bytes).is_equal_to(b"Cargo.lockCargo.tomlREADME.mdsrctarget");
     }
 
     #[tokio::test]
@@ -825,7 +807,7 @@ mod tests {
         );
 
         let writer = collector.wait().await.unwrap().unwrap();
-        assert_that!(writer.bytes).is_equal_to(b"abcdef".to_vec());
+        assert_that!(writer.bytes).is_equal_to(b"abcdef");
         assert_that!(writer.write_calls.get()).is_greater_than(0);
     }
 
@@ -845,7 +827,7 @@ mod tests {
         );
 
         let writer = collector.wait().await.unwrap().unwrap();
-        assert_that!(writer.bytes).is_equal_to(b"Cargo.lock\nCargo.toml\n".to_vec());
+        assert_that!(writer.bytes).is_equal_to(b"Cargo.lock\nCargo.toml\n");
     }
 
     #[tokio::test]
@@ -863,14 +845,9 @@ mod tests {
         )
         .wait()
         .await;
-        match chunk_error {
-            Ok(Err(err)) => {
-                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::ConnectionReset);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-            }
-        }
+        assert_that!(chunk_error).is_matching(pattern!(
+            Ok(Err(err @ SinkWriteError { .. })) if err.source().kind() == io::ErrorKind::ConnectionReset
+        ));
 
         let line_error = collect_lines_into_write_mapped(
             "custom",
@@ -887,14 +864,9 @@ mod tests {
         )
         .wait()
         .await;
-        match line_error {
-            Ok(Err(err)) => {
-                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-            }
-        }
+        assert_that!(line_error).is_matching(pattern!(
+            Ok(Err(err @ SinkWriteError { .. })) if err.source().kind() == io::ErrorKind::BrokenPipe
+        ));
     }
 
     #[tokio::test]
@@ -924,7 +896,7 @@ mod tests {
 
         let write = collector.wait().await.unwrap().unwrap();
         assert_that!(write.bytes_written).is_equal_to(0);
-        assert_that!(events.lock().unwrap().as_slice()).is_equal_to([
+        assert_that!(events.lock().unwrap().as_slice()).contains_exactly([
             (
                 "custom",
                 SinkWriteOperation::Line,
@@ -965,14 +937,9 @@ mod tests {
             }),
         );
 
-        match collector.wait().await {
-            Ok(Err(err)) => {
-                assert_that!(err.source().kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected sink write error, got {other:?}"));
-            }
-        }
+        assert_that!(collector.wait().await).is_matching(pattern!(
+            Ok(Err(err @ SinkWriteError { .. })) if err.source().kind() == io::ErrorKind::BrokenPipe
+        ));
         assert_that!(*handled_count.lock().unwrap()).is_equal_to(2);
     }
 }

@@ -37,7 +37,7 @@ async fn drop_allows_later_collector() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"later");
 }
 
 #[tokio::test]
@@ -67,7 +67,7 @@ async fn wait_cancellation_releases_single_subscriber_claim() {
     entered_rx.await.unwrap();
 
     let result = tokio::time::timeout(Duration::from_millis(25), inspector.wait()).await;
-    assert_that!(result.is_err()).is_true();
+    assert_that!(result).is_err();
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
@@ -80,7 +80,7 @@ async fn wait_cancellation_releases_single_subscriber_claim() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"later\n".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"later\n");
 }
 
 #[tokio::test]
@@ -111,7 +111,7 @@ async fn cancel_aborts_hanging_async_callback_after_timeout() {
     entered_rx.await.unwrap();
 
     let outcome = inspector.cancel(Duration::from_millis(25)).await.unwrap();
-    assert_that!(matches!(outcome, ConsumerCancelOutcome::Aborted)).is_true();
+    assert_that!(outcome).is_matching(pattern!(ConsumerCancelOutcome::Aborted));
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
@@ -124,7 +124,7 @@ async fn cancel_aborts_hanging_async_callback_after_timeout() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"later");
 }
 
 #[tokio::test]
@@ -167,5 +167,5 @@ async fn abort_releases_single_subscriber_claim() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"later");
 }

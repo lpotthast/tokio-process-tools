@@ -10,7 +10,7 @@
 //! For a runnable demonstration, this example spawns a `sh` pipeline that simulates a web
 //! server: it sleeps briefly, prints the readiness line, then sleeps for the rest of its
 //! life so we can exercise the cleanup path. Swap the command for your real binary in
-//! production; the rest of the structure is unchanged.
+//! production. The rest of the structure is unchanged.
 //!
 //! Run: `cargo run --example wait_for_readiness` (Unix / macOS; on Windows, swap `sh` for
 //! a comparable shell pipeline).

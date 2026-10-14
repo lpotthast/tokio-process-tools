@@ -81,7 +81,7 @@ impl StreamConfigBuilder {
     ///
     /// **Scope:** the guarantee applies only to subscribers that are *currently attached* when
     /// each chunk is produced. Subscribers that attach later are not retroactively delivered
-    /// earlier chunks by this policy; that is what the replay axis is for.
+    /// earlier chunks by this policy. That is what the replay axis is for.
     #[must_use]
     pub fn reliable_with_backpressure(self) -> StreamConfigReplayBuilder<ReliableWithBackpressure> {
         StreamConfigReplayBuilder {
@@ -144,7 +144,8 @@ where
 
     /// Retains all output of the stream.
     ///
-    /// This can potentially grow massively and could require a lot of memory.
+    /// The retained history grows without bound, limited only by how much the child writes. Use
+    /// this only when the output source and its output volume are trusted.
     ///
     /// Call `seal_replay()` on the stream once every consumer that needs the retained history has
     /// attached. Sealing applies to *future* consumers only: it stops new replay from being
@@ -370,48 +371,53 @@ mod tests {
 
     #[test]
     fn invalid_configs_panic_with_parameter_names() {
-        assert_that_panic_by(|| {
+        assert_that!(|| {
             let _config = StreamConfig::builder()
                 .lossy_without_backpressure()
                 .no_replay()
                 .read_chunk_size(0.bytes());
         })
-        .has_type::<String>()
+        .panics()
+        .message()
         .is_equal_to("read_chunk_size must be greater than zero bytes");
 
-        assert_that_panic_by(|| {
+        assert_that!(|| {
             let _config = StreamConfig::builder()
                 .lossy_without_backpressure()
                 .no_replay()
                 .read_chunk_size(8.bytes())
                 .max_buffered_chunks(0);
         })
-        .has_type::<String>()
+        .panics()
+        .message()
         .is_equal_to("max_buffered_chunks must be greater than zero");
 
-        assert_that_panic_by(|| {
+        assert_that!(|| {
             let _config = StreamConfig::builder()
                 .lossy_without_backpressure()
                 .replay_last_chunks(0);
         })
-        .has_type::<String>()
+        .panics()
+        .message()
         .is_equal_to("chunks must retain at least one chunk");
 
-        assert_that_panic_by(|| {
+        assert_that!(|| {
             let _config = StreamConfig::builder()
                 .lossy_without_backpressure()
                 .replay_last_bytes(NumBytes::zero());
         })
-        .has_type::<String>()
+        .panics()
+        .message()
         .is_equal_to("bytes must retain at least one byte");
 
-        assert_that_panic_by(|| {
+        assert_that!(|| {
             let _replay = ReplayEnabled::new(ReplayRetention::LastChunks(0));
         })
-        .has_type::<String>()
+        .panics()
+        .message()
         .is_equal_to("replay_retention must retain at least one chunk");
 
-        assert_that_panic_by(|| {
+        assert_that!(|| {
             let config = StreamConfig::builder()
                 .lossy_without_backpressure()
                 .replay_all()
@@ -422,10 +428,11 @@ mod tests {
             let _config =
                 config.with_replay_retention(ReplayRetention::LastBytes(NumBytes::zero()));
         })
-        .has_type::<String>()
+        .panics()
+        .message()
         .is_equal_to("replay_retention must retain at least one byte");
 
-        assert_that_panic_by(|| {
+        assert_that!(|| {
             let config = StreamConfig {
                 read_chunk_size: 8.bytes(),
                 max_buffered_chunks: 2,
@@ -437,7 +444,8 @@ mod tests {
 
             config.assert_valid("options");
         })
-        .has_type::<String>()
+        .panics()
+        .message()
         .is_equal_to("options.replay_retention must retain at least one byte");
     }
 

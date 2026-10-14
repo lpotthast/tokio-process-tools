@@ -83,10 +83,11 @@ mod tests {
 
     #[test]
     fn armed_drop_panics_with_expected_message() {
-        assert_that_panic_by(|| {
+        assert_that!(|| {
             let _guard = PanicOnDrop::new("ResourceX", "must be defused", "call defuse()");
         })
-        .has_type::<String>()
+        .panics()
+        .message()
         .contains("ResourceX")
         .contains("must be defused")
         .contains("call defuse()");
@@ -113,11 +114,12 @@ mod tests {
         // If this test reached a double-panic, the process would `abort` via Rust's no-double-panic
         // rule and `cargo test` would exit non-zero with no FAILED line. Reaching the assertions
         // below is itself part of the contract: only the first panic must escape.
-        assert_that_panic_by(|| {
+        assert_that!(|| {
             let _guard = PanicOnDrop::new("ResourceX", "must be defused", "call defuse()");
             panic!("first panic, the guard drops while unwinding from this");
         })
-        .has_type::<&str>()
+        .panics()
+        .message()
         .is_equal_to("first panic, the guard drops while unwinding from this");
     }
 }

@@ -380,6 +380,7 @@ pub(super) async fn append_event<D, R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_stream::event::tests::StreamEventAssertions;
     use crate::{NumBytesExt, ReplayEnabled};
     use assertr::prelude::*;
 
@@ -398,17 +399,8 @@ mod tests {
     }
 
     fn assert_chunk(event: Option<&IndexedEvent>, expected: &'static [u8]) {
-        match event {
-            Some(IndexedEvent {
-                event: StreamEvent::Chunk(chunk),
-                ..
-            }) => {
-                assert_that!(chunk.as_ref()).is_equal_to(expected);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected chunk, got {other:?}"));
-            }
-        }
+        let event = event.expect("expected a retained chunk event");
+        assert_that!(event.event).is_chunk().is_equal_to(expected);
     }
 
     #[test]
@@ -452,7 +444,7 @@ mod tests {
         state.push_event(StreamEvent::Eof, options);
         state.seal_replay();
 
-        assert_that!(state.replay.len()).is_equal_to(0);
+        assert_that!(state.replay).is_empty();
         assert_that!(state.replay_byte_count).is_equal_to(0);
         assert_that!(state.terminal).is_some();
     }
@@ -503,11 +495,8 @@ mod tests {
         });
 
         assert_that!(queue.recv().await.unwrap().event).is_equal_to(StreamEvent::Gap);
-        match queue.recv().await.unwrap().event {
-            StreamEvent::Chunk(chunk) => {
-                assert_that!(chunk.as_ref()).is_equal_to(b"c");
-            }
-            other => assert_that!(&other).fail(format_args!("expected chunk, got {other:?}")),
-        }
+        assert_that!(queue.recv().await.unwrap().event)
+            .is_chunk()
+            .is_equal_to(b"c");
     }
 }

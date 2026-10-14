@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.4] - 2026-10-14
+
+### Added
+
+- `TerminateOnDropFallback` and `ProcessHandle::terminate_on_drop_with_fallback(...)`. When a `TerminateOnDrop` is
+  dropped where its graceful shutdown cannot run (outside a Tokio runtime, inside a current-thread runtime, or while
+  unwinding), it kills the process group / Job Object immediately and then either panics (`Panic`, still the behavior
+  of `terminate_on_drop(...)`) or logs an error through `tracing` (`Trace`). The panic is never raised while the thread
+  is already unwinding.
+
+### Fixed
+
+- Calling `must_not_be_terminated()` on a `TerminateOnDrop` now actually lets the child outlive the wrapper. Previously,
+  the wrapper still terminated the child when dropped inside a multithreaded runtime.
+- Dropping a `TerminateOnDrop` outside a multithreaded runtime no longer panics when there is nothing left to
+  terminate, i.e. when the child has already exited or was already awaited, terminated, or killed through the wrapper.
+- When a graceful termination fails during drop, the logged error now includes its full structured details.
+
 ## [0.11.3] - 2026-10-06
 
 ### Added

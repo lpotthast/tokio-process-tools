@@ -37,14 +37,15 @@ impl Subscription for mpsc::Receiver<StreamEvent> {
     }
 }
 
-/// The output stream from a process. Either representing stdout or stderr.
+/// The output stream from a process (stdout or stderr) using the single-subscriber backend.
 ///
-/// This is the single-subscriber variant, allowing exactly one active consumer at a time. It is
-/// useful when one inspector, collector, or line waiter should own the stream and accidental
-/// concurrent fanout should be rejected early. It can reduce coordination overhead in some
-/// single-consumer paths, but it is not a categorical throughput replacement for broadcast.
-/// If multiple concurrent consumers are required, use the
-/// `output_stream::backend::broadcast::BroadcastOutputStream`.
+/// This backend allows exactly one active consumer at a time. Use it when one inspector,
+/// collector, or line waiter should own the stream and accidental concurrent fanout should be
+/// rejected early: a second consumer attempt fails with
+/// [`StreamConsumerError::ActiveConsumer`] instead of silently competing for events. It can
+/// reduce coordination overhead in some single-consumer paths, but delivery policy still
+/// determines lag behavior. When multiple concurrent consumers are required, use
+/// [`crate::BroadcastOutputStream`] instead.
 pub struct SingleSubscriberOutputStream<D = LossyWithoutBackpressure, R = NoReplay>
 where
     D: Delivery,

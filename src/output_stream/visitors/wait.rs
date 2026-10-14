@@ -5,7 +5,7 @@ use std::borrow::Cow;
 /// [`LineVisitor`] that breaks the moment a predicate accepts a line and remembers whether it
 /// has matched yet. Compose with
 /// [`ParseLines`](crate::output_stream::line::adapter::ParseLines) to build a
-/// predicate-driven consumer; the backends' `wait_for_line` helpers wrap this same visitor with
+/// predicate-driven consumer. The backends' `wait_for_line` helpers wrap this same visitor with
 /// an additional [`tokio::time::timeout`].
 ///
 /// There is no async counterpart. The predicate is a synchronous
@@ -67,9 +67,8 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     /// Drive a `WaitForLine` over the supplied events and translate the visitor's `bool`
-    /// output into [`WaitForLineResult`]. Mirrors what the deleted `wait_for_line` factory
-    /// used to do; lives in tests because production code now drives the visitor straight from
-    /// the backend method.
+    /// output into [`WaitForLineResult`], performing the same translation the backends'
+    /// `wait_for_line` methods apply in production.
     async fn drive_wait_for_line(
         events: Vec<StreamEvent>,
         predicate: impl Fn(Cow<'_, str>) -> bool + Send + 'static,
@@ -113,7 +112,7 @@ mod tests {
             ])
             .await;
             assert_that!(result)
-                .get_ok()
+                .ok()
                 .is_equal_to(WaitForLineResult::Matched);
         }
 
@@ -125,7 +124,7 @@ mod tests {
             ])
             .await;
             assert_that!(result)
-                .get_ok()
+                .ok()
                 .is_equal_to(WaitForLineResult::Matched);
         }
 
@@ -137,7 +136,7 @@ mod tests {
             ])
             .await;
             assert_that!(result)
-                .get_ok()
+                .ok()
                 .is_equal_to(WaitForLineResult::StreamClosed);
         }
 
@@ -151,7 +150,7 @@ mod tests {
             ])
             .await;
             assert_that!(result)
-                .get_ok()
+                .ok()
                 .is_equal_to(WaitForLineResult::StreamClosed);
         }
 
@@ -201,7 +200,7 @@ mod tests {
             .await;
 
             assert_that!(result)
-                .get_ok()
+                .ok()
                 .is_equal_to(WaitForLineResult::Matched);
         }
     }
@@ -231,7 +230,9 @@ mod tests {
                     }
                 })
             });
-            assert_that!(timeout).is_equal_to(Ok(WaitForLineResult::Timeout));
+            assert_that!(timeout)
+                .ok()
+                .is_equal_to(WaitForLineResult::Timeout);
         }
     }
 }

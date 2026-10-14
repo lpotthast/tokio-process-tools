@@ -2,14 +2,14 @@
 //! Spawn a child, wait for it to exit, and collect its stdout/stderr as parsed lines.
 //!
 //! This is the canonical "spawn + wait + collect" pattern. The wait timeout bounds how long
-//! the process is allowed to run; `eof_timeout` is a separate budget for stdout/stderr to
+//! the process is allowed to run. `eof_timeout` is a separate budget for stdout/stderr to
 //! observe EOF and drain after the process has exited.
 //!
 //! The stream is configured with `replay_last_bytes(...)` because the collector is attached
 //! by the wait helper *after* the child has already started running. Without replay,
 //! anything the child wrote before the helper attaches would be lost.
 //!
-//! Run: `cargo run --example wait_and_collect_lines`
+//! Run: `cargo run --example collect_output_lines`
 
 use std::time::Duration;
 use tokio::process::Command;

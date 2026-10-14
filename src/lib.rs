@@ -68,4 +68,4 @@ pub use process_handle::termination::{
 pub use process_handle::wait_builder::{WaitForCompletion, state as wait_builder_state};
 pub use process_handle::{ProcessHandle, RunningState, Stdin};
 #[cfg(any(unix, windows))]
-pub use terminate_on_drop::TerminateOnDrop;
+pub use terminate_on_drop::{TerminateOnDrop, TerminateOnDropFallback};

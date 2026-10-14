@@ -63,13 +63,13 @@ pub(crate) fn prepare_command(
 /// Owns a freshly spawned child and the platform's group-management primitive that reaches its
 /// descendants on termination.
 ///
-/// On Unix this is purely a wrapper around the Tokio [`tokio::process::Child`]; the child's PID
+/// On Unix this is purely a wrapper around the Tokio [`tokio::process::Child`]. The child's PID
 /// also serves as the PGID (set by [`prepare_command`] at spawn time), so the signal senders
 /// route through `killpg`. On Windows it additionally owns an anonymous Job Object the child
 /// has been assigned to, so `TerminateJobObject` can take down the entire tree without
 /// orphaning grandchildren.
 ///
-/// Methods that read or signal use `&self` (or the leader's PID); the few that mutate the
+/// Methods that read or signal use `&self` (or the leader's PID). The few that mutate the
 /// underlying Tokio child (`take_*`, `try_wait`, `wait`, `send_kill`) take `&mut self`.
 pub(crate) struct ProcessGroup {
     leader: tokio::process::Child,
@@ -148,7 +148,7 @@ impl ProcessGroup {
     /// Returns the leader's OS process ID if the child has not yet been polled to completion.
     ///
     /// On Unix the leader's PID equals the PGID, so this also identifies the process group.
-    /// On Windows the Job Object has its own opaque kernel handle; this method returns the
+    /// On Windows the Job Object has its own opaque kernel handle. This method returns the
     /// leader process's PID specifically.
     pub(crate) fn id(&self) -> Option<u32> {
         self.leader.id()
@@ -164,7 +164,7 @@ impl ProcessGroup {
     /// Waits for the leader to exit.
     ///
     /// Mirrors [`tokio::process::Child::wait`]. Note that members of the group other than the
-    /// leader may still be running after this resolves; reaching them is the responsibility of
+    /// leader may still be running after this resolves. Reaching them is the responsibility of
     /// callers that expect a fully-terminated tree (use [`Self::send_kill`] or the
     /// `ProcessHandle::terminate` flow first).
     pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -212,7 +212,7 @@ impl ProcessGroup {
     /// process group: `CTRL_C_EVENT` requires `dwProcessGroupId = 0` and would be broadcast to
     /// every process sharing the calling console (including the parent), so it is not usable
     /// to terminate a single child group. There is therefore no separate `SIGINT` vs.
-    /// `SIGTERM` distinction on Windows; this single method covers the entire graceful surface.
+    /// `SIGTERM` distinction on Windows. This single method covers the entire graceful surface.
     ///
     /// This is a raw signal sender. Callers that can reap process state should do so before
     /// using it.
@@ -237,7 +237,7 @@ impl ProcessGroup {
 
     /// Forcefully kill the entire spawned tree.
     ///
-    /// On Unix this is `killpg(SIGKILL)` against the leader's PGID; on Windows it is
+    /// On Unix this is `killpg(SIGKILL)` against the leader's PGID. On Windows it is
     /// `TerminateJobObject` against the assigned Job Object. If the Windows path has no Job
     /// Object attached (only possible if the child had already exited at spawn time), this
     /// falls back to [`tokio::process::Child::start_kill`] and only reaches the leader. On
@@ -272,7 +272,7 @@ impl ProcessGroup {
     /// Consume this group and return the bare Tokio [`tokio::process::Child`] leader,
     /// dropping the platform group-management state.
     ///
-    /// On Windows the Job Object handle is closed here; because we deliberately do **not** set
+    /// On Windows the Job Object handle is closed here. Because we deliberately do **not** set
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` on the job, closing the handle does not terminate
     /// the child. This is what lets [`crate::ProcessHandle::into_inner`] hand the child back to
     /// the caller for them to manage.

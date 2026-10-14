@@ -21,11 +21,9 @@ use std::future::Future;
 /// `StreamVisitor` is the synchronous counterpart to [`AsyncStreamVisitor`]. Implement it on a
 /// type that needs to react to chunks, gaps, and EOF without `.await`-ing between events, then
 /// drive it via `consume` to obtain a [`Consumer`](crate::Consumer) handle that owns the
-/// resulting tokio task.
-///
-/// The built-in visitors under [`crate::visitors`] all implement this trait (or its async
-/// counterpart [`AsyncStreamVisitor`]). Implement it on your own type to plug in custom
-/// chunk-level logic without wrapping a closure in shared mutable state.
+/// resulting tokio task. The built-in visitors under [`crate::visitors`] all implement this trait
+/// or its async counterpart. Implementing it on your own type plugs custom chunk-level logic into
+/// the same machinery without wrapping a closure in shared mutable state.
 ///
 /// # Lifecycle
 ///
@@ -67,7 +65,7 @@ pub trait StreamVisitor: Send + 'static {
     /// Invoked for every chunk observed on the stream.
     ///
     /// Return [`Next::Continue`] to keep visiting, or [`Next::Break`] to stop without consuming
-    /// further events; in the latter case [`on_eof`](StreamVisitor::on_eof) is not called.
+    /// further events. In the latter case [`on_eof`](StreamVisitor::on_eof) is not called.
     fn on_chunk(&mut self, chunk: Chunk) -> Next;
 
     /// Invoked when the stream backend reports that one or more chunks were dropped between the
@@ -102,7 +100,7 @@ pub trait StreamVisitor: Send + 'static {
 ///
 /// The trait uses return-position `impl Future` rather than `async fn` to keep the `Send` bound
 /// on the returned future expressible on stable Rust. See [`StreamVisitor`] for the lifecycle
-/// description; the only difference is that `on_chunk` and `on_eof` are async.
+/// description. The only difference is that `on_chunk` and `on_eof` are async.
 ///
 /// # Example
 ///
@@ -134,7 +132,7 @@ pub trait AsyncStreamVisitor: Send + 'static {
     /// Asynchronously observes a single chunk.
     ///
     /// Return [`Next::Continue`] to keep visiting, or [`Next::Break`] to stop without consuming
-    /// further events; in the latter case [`on_eof`](AsyncStreamVisitor::on_eof) is not called.
+    /// further events. In the latter case [`on_eof`](AsyncStreamVisitor::on_eof) is not called.
     fn on_chunk(&mut self, chunk: Chunk) -> impl Future<Output = Next> + Send + '_;
 
     /// Invoked when the stream backend reports that one or more chunks were dropped between the

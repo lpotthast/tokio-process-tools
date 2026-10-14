@@ -4,7 +4,7 @@ use super::termination::GracefulShutdown;
 use crate::output_stream::OutputStream;
 use crate::panic_on_drop::PanicOnDrop;
 #[cfg(any(unix, windows))]
-use crate::terminate_on_drop::TerminateOnDrop;
+use crate::terminate_on_drop::{TerminateOnDrop, TerminateOnDropFallback};
 
 /// Drop-time behavior selected by the lifecycle methods on [`ProcessHandle`].
 ///
@@ -59,26 +59,21 @@ where
         }
     }
 
-    /// Sets a panic-on-drop mechanism for this `ProcessHandle`.
+    /// Arms the kill-and-panic-on-drop safeguard for this `ProcessHandle`.
     ///
-    /// This method enables a safeguard that ensures that the process represented by this
-    /// `ProcessHandle` is properly terminated or awaited before being dropped.
-    /// If `must_be_terminated` is set and the `ProcessHandle` is
-    /// dropped without successfully terminating, killing, waiting for, or explicitly detaching the
-    /// process, an intentional panic will occur to prevent silent failure-states, ensuring that
-    /// system resources are handled correctly.
+    /// While armed, dropping the handle without successfully terminating, killing, waiting for,
+    /// or explicitly detaching the process performs a best-effort kill of the process group and
+    /// then panics, so a leaked process is loud instead of silent.
     ///
-    /// You typically do not need to call this, as every `ProcessHandle` is marked by default.
-    /// Call `must_not_be_terminated` to clear this safeguard to explicitly allow dropping the
-    /// process without terminating it.
-    /// Calling this method while the safeguard is already enabled is safe and has no effect beyond
-    /// keeping the handle armed.
+    /// You typically do not need to call this, as every `ProcessHandle` starts armed. It exists
+    /// to re-arm a handle after [`must_not_be_terminated`](Self::must_not_be_terminated). Calling
+    /// it while the safeguard is already armed is safe and has no further effect.
     ///
     /// # Panic
     ///
     /// If the `ProcessHandle` is dropped without being awaited or terminated successfully
-    /// after calling this method, a panic will occur with a descriptive message
-    /// to inform about the incorrect usage.
+    /// after calling this method, a panic with a descriptive message points out the incorrect
+    /// usage.
     pub fn must_be_terminated(&mut self) {
         match &mut self.drop_mode {
             DropMode::Armed { panic } if panic.is_armed() => {
@@ -101,9 +96,9 @@ where
     /// Use plain [`tokio::process::Command`] directly when you need a child process that can
     /// outlive the original handle without depending on captured stdio pipes.
     ///
-    /// Also, the right opt-out after [`terminate`](Self::terminate) returns an unrecoverable error
-    /// and the caller chooses to accept the failure instead of retrying or escalating to
-    /// [`kill`](Self::kill).
+    /// This is also the right opt-out after [`terminate`](Self::terminate) returns an
+    /// unrecoverable error and the caller chooses to accept the failure instead of retrying or
+    /// escalating to [`kill`](Self::kill).
     pub fn must_not_be_terminated(&mut self) {
         // Defuse the panic guard before swapping the variant so the dropped `PanicOnDrop` does
         // not fire when the old `Armed` value is dropped by the assignment.
@@ -119,28 +114,46 @@ where
         matches!(&self.drop_mode, DropMode::Armed { panic } if panic.is_armed())
     }
 
-    /// Test-only inspector: whether the drop guard has been disarmed.
+    /// Whether the drop guard has been disarmed, either by a successful terminal call or by
+    /// [`must_not_be_terminated`](Self::must_not_be_terminated).
     #[doc(hidden)]
     pub fn is_drop_disarmed(&self) -> bool {
         matches!(self.drop_mode, DropMode::Disarmed)
     }
 
-    /// Wrap this process handle in a `TerminateOnDrop` instance, terminating the controlled process
-    /// automatically when this handle is dropped.
+    /// Wraps this process handle in a [`TerminateOnDrop`], which terminates the process when it is
+    /// dropped.
     ///
-    /// `shutdown` carries the same per-platform graceful policy as [`Self::terminate`]; see
+    /// `shutdown` carries the same per-platform graceful policy as [`Self::terminate`]. See
     /// [`GracefulShutdown`] for how to construct it.
     ///
-    /// **SAFETY: This only works when your code is running in a multithreaded tokio runtime!**
+    /// The graceful shutdown can only run when the wrapper is dropped on a thread inside a
+    /// **multithreaded** tokio runtime. Anywhere else, the process is killed immediately and the
+    /// drop panics, as with [`TerminateOnDropFallback::Panic`]. Use
+    /// [`Self::terminate_on_drop_with_fallback`] to choose a different fallback. See
+    /// [`TerminateOnDrop`] for the full drop behavior.
     ///
-    /// Prefer manual termination of the process or awaiting it and relying on the (automatically
-    /// configured) `must_be_terminated` logic, raising a panic when a process was neither awaited
-    /// nor terminated before being dropped.
+    /// Prefer terminating or awaiting the process explicitly where possible.
     #[cfg(any(unix, windows))]
     pub fn terminate_on_drop(self, shutdown: GracefulShutdown) -> TerminateOnDrop<Stdout, Stderr> {
+        self.terminate_on_drop_with_fallback(shutdown, TerminateOnDropFallback::Panic)
+    }
+
+    /// Like [`Self::terminate_on_drop`], but with an explicit choice of how a drop in a context
+    /// that cannot run the graceful shutdown is reported.
+    ///
+    /// See [`TerminateOnDropFallback`] for the available policies and [`TerminateOnDrop`] for the
+    /// full drop behavior.
+    #[cfg(any(unix, windows))]
+    pub fn terminate_on_drop_with_fallback(
+        self,
+        shutdown: GracefulShutdown,
+        fallback: TerminateOnDropFallback,
+    ) -> TerminateOnDrop<Stdout, Stderr> {
         TerminateOnDrop {
             process_handle: self,
             shutdown,
+            fallback,
         }
     }
 }

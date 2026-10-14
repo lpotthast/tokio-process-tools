@@ -2,7 +2,7 @@
 //! [`Subscription`] until EOF, `Break`, cancellation, or a stream read error.
 //!
 //! The traits these loops drive are runtime-agnostic and live one level up at
-//! [`crate::output_stream::visitor`]; the loops themselves are tokio-bound because they use
+//! [`crate::output_stream::visitor`]. The loops themselves are tokio-bound because they use
 //! `tokio::select!` to race the next stream event against a `oneshot::Receiver` cancellation
 //! token. The [`spawn_consumer_*`] helpers package the loop into a [`Consumer<S>`] handle by
 //! `tokio::spawn`-ing the driver and wiring the cancellation channel.

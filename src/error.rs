@@ -132,7 +132,7 @@ impl fmt::Display for TerminationAction {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum WaitError {
-    /// A general IO error occurred.
+    /// Waiting for the process failed with an IO error.
     #[error("IO error occurred while waiting for process '{process_name}'")]
     IoError {
         /// The name of the process.
@@ -434,7 +434,7 @@ impl Eq for StreamReadError {}
 
 /// Result of waiting for an output line matching a predicate.
 ///
-/// This enum is returned inside a `Result`; stream read failures are surfaced as
+/// This enum is returned inside a `Result`. Stream read failures are surfaced as
 /// [`StreamReadError`] rather than as a variant of this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitForLineResult {
@@ -467,6 +467,6 @@ pub(crate) mod tests {
             .expect("diagnostic should preserve the original io::Error");
 
         assert_that!(io_error.kind()).is_equal_to(expected_kind);
-        assert_that!(io_error.to_string().as_str()).contains(expected_message);
+        assert_that!(io_error.to_string()).contains(expected_message);
     }
 }

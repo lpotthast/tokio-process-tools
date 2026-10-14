@@ -103,7 +103,7 @@ mod tests {
         let error = diagnostics.into_termination_failed(Cow::Borrowed("diagnostic-test"));
         let attempt_errors = error.attempt_errors();
 
-        assert_that!(attempt_errors.len()).is_equal_to(6);
+        assert_that!(attempt_errors).has_length(6);
         assert_attempt_error(
             &attempt_errors[0],
             TerminationAction::CheckStatus,
@@ -181,7 +181,7 @@ mod tests {
         let error = diagnostics.into_termination_failed(Cow::Borrowed("diagnostic-test"));
         let attempt_errors = error.attempt_errors();
 
-        assert_that!(attempt_errors.len()).is_equal_to(5);
+        assert_that!(attempt_errors).has_length(5);
         assert_attempt_error(
             &attempt_errors[0],
             TerminationAction::CheckStatus,

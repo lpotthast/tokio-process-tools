@@ -181,6 +181,7 @@ mod tests {
     use super::super::state::{SubscriberSender, append_event};
     use super::*;
     use crate::StreamReadError;
+    use crate::output_stream::event::tests::StreamEventAssertions;
     use crate::{
         NumBytesExt, ReliableWithBackpressure, ReplayEnabled, ReplayRetention, StreamConfig,
     };
@@ -276,14 +277,10 @@ mod tests {
         D: Delivery,
         R: Replay,
     {
-        match subscription.recv().await {
-            Some(StreamEvent::Chunk(chunk)) => {
-                assert_that!(chunk.as_ref()).is_equal_to(expected);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected chunk, got {other:?}"));
-            }
-        }
+        assert_that_owned!(subscription.recv().await)
+            .some()
+            .is_chunk()
+            .is_equal_to(expected);
     }
 
     #[tokio::test]
@@ -297,10 +294,10 @@ mod tests {
         append_event(&shared, options, StreamEvent::Eof).await;
 
         assert_that!(subscription.recv().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::Gap);
         assert_that!(subscription.recv().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::Eof);
     }
 
@@ -315,7 +312,7 @@ mod tests {
         let mut subscription = subscribe(&shared, options);
         assert_next_chunk(&mut subscription, b"tail").await;
         assert_that!(subscription.recv().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::Eof);
     }
 
@@ -336,15 +333,10 @@ mod tests {
         .await;
 
         let mut subscription = subscribe(&shared, options);
-        match subscription.recv().await {
-            Some(StreamEvent::ReadError(err)) => {
-                assert_that!(err.stream_name()).is_equal_to("custom");
-                assert_that!(err.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected read error, got {other:?}"));
-            }
-        }
+        assert_that!(subscription.recv().await).is_matching(pattern!(
+            Some(StreamEvent::ReadError(err))
+                if err.stream_name() == "custom" && err.kind() == io::ErrorKind::BrokenPipe
+        ));
     }
 
     #[tokio::test]
@@ -365,15 +357,10 @@ mod tests {
 
         let mut subscription = subscribe(&shared, options);
         assert_next_chunk(&mut subscription, b"booting\npartial").await;
-        match subscription.recv().await {
-            Some(StreamEvent::ReadError(err)) => {
-                assert_that!(err.stream_name()).is_equal_to("custom");
-                assert_that!(err.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected read error, got {other:?}"));
-            }
-        }
+        assert_that!(subscription.recv().await).is_matching(pattern!(
+            Some(StreamEvent::ReadError(err))
+                if err.stream_name() == "custom" && err.kind() == io::ErrorKind::BrokenPipe
+        ));
     }
 
     #[tokio::test]
@@ -389,7 +376,7 @@ mod tests {
         assert_next_chunk(&mut subscription, b"replay").await;
         assert_next_chunk(&mut subscription, b"live").await;
         assert_that!(subscription.recv().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::Eof);
     }
 }

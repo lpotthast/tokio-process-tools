@@ -9,10 +9,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Use `just` for normal workflows; the recipes are in `Justfile`.
 
-- `just verify`: full pre-PR validation (fmt-check, clippy, test, build, doc). Run this before declaring a change done.
+- `just verify`: full non-mutating pre-PR validation (fmt-check, check incl. Windows lib and MSRV, clippy, test, build,
+  docs, audit, semver-checks). Run this before declaring a change done.
+- `just tidy`: the mutating counterpart. Updates `Cargo.lock`, sorts `Cargo.toml` and formats all code.
 - `just fmt`: apply rustfmt across the workspace.
-- `just lint`: `cargo clippy --all-targets --all-features -- -D warnings`.
+- `just clippy`: `cargo clippy --all-targets --all-features -- -D warnings`.
 - `just test`: full unit test suite.
+- `just install-tools`: install the cargo tools and toolchains the recipes rely on.
 - `just bench-chunks` / `just bench-lines`: targeted criterion benchmarks (`benches/`).
 
 Single test by name: `cargo test <test_name> -- --nocapture`. Some tests need a multi-thread runtime; see "Drop
@@ -82,9 +85,18 @@ best-effort cleanup and then **panics**. The opt-out paths are explicit: `wait_f
 `.terminate_on_drop(...)`, `into_inner()`, or `must_not_be_terminated()`. This is deliberate. Do not soften it to a
 silent leak.
 
-`TerminateOnDrop` (in `src/terminate_on_drop.rs` + `src/async_drop.rs`) drives async termination from synchronous
-`Drop` and **requires a multithreaded Tokio runtime**. Tests that exercise it must use
-`#[tokio::test(flavor = "multi_thread")]`. The single-threaded runtime cannot drive that path.
+`TerminateOnDrop` (in `src/terminate_on_drop.rs` + `src/async_drop.rs`) drives async graceful termination from
+synchronous `Drop`, which **requires the drop to happen on a thread inside a multithreaded Tokio runtime**. In any
+other context (no runtime entered on the dropping thread, a current-thread runtime, or a thread unwinding from a
+panic) the drop kills the process group immediately and reports according to `TerminateOnDropFallback`: `Panic` (used
+by `terminate_on_drop`) or the explicit non-panicking `Trace` opt-out. The panic is always suppressed during an
+existing unwind, where a second panic would abort. A wrapper whose handle is already disarmed (including via
+`must_not_be_terminated()` through `DerefMut`) or whose child has already exited is left alone in every context. Tests
+that exercise the graceful drop path must use `#[tokio::test(flavor = "multi_thread")]`.
+
+The fallback policy does not govern a graceful termination attempt that runs and returns `Err`. The error is logged
+and the inner handle stays armed, so its own drop then kills again and the armed `PanicOnDrop` raises its generic
+message. The original termination error is only available through `tracing`.
 
 `PanicOnDrop` is the misuse guard for the armed-handle case. If `terminate()` returns `Err`, the guard stays armed on
 purpose so the failure is loud rather than silent. Recover by retrying, escalating to `kill()`, or calling
@@ -144,6 +156,6 @@ to compare from the new tag. Run `just verify` as the final gate.
 ## Coding notes specific to this crate
 
 - `src/lib.rs` enables `#![warn(missing_docs)]`. New exported items need concise Rustdoc.
-- `clippy::pedantic` is set to `warn` crate-wide via `Cargo.toml`. Address pedantic findings on touched code rather
-  than blanket-allowing them.
+- `clippy::all` and `clippy::pedantic` are set to `deny` crate-wide via `Cargo.toml`. Address pedantic findings on
+  touched code rather than blanket-allowing them.
 - Markdown line length convention: 120 columns. Do not pre-wrap shorter than that.

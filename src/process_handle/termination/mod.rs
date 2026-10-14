@@ -162,14 +162,13 @@ where
     /// Terminates this process by dispatching the configured graceful-shutdown sequence first,
     /// then forcefully killing the process if it has not exited after the sequence completes.
     ///
-    /// The signature is the same on every supported platform; the shape of `shutdown` is
-    /// platform-conditional. See [`GracefulShutdown`] for how to construct one and
-    /// [`UnixGracefulShutdown`] for guidance on choosing the Unix sequence.
+    /// The shape of `shutdown` is platform-conditional. See [`GracefulShutdown`] for how to
+    /// construct one and [`UnixGracefulShutdown`] for guidance on choosing the Unix sequence.
     ///
     /// - On Unix the configured [`UnixGracefulShutdown`] dispatches one or more graceful signals
-    ///   in order; each phase's `timeout` bounds how long to wait for the child to exit before
-    ///   escalating to the next phase. After the last configured phase, `SIGKILL` runs as the
-    ///   implicit forceful fallback.
+    ///   in order, escalating to the next phase when a phase's `timeout` elapses without the
+    ///   child exiting. After the last configured phase, `SIGKILL` runs as the implicit forceful
+    ///   fallback.
     /// - On Windows this is a 2-phase termination: `CTRL_BREAK_EVENT` -> wait
     ///   `shutdown.windows.timeout` -> `TerminateProcess`. **Only one `CTRL_BREAK_EVENT`
     ///   is ever sent.** `GenerateConsoleCtrlEvent` can only target a child's process group with
@@ -188,14 +187,14 @@ where
     /// never fires for them. The timeout only matters when the child has installed a handler
     /// that takes time to complete.
     ///
-    /// # What signal should I send?
+    /// # Choosing the signal
     ///
     /// See [`UnixGracefulShutdown`] for the recommended single-signal sequences and a discussion
     /// of why mixing `SIGINT` and `SIGTERM` does not cover children with unknown signal handlers.
     ///
     /// # Windows interop note
     ///
-    /// `tokio::signal::ctrl_c()` on Windows registers only for `CTRL_C_EVENT`; it does not catch
+    /// `tokio::signal::ctrl_c()` on Windows registers only for `CTRL_C_EVENT` and does not catch
     /// `CTRL_BREAK_EVENT`. A child Rust binary that listens only on the cross-platform
     /// `tokio::signal::ctrl_c()` will not respond to this graceful step on Windows and will be
     /// terminated forcefully after `timeout`. To interoperate, such a child should
@@ -204,7 +203,7 @@ where
     ///
     /// # Per-phase timeout semantics
     ///
-    /// Each per-phase timeout in `shutdown` bounds the post-signal wait of its phase:
+    /// In detail, the post-signal wait of each phase behaves as follows:
     ///
     /// - Signal send succeeds: wait up to the user-supplied timeout, then escalate.
     /// - Signal send fails: replace the user timeout with a fixed 100 ms grace so Tokio's
@@ -405,7 +404,7 @@ where
     }
 
     /// Test-only helper for verifying that an `Err` termination result leaves the drop guards
-    /// armed. Disarms only on `Ok`; production code uses [`terminate`](Self::terminate) which
+    /// armed. Disarms only on `Ok`. Production code uses [`terminate`](Self::terminate), which
     /// applies this internally. Exposed so integration tests can drive the disarm-on-success
     /// contract with synthetic results without going through a real signal-injection sequence.
     #[doc(hidden)]

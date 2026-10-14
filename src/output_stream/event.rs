@@ -1,18 +1,15 @@
 use crate::StreamReadError;
 use bytes::{Buf, Bytes};
 
-/// A "chunk" is an arbitrarily sized byte slice read from the underlying stream.
-/// The slices' length is at max of the previously configured maximum `chunk_size`.
+/// An arbitrarily sized slice of bytes read from the underlying stream.
 ///
-/// We use the word "chunk", as it is often used when processing collections in segments or when
-/// dealing with buffered I/O operations where data arrives in variable-sized pieces.
+/// A chunk is never longer than the `read_chunk_size` configured for the stream, but it may well
+/// be shorter. If the underlying stream buffers less data than that, full-length chunks may never
+/// be observed.
 ///
-/// In contrast to this, a "frame" typically carries more specific semantics. It usually implies a
-/// complete logical unit with defined boundaries within a protocol or format. This we do not have
-/// here.
-///
-/// Note: If the underlying stream is of lower buffer size, chunks of full `chunk_size` length may
-/// never be observed.
+/// The term "chunk" is deliberate: unlike a "frame", it carries no protocol semantics. Chunk
+/// boundaries are an artifact of buffered reading and can fall anywhere, including in the middle
+/// of a line or a multi-byte character.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Chunk(pub(crate) Bytes);
 
@@ -95,9 +92,9 @@ impl StreamEvent {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use assertr::AssertThat;
     use assertr::actual::Actual;
-    use assertr::mode::Panic;
+    use assertr::borrow_for::BorrowFor;
+    use assertr::prelude::*;
     use tokio::sync::mpsc;
 
     pub(crate) async fn event_receiver(events: Vec<StreamEvent>) -> mpsc::Receiver<StreamEvent> {
@@ -119,18 +116,22 @@ pub(crate) mod tests {
     impl<'t> StreamEventAssertions<'t> for AssertThat<'t, StreamEvent, Panic> {
         #[track_caller]
         fn is_chunk(self) -> AssertThat<'t, Chunk, Panic> {
-            if !matches!(self.actual(), StreamEvent::Chunk(_)) {
-                let actual = self.actual();
-                self.fail(format_args!(
-                    "Actual: {actual:#?}\n\nis not of expected variant: StreamEvent::Chunk"
-                ));
-            }
-
-            self.map(|actual| match actual {
-                Actual::Owned(StreamEvent::Chunk(chunk)) => Actual::Owned(chunk),
-                Actual::Borrowed(StreamEvent::Chunk(chunk)) => Actual::Borrowed(chunk),
-                _ => unreachable!("variant verified above"),
-            })
+            self.is_matching(pattern!(StreamEvent::Chunk(_)))
+                .map(|actual| match actual {
+                    Actual::Owned(StreamEvent::Chunk(chunk)) => Actual::Owned(chunk),
+                    Actual::Borrowed(StreamEvent::Chunk(chunk)) => Actual::Borrowed(chunk),
+                    _ => unreachable!("variant verified above"),
+                })
         }
+    }
+
+    // Let byte literals serve as expected values for `Chunk` subjects, as in
+    // `assert_that!(event).is_chunk().is_equal_to(b"ab")`.
+    impl<'a, const N: usize> BorrowFor<Chunk> for &'a [u8; N] {
+        type View = &'a [u8; N];
+    }
+
+    impl BorrowFor<Chunk> for &[u8] {
+        type View = [u8];
     }
 }

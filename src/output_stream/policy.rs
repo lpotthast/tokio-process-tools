@@ -43,7 +43,7 @@ impl Delivery for LossyWithoutBackpressure {
 ///
 /// **Scope:** The guarantee applies only to subscribers that are *currently attached* when each
 /// chunk is produced. Subscribers that attach later do not retroactively receive earlier chunks
-/// from this delivery policy; that is what the replay axis is for.
+/// from this delivery policy. That is what the replay axis is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReliableWithBackpressure;
 
@@ -110,7 +110,7 @@ impl Replay for ReplayEnabled {
     }
 }
 
-/// Runtime delivery behavior used by typed stream modes.
+/// Runtime (value-level) form of the delivery policy.
 ///
 /// The two variants describe the same trade-off as the typed [`LossyWithoutBackpressure`] and
 /// [`ReliableWithBackpressure`] markers. Active subscribers either get every chunk at the cost of
@@ -124,7 +124,7 @@ pub enum DeliveryGuarantee {
 
     /// Wait for active subscribers before reading more output when bounded buffers are full. The
     /// child's next write blocks once the kernel pipe fills. The reliability scope is limited to
-    /// subscribers attached at the time each chunk is produced; late attachers depend on the
+    /// subscribers attached at the time each chunk is produced. Late attachers depend on the
     /// replay axis for earlier output.
     ReliableWithBackpressure,
 }
@@ -141,7 +141,7 @@ pub enum ReplayRetention {
     /// log only while doing so leaves the remaining size at or above the requested limit. Chunks
     /// are never split, so the actual retained size is "rounded up to whole chunks." A single
     /// chunk that is itself larger than the configured limit is retained in full until a newer
-    /// chunk arrives that can replace it; the limit is therefore a soft floor on retention, not
+    /// chunk arrives that can replace it. The limit is therefore a soft floor on retention, not
     /// a hard upper bound on memory.
     ///
     /// To make the practical bound predictable, pair this with a `read_chunk_size` smaller than

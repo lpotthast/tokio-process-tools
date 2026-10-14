@@ -2,6 +2,7 @@ use super::common::wait_for_terminal_shared;
 use super::reader_test_support::spawn_configured_reader;
 use crate::NumBytesExt;
 use crate::output_stream::event::StreamEvent;
+use crate::output_stream::event::tests::StreamEventAssertions;
 use crate::output_stream::policy::DeliveryGuarantee;
 use crate::test_support::ReadErrorAfterBytes;
 use assertr::prelude::*;
@@ -27,7 +28,7 @@ async fn configured_reader_publishes_read_error_without_panicking() {
         match event {
             StreamEvent::Chunk(_) | StreamEvent::Gap => {}
             StreamEvent::Eof => {
-                assert_that!(()).fail("read failure must not be reported as EOF");
+                panic!("read failure must not be reported as EOF");
             }
             StreamEvent::ReadError(err) => {
                 assert_that!(err.stream_name()).is_equal_to("custom");
@@ -53,36 +54,21 @@ async fn configured_reader_records_read_error_while_active_queue_is_full() {
     let terminal = tokio::time::timeout(Duration::from_secs(1), wait_for_terminal_shared(&shared))
         .await
         .expect("read error should be recorded even while live delivery is blocked");
-    match terminal {
-        StreamEvent::ReadError(err) => {
-            assert_that!(err.stream_name()).is_equal_to("custom");
-            assert_that!(err.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected read error, got {other:?}"));
-        }
-    }
+    assert_that!(terminal).is_matching(pattern!(
+        StreamEvent::ReadError(err)
+            if err.stream_name() == "custom" && err.kind() == io::ErrorKind::BrokenPipe
+    ));
     assert_that!(stream_reader.is_finished()).is_false();
     drop(shared);
 
-    match rx.recv().await.unwrap() {
-        StreamEvent::Chunk(chunk) => {
-            assert_that!(chunk.as_ref()).is_equal_to(b"aa".as_slice());
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected buffered chunk, got {other:?}"));
-        }
-    }
+    assert_that!(rx.recv().await.unwrap())
+        .is_chunk()
+        .is_equal_to(b"aa");
     assert_that!(rx.recv().await.unwrap()).is_equal_to(StreamEvent::Gap);
-    match rx.recv().await.unwrap() {
-        StreamEvent::ReadError(err) => {
-            assert_that!(err.stream_name()).is_equal_to("custom");
-            assert_that!(err.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected read error, got {other:?}"));
-        }
-    }
+    assert_that!(rx.recv().await.unwrap()).is_matching(pattern!(
+        StreamEvent::ReadError(err)
+            if err.stream_name() == "custom" && err.kind() == io::ErrorKind::BrokenPipe
+    ));
 
     stream_reader.await.unwrap();
     assert_that!(

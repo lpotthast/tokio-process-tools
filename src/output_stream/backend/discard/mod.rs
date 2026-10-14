@@ -14,7 +14,7 @@ use std::convert::Infallible;
 
 /// Marker stream for a stdio slot configured with [`std::process::Stdio::null()`].
 ///
-/// The OS discards the child's writes; no pipe is allocated and no reader task runs. The
+/// The OS discards the child's writes. No pipe is allocated and no reader task runs. The
 /// `read_chunk_size` and `max_buffered_chunks` accessors are present because [`OutputStream`]
 /// requires them, but they have no operational meaning for this variant and return zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -10,7 +10,7 @@
 //! emits a single EOF event and then closes: any visitor consumed against a discarded
 //! stream observes zero chunks and terminates immediately. The `.with_line_output(...)`
 //! and `.with_raw_output(...)` stages on the `wait_for_completion(...)` builder are not in
-//! scope on a handle whose stream is discarded; consume the captured slot manually before
+//! scope on a handle whose stream is discarded. Consume the captured slot manually before
 //! waiting, as shown below.
 //!
 //! For the simpler symmetric "discard everything, only the exit status matters" case, use

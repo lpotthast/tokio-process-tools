@@ -69,7 +69,7 @@ impl Default for AutoName {
 ///
 /// Process names are used in public error messages and tracing fields. Only capture
 /// arguments, environment variables, or current directories when those values are safe to log.
-/// Use [`AutoNameSettings::builder`] to opt into custom combinations; the builder defaults to
+/// Use [`AutoNameSettings::builder`] to opt into custom combinations. The builder defaults to
 /// capturing only the program name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 #[expect(
@@ -101,7 +101,7 @@ impl Default for AutoNameSettings {
 impl AutoNameSettings {
     /// Capture the program name.
     ///
-    /// Example: `Command::new("ls").arg("-la").env("FOO", "foo)` is captured as `"ls"`.
+    /// Example: `Command::new("ls").arg("-la").env("FOO", "foo")` is captured as `"ls"`.
     #[must_use]
     pub fn program_only() -> Self {
         Self::default()
@@ -109,7 +109,7 @@ impl AutoNameSettings {
 
     /// Capture the program name and all arguments.
     ///
-    /// Example: `Command::new("ls").arg("-la").env("FOO", "foo)` is captured as `ls "-la"`.
+    /// Example: `Command::new("ls").arg("-la").env("FOO", "foo")` is captured as `ls "-la"`.
     ///
     /// Arguments may contain tokens, passwords, signed URLs, or headers. Use this only when
     /// arguments are safe to include in public errors and logs or for debugging purposes.
@@ -120,7 +120,7 @@ impl AutoNameSettings {
 
     /// Capture the program name and all environment variables and arguments.
     ///
-    /// Example: `Command::new("ls").arg("-la").env("FOO", "foo)` is captured as `FOO=foo ls "-la"`.
+    /// Example: `Command::new("ls").arg("-la").env("FOO", "foo")` is captured as `FOO=foo ls "-la"`.
     ///
     /// Environment variables and arguments often contain credentials. Use this only when all
     /// captured values are safe to include in public errors and logs or for debugging purposes.
@@ -132,9 +132,9 @@ impl AutoNameSettings {
             .build()
     }
 
-    /// Capture the directory and the program name and all environment variables and arguments.
+    /// Capture the current directory, the program name, all environment variables, and all arguments.
     ///
-    /// Example: `Command::new("ls").arg("-la").env("FOO", "foo)` is captured as
+    /// Example: `Command::new("ls").arg("-la").env("FOO", "foo")` is captured as
     /// `/some/dir % FOO=foo ls "-la"`.
     ///
     /// Current directories, environment variables, and arguments may contain sensitive data.

@@ -44,15 +44,33 @@ async fn must_not_be_terminated_lets_child_outlive_dropped_handle() {
     drop(process);
 
     let pid = Pid::from_raw(pid.cast_signed());
-    assert_that!(signal::kill(pid, None).is_ok()).is_true();
+    assert_that!(signal::kill(pid, None)).is_ok();
 
     signal::kill(pid, Signal::SIGKILL).unwrap();
-    match waitpid(pid, None) {
-        Ok(_) | Err(Errno::ECHILD) => {}
-        Err(err) => {
-            assert_that!(err).fail(format_args!("waitpid failed: {err}"));
-        }
-    }
+    assert_that!(waitpid(pid, None)).is_matching(pattern!(Ok(_) | Err(Errno::ECHILD)));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn must_not_be_terminated_lets_child_outlive_dropped_terminate_on_drop_wrapper() {
+    use nix::errno::Errno;
+    use nix::sys::signal::{self, Signal};
+    use nix::sys::wait::waitpid;
+    use nix::unistd::Pid;
+
+    let mut guard = spawn_long_running_process().terminate_on_drop(short_graceful_shutdown());
+    let pid = guard.id().unwrap();
+
+    // Detaching through the wrapper must win over its terminate-on-drop behavior, even in a
+    // multithreaded runtime where the graceful shutdown could run.
+    guard.must_not_be_terminated();
+    drop(guard);
+
+    let pid = Pid::from_raw(pid.cast_signed());
+    assert_that!(signal::kill(pid, None)).is_ok();
+
+    signal::kill(pid, Signal::SIGKILL).unwrap();
+    assert_that!(waitpid(pid, None)).is_matching(pattern!(Ok(_) | Err(Errno::ECHILD)));
 }
 
 #[cfg(unix)]
@@ -91,22 +109,167 @@ async fn must_not_be_terminated_still_closes_stdin_on_drop() {
     process.must_not_be_terminated();
     drop(process);
 
-    match tokio::time::timeout(
+    let wait_result = tokio::time::timeout(
         Duration::from_secs(2),
         tokio::task::spawn_blocking(move || waitpid(pid, None)),
     )
     .await
     .unwrap()
-    .unwrap()
-    {
-        Ok(_) | Err(Errno::ECHILD) => {}
-        Err(err) => {
-            assert_that!(err).fail(format_args!("waitpid failed: {err}"));
-        }
-    }
+    .unwrap();
+    assert_that!(wait_result).is_matching(pattern!(Ok(_) | Err(Errno::ECHILD)));
 
     assert_that!(fs::read_to_string(temp_dir.path().join("stdin-result.txt")).unwrap())
         .is_equal_to("eof");
+}
+
+#[test]
+fn terminate_on_drop_trace_fallback_outside_runtime_kills_child_without_panicking() {
+    use tokio_process_tools::TerminateOnDropFallback;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let guard = rt.block_on(async {
+        spawn_long_running_process().terminate_on_drop_with_fallback(
+            short_graceful_shutdown(),
+            TerminateOnDropFallback::Trace,
+        )
+    });
+    let pid = guard.id().unwrap();
+
+    // The reported footgun shape: the runtime is still alive, but the dropping thread is not
+    // inside its context (e.g. `main` after `Runtime::block_on` returned).
+    drop(guard);
+
+    drop(rt);
+    assert_child_exited_after_forceful_drop(pid);
+}
+
+#[test]
+fn terminate_on_drop_trace_fallback_inside_current_thread_kills_child_without_panicking() {
+    use tokio_process_tools::TerminateOnDropFallback;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let pid = rt.block_on(async {
+        let guard = spawn_long_running_process().terminate_on_drop_with_fallback(
+            short_graceful_shutdown(),
+            TerminateOnDropFallback::Trace,
+        );
+        let pid = guard.id().unwrap();
+        drop(guard);
+        pid
+    });
+
+    drop(rt);
+    assert_child_exited_after_forceful_drop(pid);
+}
+
+#[test]
+fn terminate_on_drop_default_fallback_kills_child_before_panicking() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let guard = rt.block_on(async {
+        spawn_long_running_process().terminate_on_drop(short_graceful_shutdown())
+    });
+    let pid = guard.id().unwrap();
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)))
+        .expect_err("the default fallback should panic outside a runtime context");
+    assert_that!(panic)
+        .message()
+        .contains("outside a tokio runtime context");
+
+    drop(rt);
+    assert_child_exited_after_forceful_drop(pid);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminate_on_drop_panic_fallback_during_unwind_preserves_original_panic() {
+    use tokio_process_tools::TerminateOnDropFallback;
+
+    let process = spawn_long_running_process();
+    let pid = process.id().unwrap();
+    let guard = process
+        .terminate_on_drop_with_fallback(short_graceful_shutdown(), TerminateOnDropFallback::Panic);
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = guard;
+        panic!("intentional test panic");
+    }));
+
+    let panic = unwound.expect_err("the original panic should continue unwinding");
+    assert_that!(panic)
+        .message()
+        .is_equal_to("intentional test panic");
+    assert_child_exited_after_forceful_drop(pid);
+}
+
+#[test]
+fn terminate_on_drop_with_already_exited_child_closes_lifecycle_without_runtime_context() {
+    use std::time::Duration;
+    use tokio_process_tools::{RunningState, TerminateOnDropFallback};
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let guard = rt.block_on(async {
+        let mut process = spawn_immediately_exiting_process();
+        loop {
+            match process.is_running() {
+                RunningState::Terminated(_) => break,
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        process.terminate_on_drop_with_fallback(
+            short_graceful_shutdown(),
+            TerminateOnDropFallback::Panic,
+        )
+    });
+
+    // The synchronous preflight observes the already-reaped exit and closes the lifecycle before
+    // consulting the unsupported-context policy, so even the explicit panic fallback stays quiet.
+    drop(guard);
+    drop(rt);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminate_on_drop_inside_multithreaded_runtime_honors_graceful_shutdown() {
+    use std::fs;
+    use std::time::Duration;
+    use tempfile::tempdir;
+    use tokio_process_tools::{TerminateOnDropFallback, WaitForLineResult};
+
+    let temp_dir = tempdir().unwrap();
+    let marker = temp_dir.path().join("graceful-signal.txt");
+
+    let mut cmd = signal_responsive_long_running_command();
+    cmd.env("TOKIO_PROCESS_TOOLS_GRACEFUL_MARKER", &marker);
+    let process = spawn_broadcast_with_replay("graceful-on-drop", cmd);
+
+    let readiness = process
+        .stdout()
+        .wait_for_line(
+            Duration::from_secs(5),
+            |line| line == "ready",
+            line_parsing_options(),
+        )
+        .await
+        .unwrap();
+    assert_that!(readiness).is_equal_to(WaitForLineResult::Matched);
+
+    // The fallback policy is irrelevant in a supported multithreaded context; choosing Panic here
+    // makes that boundary explicit and guards against accidentally consulting it on success.
+    let guard = process.terminate_on_drop_with_fallback(
+        default_graceful_shutdown(),
+        TerminateOnDropFallback::Panic,
+    );
+    drop(guard);
+
+    // The graceful drop blocks until termination completes, and the child writes the marker
+    // before exiting, so the file is present here if and only if the graceful signal was
+    // delivered instead of an immediate SIGKILL.
+    assert_that!(fs::read_to_string(&marker).unwrap()).is_equal_to("graceful");
 }
 
 #[cfg(unix)]
@@ -138,17 +301,12 @@ async fn must_not_be_terminated_still_closes_stdout_pipe_on_drop() {
     process.must_not_be_terminated();
     drop(process);
 
-    match tokio::time::timeout(
+    let wait_result = tokio::time::timeout(
         Duration::from_secs(2),
         tokio::task::spawn_blocking(move || waitpid(pid, None)),
     )
     .await
     .unwrap()
-    .unwrap()
-    {
-        Ok(_) | Err(Errno::ECHILD) => {}
-        Err(err) => {
-            assert_that!(err).fail(format_args!("waitpid failed: {err}"));
-        }
-    }
+    .unwrap();
+    assert_that!(wait_result).is_matching(pattern!(Ok(_) | Err(Errno::ECHILD)));
 }

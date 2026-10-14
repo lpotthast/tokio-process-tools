@@ -72,6 +72,6 @@ async fn block_until_subscribers_catch_up_gated_multi_subscriber_collection_comp
     .await;
 
     assert_that!(result)
-        .get_ok()
+        .ok()
         .is_equal_to(total_bytes * subscriber_count);
 }

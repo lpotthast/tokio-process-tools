@@ -13,10 +13,10 @@
 //! their final value via `into_output(self)` at the end of the consumer task's life.
 //!
 //! `on_gap` is invoked when one or more chunks were dropped between the previous and next
-//! observed chunk (only possible under `lossy_without_backpressure()` overflow); visitors that
+//! observed chunk (only possible under `lossy_without_backpressure()` overflow). Visitors that
 //! splice bytes across chunks should treat it as a reset signal. `on_eof` is skipped when
 //! `on_chunk` returned `Next::Break`, on the assumption that an early-break visitor already
-//! has its result; cancellation and abort skip `on_eof` for the same reason. Whichever exit
+//! has its result. Cancellation and abort skip `on_eof` for the same reason. Whichever exit
 //! path was taken, `into_output` always runs, so `Consumer::wait()` and `cancel()` always
 //! have a value to yield.
 //!

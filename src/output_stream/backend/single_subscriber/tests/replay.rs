@@ -41,7 +41,7 @@ async fn typed_no_replay_starts_consumer_at_live_output() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"live".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"live");
 }
 
 #[tokio::test]
@@ -68,7 +68,7 @@ async fn typed_replay_all_delivers_pre_consumer_output_before_live_output() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"oldlive".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"oldlive");
 }
 
 #[tokio::test]
@@ -90,7 +90,7 @@ async fn configured_subscription_snapshots_replay_buffer_from_shared_state() {
             .state
             .lock()
             .expect("single-subscriber state poisoned");
-        assert_that!(state.events.len()).is_equal_to(1);
+        assert_that!(state.events).has_length(1);
     }
 
     let collector = stream
@@ -105,7 +105,7 @@ async fn configured_subscription_snapshots_replay_buffer_from_shared_state() {
             .state
             .lock()
             .expect("single-subscriber state poisoned");
-        assert_that!(state.events.len()).is_equal_to(1);
+        assert_that!(state.events).has_length(1);
     }
 
     write_half.write_all(b"live").await.unwrap();
@@ -113,7 +113,7 @@ async fn configured_subscription_snapshots_replay_buffer_from_shared_state() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"oldlive".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"oldlive");
 }
 
 #[tokio::test]
@@ -197,7 +197,7 @@ async fn replay_retains_output_between_consumers() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"idle".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"idle");
 }
 
 #[tokio::test]
@@ -239,7 +239,7 @@ async fn replay_retention_limits_later_consumer() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"cc".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"cc");
 }
 
 #[tokio::test]
@@ -276,23 +276,18 @@ async fn later_consumer_observes_read_error() {
 
     let _ = wait_for_terminal(&stream).await;
 
-    match stream
+    let result = stream
         .consume(CollectChunks::fold(
             CollectedBytes::new(),
             CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
         ))
         .unwrap()
         .wait()
-        .await
-    {
-        Err(ConsumerError::StreamRead { source }) => {
-            assert_that!(source.stream_name()).is_equal_to("custom");
-            assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected stream read error, got {other:?}"));
-        }
-    }
+        .await;
+    assert_that!(result).err().is_matching(pattern!(
+        ConsumerError::StreamRead { source }
+            if source.stream_name() == "custom" && source.kind() == io::ErrorKind::BrokenPipe
+    ));
 }
 
 #[tokio::test]
@@ -314,7 +309,7 @@ async fn configured_subscription_after_seal_starts_live_with_empty_shared_replay
             .state
             .lock()
             .expect("single-subscriber state poisoned");
-        assert_that!(state.events.len()).is_equal_to(1);
+        assert_that!(state.events).has_length(1);
     }
 
     stream.seal_replay();
@@ -330,7 +325,7 @@ async fn configured_subscription_after_seal_starts_live_with_empty_shared_replay
             .state
             .lock()
             .expect("single-subscriber state poisoned");
-        assert_that!(state.events.len()).is_equal_to(0);
+        assert_that!(state.events).is_empty();
     }
 
     write_half.write_all(b"live").await.unwrap();
@@ -338,7 +333,7 @@ async fn configured_subscription_after_seal_starts_live_with_empty_shared_replay
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"live".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"live");
 }
 
 #[tokio::test]
@@ -368,5 +363,7 @@ async fn typed_wait_after_seal_starts_live() {
     write_half.write_all(b"live\n").await.unwrap();
     drop(write_half);
 
-    assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Matched));
+    assert_that!(waiter.await)
+        .ok()
+        .is_equal_to(WaitForLineResult::Matched);
 }

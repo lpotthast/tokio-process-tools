@@ -34,8 +34,8 @@ where
         .expect_completed("process should complete");
 
     assert_that!(status.success()).is_true();
-    assert_that!(stdout.lines().is_empty()).is_false();
-    assert_that!(stderr.lines().is_empty()).is_true();
+    assert_that!(stdout.lines()).is_not_empty();
+    assert_that!(stderr.lines()).is_empty();
 }
 
 async fn assert_out_and_err_completion<Stdout, Stderr>(mut process: ProcessHandle<Stdout, Stderr>)
@@ -55,8 +55,8 @@ where
         .expect_completed("process should complete");
 
     assert_that!(output.status.success()).is_true();
-    assert_that_owned!(output.stdout.lines().iter().map(String::as_str)).contains_exactly(["out"]);
-    assert_that_owned!(output.stderr.lines().iter().map(String::as_str)).contains_exactly(["err"]);
+    assert_that!(output.stdout.lines()).contains_exactly(["out"]);
+    assert_that!(output.stderr.lines()).contains_exactly(["err"]);
 }
 
 mod shared_config {
@@ -524,15 +524,15 @@ mod spawn_errors {
         {
             Ok(mut process) => {
                 let _ = process.wait_for_completion(Duration::from_secs(2)).await;
-                assert_that!(()).fail("command should fail to spawn");
-                return;
+                panic!("command should fail to spawn");
             }
             Err(error) => error,
         };
         let error = error.to_string();
 
-        assert_that!(error.as_str()).contains("tokio-process-tools-definitely-missing-command");
-        assert_that!(error.as_str()).does_not_contain(sensitive_arg);
+        assert_that!(error)
+            .contains("tokio-process-tools-definitely-missing-command")
+            .does_not_contain(sensitive_arg);
     }
 }
 

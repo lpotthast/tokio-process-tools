@@ -48,7 +48,7 @@ use crate::{CollectedBytes, CollectedLines};
 ///
 /// The two state axes (`Output` and `Terminate`) gate which builder methods compile and which
 /// `IntoFuture` impl the chain resolves to. The carried data on the populated states (eof
-/// timeout, options, shutdown) is internal; users construct these states via
+/// timeout, options, shutdown) is internal. Users construct these states via
 /// [`WaitForCompletion::with_line_output`], [`WaitForCompletion::with_raw_output`], and
 /// [`WaitForCompletion::or_terminate`].
 pub mod state {
@@ -98,7 +98,7 @@ use state::{LineOutput, NoOutput, NoTerminate, RawOutput};
 ///
 /// Stdin is closed before the wait begins (matching [`tokio::process::Child::wait`]) on
 /// every variant. If the wait times out without `.or_terminate(...)`, the process keeps
-/// running; with `.or_terminate(...)`, cleanup is forced through
+/// running. With `.or_terminate(...)`, cleanup is forced through
 /// [`ProcessHandle::terminate`].
 #[must_use = "calling `wait_for_completion(...)` only configures the wait. \
               `.await` the builder (or chain `.with_*_output(...)` / `.or_terminate(...)` first) \
@@ -150,7 +150,7 @@ where
     /// Configure line-mode output collection.
     ///
     /// Collectors are attached when this method is called. If the stream was configured with
-    /// `.no_replay()`, output produced before attachment may be discarded; configure replay
+    /// `.no_replay()`, output produced before attachment may be discarded. Configure replay
     /// before spawning when startup output must be included.
     ///
     /// `eof_timeout` bounds the additional post-exit wait for stdout / stderr consumers to

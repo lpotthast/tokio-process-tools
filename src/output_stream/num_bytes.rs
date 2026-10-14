@@ -13,8 +13,8 @@ impl NumBytes {
     /// The largest representable byte count (`usize::MAX`).
     ///
     /// Use this when an API requires an explicit byte limit but you don't actually want to cap
-    /// it. For example, line-parsing options that require a non-zero `max_line_length` but you
-    /// trust the source to produce reasonable lines.
+    /// it, for example when a line-parsing option requires a non-zero `max_line_length` but you
+    /// trust the source to produce reasonably sized lines.
     pub const MAX: NumBytes = NumBytes(usize::MAX);
 
     /// Creates a `NumBytes` value of zero.
@@ -30,7 +30,7 @@ impl NumBytes {
         );
     }
 
-    /// The amount of bytes represented by this instance.
+    /// The number of bytes represented by this instance.
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.0

@@ -23,7 +23,7 @@ mod stdin {
         let mut stdin = Stdin::Open(child_stdin);
 
         assert_that!(stdin.is_open()).is_true();
-        assert_that!(stdin.as_mut().is_some()).is_true();
+        assert_that!(stdin.as_mut()).is_some();
 
         stdin.close();
 
@@ -79,15 +79,7 @@ mod is_running {
             .spawn()
             .unwrap();
 
-        match process.is_running() {
-            RunningState::Running => {}
-            RunningState::Terminated(exit_status) => {
-                assert_that!(exit_status).fail("process should still be running");
-            }
-            RunningState::Uncertain(_) => {
-                assert_that!(&process).fail("process state should not be uncertain");
-            }
-        }
+        assert_that!(process.is_running()).is_matching(pattern!(RunningState::Running));
 
         process
             .wait_for_completion(Duration::from_secs(2))
@@ -95,18 +87,10 @@ mod is_running {
             .unwrap()
             .expect_completed("process should have exited within the wait timeout");
 
-        match process.is_running() {
-            RunningState::Running => {
-                assert_that!(process).fail("process should not be running anymore");
-            }
-            RunningState::Terminated(exit_status) => {
-                assert_that!(exit_status.code()).get_some().is_equal_to(0);
-                assert_that!(exit_status.success()).is_true();
-            }
-            RunningState::Uncertain(_) => {
-                assert_that!(process).fail("process state should not be uncertain");
-            }
-        }
+        assert_that!(process.is_running()).is_matching(pattern!(
+            RunningState::Terminated(exit_status)
+                if exit_status.code() == Some(0) && exit_status.success()
+        ));
     }
 }
 
@@ -132,17 +116,14 @@ mod into_inner {
             .unwrap();
 
         let (mut child, mut stdin, stdout, _stderr) = process.into_inner();
-        assert_that!(child.stdin.is_none()).is_true();
+        assert_that!(child.stdin).is_none();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_that!(child.try_wait().unwrap().is_none()).is_true();
+        assert_that!(child.try_wait()).ok().is_none();
 
         let collector = collect_lines_into_vec(&stdout).unwrap_infallible();
 
-        let Some(stdin_handle) = stdin.as_mut() else {
-            assert_that!(stdin.is_open()).fail("stdin should be returned open");
-            return;
-        };
+        let stdin_handle = stdin.as_mut().expect("stdin should be returned open");
         stdin_handle
             .write_all(b"stdin stayed open\n")
             .await
@@ -158,8 +139,7 @@ mod into_inner {
         assert_that!(status.success()).is_true();
 
         let collected = collector.wait().await.unwrap();
-        assert_that!(collected.lines().len()).is_equal_to(1);
-        assert_that!(collected[0].as_str()).is_equal_to("stdin stayed open");
+        assert_that!(collected.lines()).contains_exactly(["stdin stayed open"]);
     }
 
     #[tokio::test]

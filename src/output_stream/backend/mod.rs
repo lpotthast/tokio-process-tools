@@ -1,5 +1,5 @@
-//! Output stream backend implementations. Tokio-bound; both backends ingest any
-//! [`tokio::io::AsyncRead`] (not just process pipes).
+//! Output stream backend implementations. All are tokio-bound, and the broadcast and
+//! single-subscriber backends ingest any [`tokio::io::AsyncRead`] (not just process pipes).
 
 /// Multi-consumer broadcast output stream backend.
 pub(crate) mod broadcast;

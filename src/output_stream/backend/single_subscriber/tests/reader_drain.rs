@@ -48,5 +48,5 @@ async fn reader_drains_after_consumer_drop() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"tail".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"tail");
 }

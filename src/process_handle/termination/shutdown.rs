@@ -67,7 +67,7 @@ use std::time::Duration;
 ///
 /// This type is only available on Unix and Windows because the underlying graceful-shutdown
 /// signals only exist there. On other Tokio-supported targets the spawn, wait, output-collection,
-/// and [`ProcessHandle::kill`] APIs remain available; only the graceful-termination surface
+/// and [`ProcessHandle::kill`] APIs remain available. Only the graceful-termination surface
 /// (`terminate(...)`, `terminate_on_drop(...)`, `wait_for_completion_or_terminate(...)`, the
 /// `send_*_signal(...)` methods, and this type) is gated out.
 ///
@@ -219,7 +219,7 @@ impl GracefulShutdownBuilder<UnixSet> {
     ///
     /// For the common case prefer [`Self::windows_ctrl_break`], which takes a `Duration`
     /// directly. Windows currently has only one graceful signal (`CTRL_BREAK_EVENT`), so
-    /// the structured form is rarely needed; it is kept for symmetry with the Unix side and
+    /// the structured form is rarely needed. It is kept for symmetry with the Unix side and
     /// to leave room for future Windows-specific knobs.
     ///
     /// On non-Windows targets the value is accepted but unused.
@@ -293,8 +293,8 @@ pub enum UnixGracefulSignal {
     Interrupt,
 
     /// `SIGTERM`. Default disposition is `Term` (kernel terminates the process when no handler is
-    /// installed). The conventional "please shut down" signal in Unix; what `kill <pid>` (no args)
-    /// sends and what systemd, K8s, Docker, runit, and supervisord all use.
+    /// installed). This is the conventional "please shut down" signal in Unix: what `kill <pid>`
+    /// (no args) sends and what systemd, K8s, Docker, runit, and supervisord all use.
     Terminate,
 }
 
@@ -371,8 +371,8 @@ impl UnixGracefulPhase {
 /// # Construction
 ///
 /// `UnixGracefulShutdown` cannot be constructed empty. The implicit `SIGKILL` fallback is not a
-/// phase; a graceful sequence must contain at least one signal to dispatch. Use one of the named
-/// single-signal constructors, or [`from_phases`](Self::from_phases) for a multi-phase
+/// phase, so a graceful sequence must contain at least one signal to dispatch. Use one of the
+/// named single-signal constructors, or [`from_phases`](Self::from_phases) for a multi-phase
 /// cooperative sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnixGracefulShutdown {
@@ -380,16 +380,17 @@ pub struct UnixGracefulShutdown {
 }
 
 impl UnixGracefulShutdown {
-    /// Single-phase sequence sending `SIGTERM` only. The recommended default for service-like
-    /// children; see the [type-level docs](Self#choosing-a-sequence) for the full discussion.
-    /// The implicit `SIGKILL` fallback runs after `timeout` if the child has not exited.
+    /// Single-phase sequence sending `SIGTERM` only. This is the recommended default for
+    /// service-like children. See the [type-level docs](Self#choosing-a-sequence) for the full
+    /// discussion. The implicit `SIGKILL` fallback runs after `timeout` if the child has not
+    /// exited.
     #[must_use]
     pub fn terminate_only(timeout: Duration) -> Self {
         Self::single(UnixGracefulPhase::terminate(timeout))
     }
 
     /// Single-phase sequence sending `SIGINT` only. Use this when forwarding a Ctrl-C / TTY
-    /// interrupt to a CLI-like child; see the [type-level docs](Self#choosing-a-sequence) for
+    /// interrupt to a CLI-like child. See the [type-level docs](Self#choosing-a-sequence) for
     /// the full discussion. The implicit `SIGKILL` fallback runs after `timeout` if the child
     /// has not exited.
     #[must_use]
@@ -408,13 +409,13 @@ impl UnixGracefulShutdown {
     /// Multi-phase sequence dispatched in iteration order. Use only for cooperative
     /// shutdown protocols against a child you control, where each signal in the sequence has
     /// a distinct handler. For unknown children pick [`Self::terminate_only`] or
-    /// [`Self::interrupt_only`] instead; see the [type-level docs](Self#choosing-a-sequence)
+    /// [`Self::interrupt_only`] instead. See the [type-level docs](Self#choosing-a-sequence)
     /// for why a multi-phase sequence does not "cover both conventions".
     ///
     /// # Panics
     ///
     /// Panics if `phases` produces no elements. A graceful sequence must contain at least one
-    /// phase; the implicit `SIGKILL` fallback is not a phase.
+    /// phase, and the implicit `SIGKILL` fallback is not a phase.
     #[must_use]
     pub fn from_phases(phases: impl IntoIterator<Item = UnixGracefulPhase>) -> Self {
         let phases: Vec<_> = phases.into_iter().collect();
@@ -478,9 +479,8 @@ mod tests {
 
             #[cfg(unix)]
             {
-                let phases = shutdown.unix.phases();
-                assert_that!(phases.len()).is_equal_to(1);
-                assert_that!(phases[0].timeout).is_equal_to(Duration::from_secs(5));
+                assert_that!(shutdown.unix.phases())
+                    .contains_exactly([UnixGracefulPhase::terminate(Duration::from_secs(5))]);
             }
             #[cfg(windows)]
             {
@@ -497,9 +497,8 @@ mod tests {
 
             #[cfg(unix)]
             {
-                let phases = shutdown.unix.phases();
-                assert_that!(phases.len()).is_equal_to(1);
-                assert_that!(phases[0].timeout).is_equal_to(Duration::from_secs(3));
+                assert_that!(shutdown.unix.phases())
+                    .contains_exactly([UnixGracefulPhase::interrupt(Duration::from_secs(3))]);
             }
             #[cfg(windows)]
             {
@@ -511,7 +510,7 @@ mod tests {
     #[cfg(unix)]
     mod unix_sequence {
         use super::*;
-        use crate::{UnixGracefulPhase, UnixGracefulSignal};
+        use crate::UnixGracefulPhase;
 
         #[test]
         fn from_phases_preserves_iteration_order() {
@@ -520,12 +519,10 @@ mod tests {
                 UnixGracefulPhase::terminate(Duration::from_secs(2)),
             ]);
 
-            let phases = sequence.phases();
-            assert_that!(phases.len()).is_equal_to(2);
-            assert_that!(phases[0].signal).is_equal_to(UnixGracefulSignal::Interrupt);
-            assert_that!(phases[0].timeout).is_equal_to(Duration::from_secs(1));
-            assert_that!(phases[1].signal).is_equal_to(UnixGracefulSignal::Terminate);
-            assert_that!(phases[1].timeout).is_equal_to(Duration::from_secs(2));
+            assert_that!(sequence.phases()).contains_exactly([
+                UnixGracefulPhase::interrupt(Duration::from_secs(1)),
+                UnixGracefulPhase::terminate(Duration::from_secs(2)),
+            ]);
         }
 
         #[test]

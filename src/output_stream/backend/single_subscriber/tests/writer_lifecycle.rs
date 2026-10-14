@@ -45,5 +45,5 @@ async fn pending_writer_abort_releases_single_subscriber_claim() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"later".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"later");
 }

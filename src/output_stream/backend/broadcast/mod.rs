@@ -11,7 +11,7 @@
 //!   history, and routes per-event dispatch through [`state::append_event`] to honor the
 //!   configured delivery guarantee.
 //!
-//! The dispatch lives in [`BroadcastOutputStream::from_stream`] below; see each
+//! The dispatch lives in [`BroadcastOutputStream::from_stream`] below. See each
 //! submodule's `//!` block for the rationale of that path.
 
 use crate::WaitForLineResult;
@@ -348,7 +348,7 @@ where
     /// `.await` cannot race ahead of the matcher.
     ///
     /// The waiter starts at the earliest output currently available to new consumers. With
-    /// replay enabled and unsealed, that can include retained past output; otherwise it starts
+    /// replay enabled and unsealed, that can include retained past output. Otherwise it starts
     /// at live output.
     ///
     /// When chunks are dropped in [`DeliveryGuarantee::LossyWithoutBackpressure`] mode, this waiter discards

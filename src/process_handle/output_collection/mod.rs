@@ -1,5 +1,5 @@
 //! Helpers used by the staged [`crate::WaitForCompletion`] builder to drain stdout/stderr
-//! alongside process exit. The builder lives in `process_handle::wait_builder`; this module
+//! alongside process exit. The builder lives in `process_handle::wait_builder`. This module
 //! owns the supporting collector spawn and the timed drain orchestration.
 
 pub(crate) mod drain;

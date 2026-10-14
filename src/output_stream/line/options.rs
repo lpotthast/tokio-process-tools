@@ -6,24 +6,22 @@ use typed_builder::TypedBuilder;
 /// Default maximum line length used by [`LineParsingOptions::default`]. 16 kilobytes.
 pub const DEFAULT_MAX_LINE_LENGTH: NumBytes = NumBytes(16 * 1024);
 
-/// What should happen when a line is too long?
+/// Behavior applied when a parsed line reaches the configured maximum length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LineOverflowBehavior {
-    /// Drop any additional data received after the current line was considered too long until
-    /// the next newline character is observed, which then starts a new line.
+    /// Emit the current line truncated at the limit and drop all further data until the next
+    /// newline character is observed, which then starts a new line.
     ///
     /// The discard state persists across chunk boundaries. Once the limit is reached, subsequent
     /// bytes are ignored until a real newline is observed.
     #[default]
     DropAdditionalData,
 
-    /// Emit the current line when the maximum allowed length is reached.
-    /// Any additional data received is immediately taken as the content of the next line.
+    /// Emit the current line when the maximum allowed length is reached and treat any additional
+    /// data as the content of the next line.
     ///
-    /// This option really just adds intermediate line breaks to not let any emitted line exceed the
-    /// length limit.
-    ///
-    /// No data is dropped with this behavior.
+    /// In effect, this inserts artificial line breaks so that no emitted line exceeds the length
+    /// limit. No data is dropped with this behavior.
     EmitAdditionalAsNewLines,
 }
 
@@ -31,8 +29,9 @@ pub enum LineOverflowBehavior {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TypedBuilder)]
 pub struct LineParsingOptions {
     /// Maximum length of a single line in bytes.
-    /// When reached, further data won't be appended to the current line.
-    /// The line will be emitted in its current state.
+    ///
+    /// When reached, the current line is emitted at the limit and any further data is handled
+    /// according to [`overflow_behavior`](Self::overflow_behavior).
     ///
     /// **Must be greater than zero** for any line-consuming visitor built via
     /// [`ParseLines`](crate::ParseLines) (and the backends' `wait_for_line` helpers).
@@ -45,20 +44,17 @@ pub struct LineParsingOptions {
     /// Defaults to [`DEFAULT_MAX_LINE_LENGTH`].
     pub max_line_length: NumBytes,
 
-    /// What should happen when a line is too long?
+    /// How to handle a line that reaches [`max_line_length`](Self::max_line_length): drop the
+    /// overflowing data, or emit it as additional lines. See [`LineOverflowBehavior`].
     ///
-    /// When lossy buffering drops chunks before they reach the parser, line-based consumers
-    /// conservatively discard any partial line and resynchronizes at the next newline instead of
-    /// joining bytes across the gap.
-    ///
-    /// Defaults to `LineOverflowBehavior::DropAdditionalData`.
+    /// Defaults to [`LineOverflowBehavior::DropAdditionalData`].
     pub overflow_behavior: LineOverflowBehavior,
 
     /// Optional cap on each parser's long-term-retained buffer capacity.
     ///
     /// The parser keeps two `BytesMut` buffers (the in-progress line and the most-recently emitted
-    /// line): each retains capacity for the parser's lifetime, growing to fit the largest line they
-    /// have ever held. For most workloads this is fine. The worst case is roughly
+    /// line). Each retains capacity for the parser's lifetime, growing to fit the largest line it
+    /// has ever held. For most workloads this is fine. The worst case is roughly
     /// `2 × `[`max_line_length`](Self::max_line_length) memory used per parser.
     ///
     /// Set this to `Some(n)` when a stream has mostly small lines but occasional large outliers
@@ -74,11 +70,10 @@ pub struct LineParsingOptions {
     /// the parser unnecessarily. When your `max_line_length` is already small, you may ignore this
     /// setting if max consumption is not an issue on your system.
     ///
-    /// Compaction reduces the parser's *steady-state* memory after outliers; it does not change
-    /// the peak. Peak per-parser memory is roughly `2 ×
-    /// `[`max_line_length`](Self::max_line_length) regardless of this setting (the in-progress
-    /// line and the most-recently emitted line each retain capacity). Compaction is also
-    /// best-effort: a partially-buffered line that has not yet finished may briefly retain
+    /// Compaction reduces the parser's *steady-state* memory after outliers. It does not change
+    /// the peak: peak per-parser memory stays at roughly
+    /// `2 × `[`max_line_length`](Self::max_line_length) regardless of this setting. Compaction is
+    /// also best-effort: a partially-buffered line that has not yet finished may briefly retain
     /// over-threshold capacity until the line completes.
     ///
     /// Defaults to `None`.

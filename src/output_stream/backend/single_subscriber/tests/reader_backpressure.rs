@@ -3,6 +3,7 @@ use super::common::wait_for_terminal_shared;
 use super::reader_test_support::{recv_event_with_timeout, spawn_configured_reader};
 use crate::output_stream::Consumable;
 use crate::output_stream::event::StreamEvent;
+use crate::output_stream::event::tests::StreamEventAssertions;
 use crate::output_stream::line::adapter::ParseLines;
 use crate::output_stream::policy::DeliveryGuarantee;
 use crate::{DEFAULT_READ_CHUNK_SIZE, LineParsingOptions, Next, NumBytesExt, StreamConfig};
@@ -63,14 +64,9 @@ async fn configured_reader_sends_pending_gap_before_terminal_eof() {
     );
     drop(shared);
 
-    match rx.recv().await.unwrap() {
-        StreamEvent::Chunk(chunk) => {
-            assert_that!(chunk.as_ref()).is_equal_to(b"aa".as_slice());
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected first chunk, got {other:?}"));
-        }
-    }
+    assert_that!(rx.recv().await.unwrap())
+        .is_chunk()
+        .is_equal_to(b"aa");
 
     let mut previous = None;
     while let Some(event) = rx.recv().await {
@@ -84,7 +80,7 @@ async fn configured_reader_sends_pending_gap_before_terminal_eof() {
                 previous = Some(event);
             }
             StreamEvent::ReadError(err) => {
-                assert_that!(&err).fail(format_args!("unexpected read error: {err}"));
+                panic!("unexpected read error: {err}");
             }
         }
     }
@@ -110,14 +106,9 @@ async fn configured_reader_records_eof_while_active_queue_is_full() {
     assert_that!(stream_reader.is_finished()).is_false();
     drop(shared);
 
-    match recv_event_with_timeout(&mut rx).await {
-        StreamEvent::Chunk(chunk) => {
-            assert_that!(chunk.as_ref()).is_equal_to(b"aa".as_slice());
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected buffered chunk, got {other:?}"));
-        }
-    }
+    assert_that!(recv_event_with_timeout(&mut rx).await)
+        .is_chunk()
+        .is_equal_to(b"aa");
     assert_that!(rx.recv().await.unwrap()).is_equal_to(StreamEvent::Gap);
     assert_that!(rx.recv().await.unwrap()).is_equal_to(StreamEvent::Eof);
 
@@ -136,21 +127,16 @@ async fn configured_best_effort_yields_when_pending_gap_channel_is_full() {
         1,
     );
 
-    match rx.recv().await.unwrap() {
-        StreamEvent::Chunk(chunk) => {
-            assert_that!(chunk.as_ref()).is_equal_to(b"x".as_slice());
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected first chunk, got {other:?}"));
-        }
-    }
+    assert_that!(rx.recv().await.unwrap())
+        .is_chunk()
+        .is_equal_to(b"x");
 
     let observed = bytes_read.load(Ordering::Relaxed);
-    assert_that!(observed < total_bytes)
+    assert_that!(observed)
         .with_detail_message(format!(
             "reader consumed all {total_bytes} bytes before yielding"
         ))
-        .is_true();
+        .is_less_than(total_bytes);
 
     drop(rx);
     stream_reader.await.unwrap();
@@ -172,14 +158,9 @@ async fn configured_reader_sends_pending_gap_before_resumed_chunk_delivery() {
     sleep(Duration::from_millis(25)).await;
 
     for expected in [b"aa".as_slice(), b"bb".as_slice()] {
-        match rx.recv().await.unwrap() {
-            StreamEvent::Chunk(chunk) => {
-                assert_that!(chunk.as_ref()).is_equal_to(expected);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected buffered chunk, got {other:?}"));
-            }
-        }
+        assert_that!(rx.recv().await.unwrap())
+            .is_chunk()
+            .is_equal_to(expected);
     }
 
     write_half.write_all(b"dd").await.unwrap();
@@ -187,14 +168,9 @@ async fn configured_reader_sends_pending_gap_before_resumed_chunk_delivery() {
     drop(write_half);
 
     assert_that!(rx.recv().await.unwrap()).is_equal_to(StreamEvent::Gap);
-    match rx.recv().await.unwrap() {
-        StreamEvent::Chunk(chunk) => {
-            assert_that!(chunk.as_ref()).is_equal_to(b"dd".as_slice());
-        }
-        other => {
-            assert_that!(&other).fail(format_args!("expected resumed chunk, got {other:?}"));
-        }
-    }
+    assert_that!(rx.recv().await.unwrap())
+        .is_chunk()
+        .is_equal_to(b"dd");
     assert_that!(rx.recv().await.unwrap()).is_equal_to(StreamEvent::Eof);
 
     stream_reader.await.unwrap();

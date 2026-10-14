@@ -49,7 +49,7 @@ async fn configured_second_subscriber_error_does_not_poison_state_or_stop_reader
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"live".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"live");
 }
 
 #[tokio::test]

@@ -139,7 +139,7 @@ mod tests {
         .await;
 
         let state = shared.state.lock().expect("broadcast state poisoned");
-        assert_that!(state.replay.len()).is_equal_to(3);
+        assert_that!(state.replay).has_length(3);
         assert_that!(&state.replay[0].event)
             .is_chunk()
             .is_equal_to(b"ab");
@@ -150,7 +150,7 @@ mod tests {
             .is_chunk()
             .is_equal_to(b"ef");
         assert_that!(state.terminal.as_ref().map(|event| &event.event))
-            .get_some()
+            .some()
             .is_equal_to(&StreamEvent::Eof);
     }
 }

@@ -14,10 +14,9 @@ where
     Stdout: OutputStream,
     Stderr: OutputStream,
 {
-    /// Successfully awaiting the completion of the process will unset the
-    /// "must be terminated" setting, as a successfully awaited process is already terminated.
-    /// Dropping this `ProcessHandle` after successfully calling `wait` should never lead to a
-    /// "must be terminated" panic being raised.
+    /// Waits for the child to exit and, on success, disarms the drop guards: a successfully
+    /// awaited process needs no termination, so dropping this `ProcessHandle` afterwards must
+    /// never raise the "must be terminated" panic.
     async fn wait(&mut self) -> io::Result<ExitStatus> {
         self.stdin().close();
         match self.group.wait().await {

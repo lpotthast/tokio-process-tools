@@ -187,8 +187,8 @@ mod signal_failures {
             .unwrap_err();
 
         assert_that!(error.process_name()).is_equal_to("long-running");
-        assert_that!(matches!(&error, TerminationError::SignalFailed { .. })).is_true();
-        assert_that!(error.attempt_errors().len()).is_equal_to(1);
+        assert_that!(error).is_matching(pattern!(TerminationError::SignalFailed { .. }));
+        assert_that!(error.attempt_errors()).has_length(1);
         assert_attempt_error(
             &error.attempt_errors()[0],
             TerminationAction::SendSignal { signal_name: label },
@@ -229,8 +229,8 @@ mod signal_failures {
             .unwrap_err();
 
         assert_that!(error.process_name()).is_equal_to("long-running");
-        assert_that!(matches!(&error, TerminationError::SignalFailed { .. })).is_true();
-        assert_that!(error.attempt_errors().len()).is_equal_to(2);
+        assert_that!(error).is_matching(pattern!(TerminationError::SignalFailed { .. }));
+        assert_that!(error.attempt_errors()).has_length(2);
         assert_attempt_error(
             &error.attempt_errors()[0],
             TerminationAction::SendSignal {

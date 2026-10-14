@@ -88,5 +88,5 @@ async fn consume_async_runs_a_custom_async_visitor_to_eof() {
     while let Some(bytes) = forwarded_rx.recv().await {
         all_bytes.extend_from_slice(&bytes);
     }
-    assert_that!(all_bytes).is_equal_to(b"alphabeta".to_vec());
+    assert_that!(all_bytes).is_equal_to(b"alphabeta");
 }

@@ -24,7 +24,9 @@ async fn timeout_allows_later_collector() {
         )
         .unwrap()
         .await;
-    assert_that!(result).is_equal_to(Ok(WaitForLineResult::Timeout));
+    assert_that!(result)
+        .ok()
+        .is_equal_to(WaitForLineResult::Timeout);
     wait_for_no_active_consumer(&stream).await;
 
     let collector = stream
@@ -37,7 +39,7 @@ async fn timeout_allows_later_collector() {
     drop(write_half);
 
     let bytes = collector.wait().await.unwrap();
-    assert_that!(bytes.bytes).is_equal_to(b"ready\n".to_vec());
+    assert_that!(bytes.bytes).is_equal_to(b"ready\n");
 }
 
 #[tokio::test]
@@ -61,7 +63,7 @@ async fn subscribes_before_polling() {
     drop(write_half);
 
     assert_that!(waiter.await)
-        .get_ok()
+        .ok()
         .is_equal_to(WaitForLineResult::Matched);
 }
 
@@ -85,6 +87,7 @@ async fn stream_drop_closes_waiting_line_waiters() {
 
     let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;
     assert_that!(result)
-        .get_ok()
-        .is_equal_to(Ok(WaitForLineResult::StreamClosed));
+        .ok()
+        .ok()
+        .is_equal_to(WaitForLineResult::StreamClosed);
 }

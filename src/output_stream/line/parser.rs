@@ -24,8 +24,8 @@ fn decode_line_lossy(bytes: &[u8]) -> Cow<'_, str> {
 /// Stateful parser for turning arbitrary byte chunks into lines.
 ///
 /// Drive it by calling [`Self::next_line`] in a loop with a slice cursor that you advance
-/// across calls; on EOF call [`Self::finish`] once to flush any unterminated trailing line.
-/// On a stream gap (chunks dropped between deliveries) call [`Self::on_gap`] to discard the
+/// across calls. On EOF, call [`Self::finish`] once to flush any unterminated trailing line.
+/// On a stream gap (chunks dropped between deliveries), call [`Self::on_gap`] to discard the
 /// in-progress partial line and resynchronize at the next newline.
 pub struct LineParser {
     /// Bytes accumulated for the current in-progress line. Cleared (via `split`) when the line
@@ -63,7 +63,7 @@ impl LineParser {
     /// Advances through `chunk` and yields the next parsed line, if any.
     ///
     /// `chunk` is mutated in place to advance past the consumed prefix. Call repeatedly,
-    /// reusing the same slice cursor, until this returns `None`; at that point the chunk is
+    /// reusing the same slice cursor, until this returns `None`. At that point the chunk is
     /// exhausted and any partial line is buffered for the next chunk.
     ///
     /// The returned [`Cow`] borrows from the chunk slice when the line fits entirely in this
@@ -182,7 +182,7 @@ impl LineParser {
     /// happens to carry a small partial line stays pinned until the in-progress line emits, at
     /// which point swap-and-clear in `emit_buffered_line` rebalances the two slots and the next
     /// `next_line` call reclaims the excess. The peak memory bound (`2 × max_line_length`) is the
-    /// same whether or not compaction is enabled; compaction only improves the steady-state
+    /// same whether or not compaction is enabled. Compaction only improves the steady-state
     /// average after outliers, with a worst-case "still over-sized" window equal to the duration
     /// of one in-progress line.
     fn compact_if_needed(&mut self, threshold: Option<crate::NumBytes>) {
@@ -254,8 +254,7 @@ mod tests {
             collected_lines.push(line.into_owned());
         }
 
-        let expected_lines: Vec<String> = expected_lines.iter().map(ToString::to_string).collect();
-        assert_that!(collected_lines).is_equal_to(expected_lines);
+        assert_that!(collected_lines).contains_exactly(expected_lines);
     }
 
     fn emit_additional_options() -> LineParsingOptions {
@@ -446,12 +445,12 @@ mod tests {
         let line = parser
             .next_line(&mut bytes, LineParsingOptions::default())
             .expect("first line is yielded");
-        assert_that!(matches!(line, Cow::Borrowed(_))).is_true();
+        assert_that!(line).is_matching(pattern!(Cow::Borrowed(_)));
         drop(line);
         let line = parser
             .next_line(&mut bytes, LineParsingOptions::default())
             .expect("second line is yielded");
-        assert_that!(matches!(line, Cow::Borrowed(_))).is_true();
+        assert_that!(line).is_matching(pattern!(Cow::Borrowed(_)));
     }
 
     mod properties {
@@ -579,7 +578,7 @@ mod tests {
                 prop_assert_eq!(from_single_byte, from_single);
             }
 
-            /// Embedded NUL bytes are treated as ordinary content; lines remain split only on
+            /// Embedded NUL bytes are treated as ordinary content, and lines remain split only on
             /// `\n`. Round-tripping through the parser preserves the line count and byte
             /// content (modulo the dropped delimiters) for ASCII-plus-NUL data.
             #[test]
@@ -731,12 +730,12 @@ mod tests {
             second.push(b'\n');
 
             let mut bytes = first;
-            assert_that!(parser.next_line(&mut bytes, options).is_none()).is_true();
+            assert_that!(parser.next_line(&mut bytes, options)).is_none();
             let mut bytes: &[u8] = &second;
             let emitted = parser
                 .next_line(&mut bytes, options)
                 .expect("line emits when newline arrives");
-            assert_that!(emitted.len()).is_equal_to(line.len());
+            assert_that!(emitted).has_length(line.len());
             drop(emitted);
         }
 
@@ -760,14 +759,14 @@ mod tests {
             // up again.
             run_split_line(&mut parser, &b"a".repeat(200), options);
             let larger = parser.line_buffer.capacity().max(parser.emitted.capacity());
-            assert_that!(larger >= 200).is_true();
+            assert_that!(larger).is_greater_or_equal_to(200);
 
             run_split_line(&mut parser, &b"b".repeat(8), options);
 
             // No threshold ⇒ the largest retained capacity does not shrink below the
             // 200-byte high-water mark even after the small line.
             let after = parser.line_buffer.capacity().max(parser.emitted.capacity());
-            assert_that!(after >= 200).is_true();
+            assert_that!(after).is_greater_or_equal_to(200);
         }
 
         #[test]
@@ -778,13 +777,12 @@ mod tests {
             let options = unbounded_options(Some(16.bytes()));
 
             run_split_line(&mut parser, &b"a".repeat(200), options);
-            assert_that!(parser.emitted.capacity() >= 200).is_true();
+            assert_that!(parser.emitted.capacity()).is_greater_or_equal_to(200);
 
             // The next `next_line` call observes the over-threshold capacity at entry and
             // drops the allocation; the small line then re-grows `emitted` to a small size.
             run_split_line(&mut parser, &b"b".repeat(8), options);
-            assert_that!(parser.emitted.capacity() <= 200).is_true();
-            assert_that!(parser.emitted.capacity() < 64).is_true();
+            assert_that!(parser.emitted.capacity()).is_less_than(64);
         }
 
         #[test]
@@ -797,8 +795,8 @@ mod tests {
 
             // Feed a partial line; no newline yet, so it stays buffered.
             let mut bytes: &[u8] = b"abcdefgh";
-            assert_that!(parser.next_line(&mut bytes, options).is_none()).is_true();
-            assert_that!(parser.line_buffer.len()).is_equal_to(8);
+            assert_that!(parser.next_line(&mut bytes, options)).is_none();
+            assert_that!(&parser.line_buffer[..]).has_length(8);
 
             // Even though `line_buffer.capacity() > threshold`, the buffer is non-empty so
             // compaction must be skipped. After feeding the rest with a newline, the full

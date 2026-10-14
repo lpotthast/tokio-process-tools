@@ -27,17 +27,10 @@ fn ignores_graceful_shutdown_and_keeps_stdout_open_until_force_killed_command()
 }
 
 #[track_caller]
-fn assert_eof_timeout(err: WaitWithOutputError, expected_eof: Duration) {
-    match err {
-        WaitWithOutputError::OutputCollectionTimeout {
-            timeout: actual, ..
-        } => {
-            assert_that!(actual).is_equal_to(expected_eof);
-        }
-        other => assert_that!(&other).fail(format_args!(
-            "expected output collection timeout, got {other:?}"
-        )),
-    }
+fn assert_eof_timeout(err: &WaitWithOutputError, expected_eof: Duration) {
+    assert_that!(err).is_matching(pattern!(
+        WaitWithOutputError::OutputCollectionTimeout { timeout, .. } if *timeout == expected_eof
+    ));
 }
 
 mod with_line_output {
@@ -101,10 +94,7 @@ mod with_line_output {
         let mut process =
             spawn_broadcast_with_replay("echo-stdin", echoes_stdin_until_eof_command());
 
-        let Some(stdin) = process.stdin().as_mut() else {
-            assert_that!(process.stdin().is_open()).fail("stdin should start open");
-            return;
-        };
+        let stdin = process.stdin().as_mut().expect("stdin should start open");
         stdin
             .write_all(b"collector wait closes stdin\n")
             .await
@@ -177,7 +167,7 @@ mod with_line_output {
         .expect("output wait should return before the outer guard");
 
         let err = result.expect_err("inherited output pipe should hit the operation deadline");
-        assert_eof_timeout(err, eof_timeout);
+        assert_eof_timeout(&err, eof_timeout);
     }
 
     #[tokio::test]
@@ -195,7 +185,7 @@ mod with_line_output {
                 line_output_options(),
             )
             .await;
-        assert_that!(result.is_err()).is_true();
+        assert_that!(result).is_err();
 
         let collector = collect_lines_into_vec(process.stdout()).unwrap();
         let _collected = collector
@@ -225,7 +215,7 @@ mod with_line_output {
                 line_output_options(),
             )
             .await;
-        assert_that!(first.unwrap().into_completed().is_none()).is_true();
+        assert_that!(first.unwrap().into_completed()).is_none();
 
         tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -267,12 +257,9 @@ mod with_line_output {
             .await
             .expect_err("active stdout consumer should reject output collection");
 
-        match err {
-            WaitWithOutputError::OutputCollectionStartFailed { .. } => {}
-            other => {
-                assert_that!(&other).fail(format_args!("expected start failure, got {other:?}"));
-            }
-        }
+        assert_that!(err).is_matching(pattern!(
+            WaitWithOutputError::OutputCollectionStartFailed { .. }
+        ));
 
         let _collected = active
             .cancel(Duration::from_secs(1))
@@ -308,12 +295,9 @@ mod with_line_output {
             .await
             .expect_err("active stderr consumer should reject output collection");
 
-        match err {
-            WaitWithOutputError::OutputCollectionStartFailed { .. } => {}
-            other => {
-                assert_that!(&other).fail(format_args!("expected start failure, got {other:?}"));
-            }
-        }
+        assert_that!(err).is_matching(pattern!(
+            WaitWithOutputError::OutputCollectionStartFailed { .. }
+        ));
 
         let stdout = collect_chunks_into_vec(process.stdout()).unwrap();
         let _stdout = stdout
@@ -356,8 +340,8 @@ mod with_raw_output {
             .expect_completed("process should complete");
 
         assert_that!(output.status.success()).is_true();
-        assert_that!(output.stdout.bytes).is_equal_to(b"out\nraw".to_vec());
-        assert_that!(output.stderr.bytes).is_equal_to(b"err\nraw".to_vec());
+        assert_that!(output.stdout.bytes).is_equal_to(b"out\nraw");
+        assert_that!(output.stderr.bytes).is_equal_to(b"err\nraw");
     }
 }
 
@@ -417,7 +401,7 @@ mod with_line_output_or_terminate {
         .expect("output wait should return before the outer guard");
 
         let err = result.expect_err("inherited output pipe should hit the operation deadline");
-        assert_eof_timeout(err, eof_timeout);
+        assert_eof_timeout(&err, eof_timeout);
     }
 
     #[cfg(unix)]
@@ -460,10 +444,7 @@ mod with_line_output_or_terminate {
                 result
             }
             other @ WaitForCompletionOrTerminateResult::Completed(_) => {
-                assert_that!(&other).fail(format_args!(
-                    "expected timeout-driven termination, got {other:?}"
-                ));
-                return;
+                panic!("expected timeout-driven termination, got {other:?}");
             }
         };
 
@@ -494,7 +475,7 @@ mod with_raw_output_or_terminate {
             .expect_completed("process should complete before timeout");
 
         assert_that!(output.status.success()).is_true();
-        assert_that!(output.stdout.bytes).is_equal_to(b"raw-out".to_vec());
-        assert_that!(output.stderr.bytes).is_equal_to(b"raw-err".to_vec());
+        assert_that!(output.stdout.bytes).is_equal_to(b"raw-out");
+        assert_that!(output.stderr.bytes).is_equal_to(b"raw-err");
     }
 }

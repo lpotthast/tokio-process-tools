@@ -3,10 +3,10 @@
 //!
 //! Reach for this when the child will produce more output than is reasonable to hold in
 //! memory: build tools, long-running servers in CI logs, anything you want on disk rather
-//! than in `Vec<String>`. Parsed lines are written one per call;
+//! than in `Vec<String>`. Parsed lines are written one per call, and
 //! [`LineWriteMode::AppendLf`] re-attaches the trailing newline that line parsing strips.
 //! [`WriteCollectionOptions::log_and_continue`] keeps collection running if the file write
-//! ever fails (disk full, broken pipe to a piped writer, etc.); use `fail_fast()` instead
+//! ever fails (disk full, broken pipe to a piped writer, etc.). Use `fail_fast()` instead
 //! when a sink failure should stop the collection.
 //!
 //! After the child exits the stream closes, the visitor drains, and `Consumer::wait`

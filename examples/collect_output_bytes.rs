@@ -1,11 +1,11 @@
 #![allow(clippy::wildcard_imports)]
-//! Same as `wait_and_collect_lines`, but for output that is not UTF-8 line-oriented.
+//! Same as `collect_output_lines`, but for output that is not UTF-8 line-oriented.
 //!
 //! Reach for `with_raw_output(...)` and `RawOutputOptions` when the child produces binary
 //! blobs (image conversion, archive tools), framed protocols, or anything where line parsing
 //! would corrupt or lose bytes. The shape of the chain is otherwise identical.
 //!
-//! Run: `cargo run --example wait_and_collect_raw_bytes`
+//! Run: `cargo run --example collect_output_bytes`
 
 use std::time::Duration;
 use tokio::process::Command;

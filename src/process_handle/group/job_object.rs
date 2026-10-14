@@ -7,7 +7,7 @@
 //! grandchildren the way `Child::start_kill` would.
 //!
 //! This deliberately does **not** set `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Closing the handle
-//! must not kill the assigned processes; otherwise dropping a `ProcessHandle` after
+//! must not kill the assigned processes. Otherwise dropping a `ProcessHandle` after
 //! [`crate::ProcessHandle::into_inner`] or
 //! [`crate::ProcessHandle::must_not_be_terminated`] would kill a child the caller intentionally
 //! chose to detach.
@@ -34,7 +34,7 @@ impl JobObject {
     ///
     /// There is a small race window between `Command::spawn` and this assignment in which the
     /// child could already have spawned a grandchild. Tokio's `Command` does not expose
-    /// `CREATE_SUSPENDED`, so we cannot eliminate that window here; the assignment is performed
+    /// `CREATE_SUSPENDED`, so we cannot eliminate that window here. The assignment is performed
     /// as soon as the child handle is available, which keeps the window microscopic.
     pub(super) fn new_with_child(child: &tokio::process::Child) -> io::Result<Self> {
         use windows_sys::Win32::Foundation::CloseHandle;

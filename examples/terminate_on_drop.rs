@@ -7,14 +7,19 @@
 //! most "I forgot to wait" bugs would otherwise survive into production.
 //!
 //! For long-lived processes that follow a service's own lifecycle, opting in to
-//! `.terminate_on_drop(...)` swaps the panic for an async termination attempt during drop.
+//! `.terminate_on_drop(...)` swaps the panic for a termination attempt during drop.
 //! The signature mirrors `terminate(...)`: a `GracefulShutdown` carrying a
 //! `UnixGracefulShutdown` on Unix and a `WindowsGracefulShutdown` on Windows.
 //!
-//! `terminate_on_drop` requires a multithreaded Tokio runtime, because drop runs the
-//! termination attempt on Tokio's blocking pool. If the attempt itself fails, the inner
-//! handle still falls back to the panic path so the failure is not silent. Under
-//! `#[tokio::test]`, opt in to the multi-thread flavor:
+//! Because `Drop` is synchronous, the graceful shutdown can only run when the wrapper is
+//! dropped on a thread inside a multithreaded Tokio runtime. Anywhere else (outside any
+//! runtime, inside a current-thread runtime, or while unwinding from a panic), the child's
+//! process group / Job Object is killed immediately instead. `.terminate_on_drop(...)` then
+//! panics to make the lost graceful shutdown impossible to miss. Use
+//! `.terminate_on_drop_with_fallback(..., TerminateOnDropFallback::Trace)` to log an error
+//! through `tracing` instead.
+//!
+//! Under `#[tokio::test]`, opt in to the multi-thread flavor:
 //!
 //! ```ignore
 //! #[tokio::test(flavor = "multi_thread")]
@@ -59,6 +64,6 @@ async fn main() {
     // Do some work while the child is alive...
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // When `_process` is dropped here, the configured graceful shutdown runs in the
-    // background. No panic, no leak.
+    // When `_process` is dropped here, the current thread blocks while the multithreaded runtime
+    // drives the configured graceful shutdown. No panic, no leak.
 }

@@ -24,11 +24,10 @@ use tokio::process::ChildStdin;
 /// Represents the `stdin` stream of a child process.
 ///
 /// stdin is always configured as piped, so it starts as `Open` with a [`ChildStdin`] handle
-/// that can be used to write data to the process. It can be explicitly closed by calling
-/// [`Stdin::close`], or implicitly closed by the staged
-/// [`ProcessHandle::wait_for_completion`] builder and [`ProcessHandle::kill`], after which it
-/// transitions to the `Closed` state. Note that some operations (kill) close `stdin` early in
-/// order to match the behavior of tokio.
+/// that can be used to write data to the process. It transitions to `Closed` when
+/// [`Stdin::close`] is called explicitly, or implicitly when the staged
+/// [`ProcessHandle::wait_for_completion`] builder or [`ProcessHandle::kill`] closes it, matching
+/// the behavior of [`tokio::process::Child::wait`] and [`tokio::process::Child::kill`].
 #[derive(Debug)]
 pub enum Stdin {
     /// `stdin` is open and available for writing.
@@ -55,11 +54,10 @@ impl Stdin {
 
     /// Closes stdin by dropping the underlying [`ChildStdin`] handle.
     ///
-    /// This sends `EOF` to the child process. After calling this method, this stdin
-    /// will be in the `Closed` state and no further writes will be possible. The staged
-    /// [`ProcessHandle::wait_for_completion`] builder and [`ProcessHandle::kill`] also close
-    /// any still-open stdin automatically; call this method when the child must observe EOF
-    /// earlier.
+    /// This sends EOF to the child process. Afterwards this stdin is in the `Closed` state and no
+    /// further writes are possible. The staged [`ProcessHandle::wait_for_completion`] builder and
+    /// [`ProcessHandle::kill`] also close any still-open stdin automatically. Call this method
+    /// when the child must observe EOF earlier.
     pub fn close(&mut self) {
         *self = Stdin::Closed;
     }
@@ -82,7 +80,7 @@ pub enum RunningState {
     /// The conservative reading is "still running": until termination has been confirmed, the
     /// drop-cleanup and panic guards on the handle are still required, and the process may yet
     /// produce output. The variant carries the underlying [`io::Error`] so callers can log or
-    /// retry at their discretion; treating it as "not running" risks dropping a still-live child.
+    /// retry at their discretion. Treating it as "not running" risks dropping a still-live child.
     /// [`RunningState::is_definitely_running`] returns `false` here on purpose so callers cannot
     /// mistake "we don't know" for "still running" via a single boolean check, but matching on
     /// the enum is the only way to distinguish [`RunningState::Terminated`] from this case.
@@ -98,7 +96,7 @@ impl RunningState {
     /// [`RunningState::Uncertain`] is real and worth surfacing, not silently collapsing.
     ///
     /// Even when this returns `false` for an [`RunningState::Uncertain`] state, the safe
-    /// interpretation is still "the process may be running"; do not use this predicate to decide
+    /// interpretation is still "the process may be running". Do not use this predicate to decide
     /// whether it is safe to drop the handle. See [`RunningState::Uncertain`].
     #[must_use]
     pub fn is_definitely_running(&self) -> bool {
@@ -113,7 +111,9 @@ impl RunningState {
 /// or terminated before being dropped (see [`ProcessHandle::must_be_terminated`]).
 ///
 /// If applicable, a process handle can be wrapped in a [`crate::TerminateOnDrop`] to be terminated
-/// automatically upon being dropped. Note that this requires a multithreaded runtime!
+/// automatically upon being dropped. Graceful termination on drop requires the drop to happen on
+/// a thread inside a multithreaded runtime. Any other context degrades to an immediate kill (see
+/// [`crate::TerminateOnDrop`]).
 #[derive(Debug)]
 pub struct ProcessHandle<Stdout, Stderr = Stdout>
 where
@@ -196,7 +196,7 @@ where
     /// For [`BroadcastOutputStream`](crate::BroadcastOutputStream), this allows creating multiple
     /// concurrent consumers. For
     /// [`SingleSubscriberOutputStream`](crate::SingleSubscriberOutputStream), only one active
-    /// consumer can exist at a time; concurrent attempts return
+    /// consumer can exist at a time, and concurrent attempts return
     /// [`StreamConsumerError::ActiveConsumer`](crate::StreamConsumerError::ActiveConsumer) from
     /// `consume(...)` / `consume_async(...)` / `wait_for_line(...)` rather than panicking.
     pub fn stdout(&self) -> &Stdout {
@@ -208,7 +208,7 @@ where
     /// For [`BroadcastOutputStream`](crate::BroadcastOutputStream), this allows creating multiple
     /// concurrent consumers. For
     /// [`SingleSubscriberOutputStream`](crate::SingleSubscriberOutputStream), only one active
-    /// consumer can exist at a time; concurrent attempts return
+    /// consumer can exist at a time, and concurrent attempts return
     /// [`StreamConsumerError::ActiveConsumer`](crate::StreamConsumerError::ActiveConsumer) from
     /// `consume(...)` / `consume_async(...)` / `wait_for_line(...)` rather than panicking.
     pub fn stderr(&self) -> &Stderr {
@@ -232,7 +232,7 @@ where
 
     /// Returns the OS process ID if the process hasn't exited yet.
     ///
-    /// Once this process has been polled to completion this will return None.
+    /// Returns `None` once the process has been polled to completion.
     pub fn id(&self) -> Option<u32> {
         self.group.id()
     }

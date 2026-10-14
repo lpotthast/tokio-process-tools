@@ -125,11 +125,11 @@ async fn kill_propagates_to_grandchildren() {
         if grandchild_is_gone(grandchild_pid) {
             return;
         }
-        assert_that!(Instant::now() <= deadline)
+        assert_that!(Instant::now())
             .with_detail_message(format!(
                 "grandchild PID {grandchild_pid} still alive 10 s after kill"
             ))
-            .is_true();
+            .is_less_or_equal_to(deadline);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

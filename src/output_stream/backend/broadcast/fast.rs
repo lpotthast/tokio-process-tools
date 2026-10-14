@@ -11,7 +11,7 @@
 //! only events still in the buffer plus the terminal event.
 //!
 //! This backend is selected by [`BroadcastOutputStream::from_stream`] in
-//! [`super`] when the config is exactly `LossyWithoutBackpressure + NoReplay`; every other
+//! [`super`] when the config is exactly `LossyWithoutBackpressure + NoReplay`. Every other
 //! combination of [`Delivery`](crate::output_stream::policy::Delivery) and
 //! [`Replay`](crate::output_stream::policy::Replay) routes to [`fanout`] instead.
 //!

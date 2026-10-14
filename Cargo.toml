@@ -1,6 +1,6 @@
 [package]
 name = "tokio-process-tools"
-version = "0.11.3"
+version = "0.11.4"
 edition = "2024"
 rust-version = "1.89.0"
 repository = "https://github.com/lpotthast/tokio-process-tools"
@@ -40,7 +40,7 @@ default = []
 __test-helpers = ["tokio/signal"]
 
 [dev-dependencies]
-assertr = "0.7.1"
+assertr = "0.9.1"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 jiff = "0.2.16"
 proptest = { version = "1.5.0", default-features = false, features = ["std", "bit-set"] }
@@ -72,4 +72,5 @@ missing_docs = "warn"
 private_bounds = "deny"
 
 [lints.clippy]
-pedantic = "warn"
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }

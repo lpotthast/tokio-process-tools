@@ -220,7 +220,7 @@ mod tests {
         state.push_replay_event(StreamEvent::chunk(b"old"), Some(ReplayRetention::All));
         state.push_replay_event(StreamEvent::chunk(b"live"), Some(ReplayRetention::All));
 
-        assert_that!(retained_bytes(&state)).is_equal_to(b"oldlive".to_vec());
+        assert_that!(retained_bytes(&state)).is_equal_to(b"oldlive");
         assert_that!(state.chunk_count).is_equal_to(2);
         assert_that!(state.byte_count).is_equal_to(7);
     }
@@ -242,7 +242,7 @@ mod tests {
             Some(ReplayRetention::LastChunks(2)),
         );
 
-        assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
+        assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc");
         assert_that!(state.chunk_count).is_equal_to(2);
         assert_that!(state.byte_count).is_equal_to(4);
     }
@@ -264,7 +264,7 @@ mod tests {
             Some(ReplayRetention::LastBytes(4.bytes())),
         );
 
-        assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
+        assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc");
         assert_that!(state.chunk_count).is_equal_to(2);
         assert_that!(state.byte_count).is_equal_to(4);
     }
@@ -286,7 +286,7 @@ mod tests {
             Some(ReplayRetention::LastBytes(3.bytes())),
         );
 
-        assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc".to_vec());
+        assert_that!(retained_bytes(&state)).is_equal_to(b"bbcc");
         assert_that!(state.byte_count).is_equal_to(4);
     }
 
@@ -326,14 +326,9 @@ mod tests {
         );
 
         assert_that!(state.events).is_empty();
-        match state.terminal_event {
-            Some(StreamEvent::ReadError(err)) => {
-                assert_that!(err.stream_name()).is_equal_to("custom");
-                assert_that!(err.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected read error, got {other:?}"));
-            }
-        }
+        assert_that!(state.terminal_event).is_matching(pattern!(
+            Some(StreamEvent::ReadError(err))
+                if err.stream_name() == "custom" && err.kind() == io::ErrorKind::BrokenPipe
+        ));
     }
 }

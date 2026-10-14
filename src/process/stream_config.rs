@@ -23,14 +23,14 @@ mod process_stream_config {
         Stream: OutputStream,
     {
         /// Returns the [`Stdio`] disposition this configuration requires for the matching child
-        /// stdio slot. Piped backends return [`Stdio::piped()`]; the discard backend returns
+        /// stdio slot. Piped backends return [`Stdio::piped()`]. The discard backend returns
         /// [`Stdio::null()`] so the OS routes the bytes to `/dev/null` without ever crossing into
         /// the parent.
         fn child_stdio(&self) -> Stdio;
 
         /// Constructs the stream wrapper. `captured` is the parent end of the child's pipe when
-        /// `child_stdio()` returned [`Stdio::piped()`]; it is `None` when this configuration set
-        /// the child slot to [`Stdio::null()`] (in which case there is nothing to read from).
+        /// `child_stdio()` returned [`Stdio::piped()`]. It is `None` when this configuration set
+        /// the child slot to [`Stdio::null()`], in which case there is nothing to read from.
         fn into_stream<S>(self, captured: Option<S>, stream_name: &'static str) -> Stream
         where
             S: AsyncRead + Unpin + Send + 'static;
@@ -40,7 +40,7 @@ mod process_stream_config {
 /// Marker trait for process stream builder configurations.
 ///
 /// This trait is sealed. External crates cannot implement additional process stream
-/// configuration types; use [`ProcessStreamBuilder`] to select one of the supported backends.
+/// configuration types. Use [`ProcessStreamBuilder`] to select one of the supported backends.
 pub trait ProcessStreamConfig<Stream>: process_stream_config::Sealed<Stream>
 where
     Stream: OutputStream,
@@ -140,7 +140,7 @@ pub struct BroadcastBackend;
 pub struct SingleSubscriberBackend;
 
 /// Configuration produced by [`ProcessStreamBuilder::discard`]. The matching child stdio slot is
-/// set to [`Stdio::null()`], so the OS discards the bytes; no pipe is allocated and no reader
+/// set to [`Stdio::null()`], so the OS discards the bytes. No pipe is allocated and no reader
 /// task runs in the parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscardedStreamConfig;
@@ -163,7 +163,7 @@ impl<Backend, Stage> PipedStreamConfig<Backend, Stage> {
 
 impl<Backend> PipedStreamConfig<Backend, StreamConfigBuilder> {
     /// Selects lossy delivery that never blocks the child. Slow active subscribers may observe
-    /// gaps; line-aware consumers resync at the next newline.
+    /// gaps, and line-aware consumers resync at the next newline.
     #[must_use]
     pub fn lossy_without_backpressure(
         self,
@@ -173,7 +173,7 @@ impl<Backend> PipedStreamConfig<Backend, StreamConfigBuilder> {
 
     /// Selects reliable delivery that pauses the reader task when an active subscriber's buffer is
     /// full, applying backpressure to the child. Reliability is scoped to currently-attached
-    /// subscribers; late attachers depend on the replay axis for earlier output.
+    /// subscribers. Late attachers depend on the replay axis for earlier output.
     #[must_use]
     pub fn reliable_with_backpressure(
         self,
@@ -295,7 +295,7 @@ mod tests {
 
         #[test]
         fn panics_on_zero_value() {
-            assert_that_panic_by(|| {
+            assert_that!(|| {
                 let _config = ProcessStreamBuilder
                     .single_subscriber()
                     .lossy_without_backpressure()
@@ -303,7 +303,8 @@ mod tests {
                     .read_chunk_size(NumBytes::zero())
                     .max_buffered_chunks(1);
             })
-            .has_type::<String>()
+            .panics()
+            .message()
             .is_equal_to("read_chunk_size must be greater than zero bytes");
         }
     }
@@ -313,7 +314,7 @@ mod tests {
 
         #[test]
         fn panics_on_zero_for_single_subscriber() {
-            assert_that_panic_by(|| {
+            assert_that!(|| {
                 let _config = ProcessStreamBuilder
                     .single_subscriber()
                     .lossy_without_backpressure()
@@ -321,13 +322,14 @@ mod tests {
                     .read_chunk_size(8.bytes())
                     .max_buffered_chunks(0);
             })
-            .has_type::<String>()
+            .panics()
+            .message()
             .is_equal_to("max_buffered_chunks must be greater than zero");
         }
 
         #[test]
         fn panics_on_zero_for_broadcast() {
-            assert_that_panic_by(|| {
+            assert_that!(|| {
                 let _config = ProcessStreamBuilder
                     .broadcast()
                     .lossy_without_backpressure()
@@ -335,7 +337,8 @@ mod tests {
                     .read_chunk_size(8.bytes())
                     .max_buffered_chunks(0);
             })
-            .has_type::<String>()
+            .panics()
+            .message()
             .is_equal_to("max_buffered_chunks must be greater than zero");
         }
     }

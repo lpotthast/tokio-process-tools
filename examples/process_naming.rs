@@ -6,7 +6,7 @@
 //!
 //! Prefer an explicit label (`"api-worker"`, `format!("agent-{id}")`) in production. The
 //! `AutoName` variants are convenient for ad-hoc and test code, but any variant that
-//! includes args, env, or cwd will surface those values in error messages; reach for them
+//! includes args, env, or cwd will surface those values in error messages. Reach for them
 //! only when the underlying values are safe to log.
 //!
 //! Run: `cargo run --example process_naming`

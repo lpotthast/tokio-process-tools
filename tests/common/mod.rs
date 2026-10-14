@@ -33,7 +33,97 @@ pub fn assert_attempt_error(
         .expect("diagnostic should preserve the original io::Error");
 
     assert_that!(io_error.kind()).is_equal_to(expected_kind);
-    assert_that!(io_error.to_string().as_str()).contains(expected_message);
+    assert_that!(io_error.to_string()).contains(expected_message);
+}
+
+/// Asserts that a known long-running child exits promptly after a forceful drop fallback.
+///
+/// The wait is bounded so a cleanup regression fails instead of hanging the entire test binary.
+/// On Unix, the helper verifies `SIGKILL` when it wins the reaping race; `ECHILD` is also accepted
+/// because Tokio's orphan reaper may have collected the status first. On Windows it waits on a
+/// process handle. A timed-out child is forcefully cleaned up before the assertion fails.
+#[cfg(unix)]
+#[track_caller]
+pub fn assert_child_exited_after_forceful_drop(pid: u32) {
+    use nix::errno::Errno;
+    use nix::sys::signal::{self, Signal};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    use nix::unistd::Pid;
+    use std::time::Instant;
+
+    let pid = Pid::from_raw(pid.cast_signed());
+    let deadline = Instant::now() + Duration::from_secs(2);
+
+    loop {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Signaled(_, Signal::SIGKILL, _)) | Err(Errno::ECHILD) => return,
+            Ok(WaitStatus::StillAlive) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(WaitStatus::StillAlive) => {
+                // Cleanup for the failing path. The test child is its own process-group leader.
+                let _ = signal::killpg(pid, Signal::SIGKILL);
+                panic!("child {pid} was still alive 2 s after the forceful drop fallback");
+            }
+            other => {
+                panic!(
+                    "expected child {pid} to die from SIGKILL (or be reaped by Tokio), got: {other:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[track_caller]
+pub fn assert_child_exited_after_forceful_drop(pid: u32) {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is the non-null handle returned by `OpenProcess`, owned by this
+            // guard and closed exactly once here.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    // SAFETY: `pid` came from the spawned child. The requested rights are sufficient to wait and
+    // to clean up the process if the expected fallback did not terminate it.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        assert_that!(error.raw_os_error())
+            .with_detail_message(format!("failed to open child process {pid}: {error}"))
+            .is_equal_to(Some(ERROR_INVALID_PARAMETER.cast_signed()));
+        return;
+    }
+    let handle = OwnedHandle(handle);
+
+    // SAFETY: `handle.0` remains valid for the duration of this bounded wait.
+    let wait_result = unsafe { WaitForSingleObject(handle.0, 2_000) };
+    if wait_result == WAIT_TIMEOUT {
+        // SAFETY: The handle was opened with `PROCESS_TERMINATE`. This is cleanup for a failing
+        // test path, preventing the deliberately long-running child from leaking.
+        unsafe {
+            TerminateProcess(handle.0, 1);
+            WaitForSingleObject(handle.0, 2_000);
+        }
+    }
+
+    assert_that!(wait_result)
+        .with_detail_message(format!(
+            "child {pid} did not exit within 2 s after the forceful drop fallback"
+        ))
+        .is_equal_to(WAIT_OBJECT_0);
 }
 
 pub fn default_graceful_shutdown() -> GracefulShutdown {

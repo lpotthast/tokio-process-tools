@@ -29,7 +29,7 @@ where
     /// attempting to signal a stale PID or process group. If the signal send fails because the
     /// child exited after the preflight check, this also reaps it and returns `Ok(())`.
     ///
-    /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
+    /// Prefer [`Self::terminate`] when the goal is to make sure this process actually exits.
     ///
     /// This method is Unix-only because Windows has no targetable `SIGINT` analogue:
     /// `GenerateConsoleCtrlEvent` only accepts `CTRL_BREAK_EVENT` for nonzero process groups.
@@ -41,8 +41,8 @@ where
     /// where the child has just exited but Tokio's SIGCHLD reaper has not yet observed it, the
     /// probe returns "still running" and this method surfaces the OS-level signal-send error
     /// (typically `EPERM` on macOS or `ESRCH` on Linux) as
-    /// [`TerminationError::SignalFailed`]. The synchronous shape is deliberate so the public
-    /// `send_*_signal` API stays non-async; reach for [`Self::terminate`] when you need the
+    /// [`TerminationError::SignalFailed`]. The method is deliberately synchronous so the public
+    /// `send_*_signal` API stays non-async. Reach for [`Self::terminate`] when you need the
     /// bounded SIGCHLD-grace wait.
     ///
     /// # Errors
@@ -68,7 +68,7 @@ where
     /// attempting to signal a stale PID or process group. If the signal send fails because the
     /// child exited after the preflight check, this also reaps it and returns `Ok(())`.
     ///
-    /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
+    /// Prefer [`Self::terminate`] when the goal is to make sure this process actually exits.
     ///
     /// This method is Unix-only because Windows has no targetable `SIGTERM` analogue:
     /// `GenerateConsoleCtrlEvent` only accepts `CTRL_BREAK_EVENT` for nonzero process groups.
@@ -80,8 +80,8 @@ where
     /// where the child has just exited but Tokio's SIGCHLD reaper has not yet observed it, the
     /// probe returns "still running" and this method surfaces the OS-level signal-send error
     /// (typically `EPERM` on macOS or `ESRCH` on Linux) as
-    /// [`TerminationError::SignalFailed`]. The synchronous shape is deliberate so the public
-    /// `send_*_signal` API stays non-async; reach for [`Self::terminate`] when you need the
+    /// [`TerminationError::SignalFailed`]. The method is deliberately synchronous so the public
+    /// `send_*_signal` API stays non-async. Reach for [`Self::terminate`] when you need the
     /// bounded SIGCHLD-grace wait.
     ///
     /// # Errors
@@ -104,13 +104,13 @@ where
     /// process group: `CTRL_C_EVENT` requires `dwProcessGroupId = 0` and would be broadcast to
     /// every process sharing the calling console (including the parent), so it is not usable to
     /// terminate a single child group. There is therefore no separate `SIGINT` vs. `SIGTERM`
-    /// distinction on Windows; this single method covers the entire graceful-shutdown surface.
+    /// distinction on Windows. This single method covers the entire graceful-shutdown surface.
     ///
     /// If the process has already exited, this reaps it and returns `Ok(())` instead of
     /// attempting to signal a stale PID or process group. If the signal send fails because the
     /// child exited after the preflight check, this also reaps it and returns `Ok(())`.
     ///
-    /// Prefer to call `terminate` instead, if you want to make sure this process is terminated.
+    /// Prefer [`Self::terminate`] when the goal is to make sure this process actually exits.
     ///
     /// This method is Windows-only. On Unix, use `send_interrupt_signal` or
     /// `send_terminate_signal` instead.
@@ -120,8 +120,8 @@ where
     /// The post-failure exit-status probe is a single synchronous `try_wait`. On the rare race
     /// where the child has just exited but Tokio has not yet observed it, the probe returns
     /// "still running" and this method surfaces the OS-level
-    /// `GenerateConsoleCtrlEvent` failure as [`TerminationError::SignalFailed`]. The synchronous
-    /// shape is deliberate so the public `send_*_signal` API stays non-async; reach for
+    /// `GenerateConsoleCtrlEvent` failure as [`TerminationError::SignalFailed`]. The method is
+    /// deliberately synchronous so the public `send_*_signal` API stays non-async. Reach for
     /// [`Self::terminate`] when you need the bounded reaper-grace wait.
     ///
     /// # Errors

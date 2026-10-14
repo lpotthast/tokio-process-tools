@@ -1,7 +1,7 @@
 #![allow(clippy::wildcard_imports)]
 //! Write to a child's stdin, close it to signal EOF, and collect the echoed output.
 //!
-//! Children always have stdin piped (there is no opt-out); the library only flushes/closes
+//! Children always have stdin piped (there is no opt-out), and the library only closes
 //! the pipe when you ask. Calling `stdin().close()` lets a child observe EOF before any
 //! wait helper runs (some programs only finish on EOF, not on idle). Terminal waits and
 //! `kill()` close any still-open stdin automatically, so the manual close is only needed

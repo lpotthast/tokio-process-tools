@@ -4,10 +4,10 @@
 //! For processes that may hang, chain `.or_terminate(shutdown)` onto a
 //! `wait_for_completion(...)` builder. The configured graceful shutdown policy runs as part
 //! of the wait, so you do not have to sequence cleanup yourself. The wait timeout bounds
-//! the normal wait; `shutdown` controls which graceful signal sequence runs before the
-//! forceful kill fallback.
+//! the normal wait, while `shutdown` controls which graceful signal sequence runs before
+//! the forceful kill fallback.
 //!
-//! Run: `cargo run --example timeout_and_cleanup`. As written, the child sleeps for 60
+//! Run: `cargo run --example terminate_on_timeout`. As written, the child sleeps for 60
 //! seconds and the wait gives up after 2 seconds, so the example exercises the
 //! `TerminatedAfterTimeout` branch.
 

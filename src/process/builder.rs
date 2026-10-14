@@ -75,7 +75,7 @@ impl Process {
     ///
     /// You can provide either an explicit name or configure automatic name generation.
     /// The name is used in public errors and tracing fields. By default, automatic
-    /// naming captures only the program name. Prefer `.name(...)` for stable safe
+    /// naming captures only the program name. Prefer an explicit name for stable, safe
     /// labels when command arguments or environment variables may contain secrets.
     #[must_use]
     pub fn name(self, name: impl Into<ProcessName>) -> Process<Named> {

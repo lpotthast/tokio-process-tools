@@ -39,7 +39,7 @@ async fn configured_reader_does_not_terminate_when_first_read_can_fill_the_entir
             StreamEvent::Gap => {}
             StreamEvent::Eof => break,
             StreamEvent::ReadError(err) => {
-                assert_that!(&err).fail(format_args!("unexpected read error: {err}"));
+                panic!("unexpected read error: {err}");
             }
         }
     }

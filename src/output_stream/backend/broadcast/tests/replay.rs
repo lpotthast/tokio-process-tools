@@ -24,7 +24,7 @@ fn best_effort_replay_options(
 
 fn assert_recv_chunk(maybe_event: Option<StreamEvent>, expected: &[u8]) {
     assert_that_owned!(maybe_event)
-        .get_some()
+        .some()
         .is_chunk()
         .is_equal_to(expected);
 }
@@ -50,7 +50,9 @@ async fn late_subscriber_receives_startup_line_with_replay_all() {
         )
         .await;
 
-    assert_that!(result).is_equal_to(Ok(WaitForLineResult::Matched));
+    assert_that!(result)
+        .ok()
+        .is_equal_to(WaitForLineResult::Matched);
 }
 
 #[tokio::test]
@@ -73,7 +75,9 @@ async fn seal_replay_drops_old_history_for_future_subscribers() {
         LineParsingOptions::default(),
     );
 
-    assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Timeout));
+    assert_that!(waiter.await)
+        .ok()
+        .is_equal_to(WaitForLineResult::Timeout);
 }
 
 #[tokio::test]
@@ -98,7 +102,9 @@ async fn subscriber_created_after_seal_starts_live_by_default() {
     write_half.write_all(b"live\n").await.unwrap();
     write_half.flush().await.unwrap();
 
-    assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Matched));
+    assert_that!(waiter.await)
+        .ok()
+        .is_equal_to(WaitForLineResult::Matched);
 }
 
 #[tokio::test]
@@ -122,7 +128,9 @@ async fn explicit_replay_after_seal_ignores_history_retained_for_active_subscrib
         LineParsingOptions::default(),
     );
 
-    assert_that!(waiter.await).is_equal_to(Ok(WaitForLineResult::Timeout));
+    assert_that!(waiter.await)
+        .ok()
+        .is_equal_to(WaitForLineResult::Timeout);
 }
 
 #[tokio::test]
@@ -181,8 +189,10 @@ async fn waiter_created_before_seal_can_match_replayed_startup_line() {
     );
     stream.seal_replay();
 
-    assert_that!(ready.await).is_equal_to(Ok(WaitForLineResult::Matched));
-    assert_that!(logs.lock().unwrap().clone()).contains_exactly(["ready"]);
+    assert_that!(ready.await)
+        .ok()
+        .is_equal_to(WaitForLineResult::Matched);
+    assert_that!(*logs.lock().unwrap()).contains_exactly(["ready"]);
 }
 
 #[tokio::test]
@@ -198,11 +208,11 @@ async fn slow_best_effort_replay_subscriber_observes_gap_then_newer_live_data() 
     drop(write_half);
 
     assert_that!(subscriber.recv().await)
-        .get_some()
+        .some()
         .is_equal_to(StreamEvent::Gap);
     assert_recv_chunk(subscriber.recv().await, b"e");
     assert_that!(subscriber.recv().await)
-        .get_some()
+        .some()
         .is_equal_to(StreamEvent::Eof);
 }
 
@@ -218,10 +228,10 @@ async fn best_effort_replay_delivers_terminal_after_pending_gap() {
     wait_for_bytes_ingested(&stream, 2).await;
 
     assert_that!(subscriber.recv().await)
-        .get_some()
+        .some()
         .is_equal_to(StreamEvent::Gap);
     assert_that!(subscriber.recv().await)
-        .get_some()
+        .some()
         .is_equal_to(StreamEvent::Eof);
 }
 

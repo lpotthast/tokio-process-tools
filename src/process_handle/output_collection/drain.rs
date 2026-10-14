@@ -266,17 +266,10 @@ mod tests {
         .await
         .expect("collector error should be returned before the outer timeout");
 
-        match result {
-            Err(ConsumerDrainError::Collection(ConsumerError::StreamRead { source })) => {
-                assert_that!(source.stream_name()).is_equal_to("stdout");
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!(
-                    "expected early stream read error, got {other:?}"
-                ));
-            }
-        }
+        assert_that!(result).is_matching(pattern!(
+            Err(ConsumerDrainError::Collection(ConsumerError::StreamRead { source }))
+                if source.stream_name() == "stdout" && source.kind() == io::ErrorKind::BrokenPipe
+        ));
     }
 
     #[tokio::test]
@@ -322,14 +315,7 @@ mod tests {
         .await
         .expect("drain should resolve via deadline-driven timeout, not the outer fallback");
 
-        match result {
-            Err(ConsumerDrainError::Timeout) => {}
-            other => {
-                assert_that!(&other).fail(format_args!(
-                    "expected drain timeout when stderr never finishes, got {other:?}"
-                ));
-            }
-        }
+        assert_that!(result).is_matching(pattern!(Err(ConsumerDrainError::Timeout)));
     }
 
     #[tokio::test]
@@ -371,14 +357,7 @@ mod tests {
         .await
         .expect("drain should resolve via deadline-driven timeout, not the outer fallback");
 
-        match result {
-            Err(ConsumerDrainError::Timeout) => {}
-            other => {
-                assert_that!(&other).fail(format_args!(
-                    "expected drain timeout when stdout never finishes, got {other:?}"
-                ));
-            }
-        }
+        assert_that!(result).is_matching(pattern!(Err(ConsumerDrainError::Timeout)));
     }
 
     #[tokio::test]
@@ -416,17 +395,10 @@ mod tests {
         .await
         .expect("collector error should be returned before the outer timeout");
 
-        match result {
-            Err(ConsumerDrainError::Collection(ConsumerError::StreamRead { source })) => {
-                assert_that!(source.stream_name()).is_equal_to("stdout");
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!(
-                    "expected early stream read error, got {other:?}"
-                ));
-            }
-        }
+        assert_that!(result).is_matching(pattern!(
+            Err(ConsumerDrainError::Collection(ConsumerError::StreamRead { source }))
+                if source.stream_name() == "stdout" && source.kind() == io::ErrorKind::BrokenPipe
+        ));
 
         let collector = stderr_stream
             .consume(CollectChunks::fold(

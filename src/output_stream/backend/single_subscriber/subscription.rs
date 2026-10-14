@@ -95,10 +95,10 @@ mod tests {
         drop(sender);
 
         assert_that!(subscription.next_event().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::chunk(b"old"));
         assert_that!(subscription.next_event().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::chunk(b"live"));
         assert_that!(subscription.next_event().await).is_none();
     }
@@ -122,10 +122,10 @@ mod tests {
             .unwrap();
 
         assert_that!(subscription.next_event().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::chunk(b"old"));
         assert_that!(subscription.next_event().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::Eof);
         assert_that!(subscription.next_event().await).is_none();
     }
@@ -150,19 +150,14 @@ mod tests {
         );
 
         assert_that!(subscription.next_event().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::Gap);
-        match subscription.next_event().await {
-            Some(StreamEvent::ReadError(err)) => {
-                assert_that!(err.stream_name()).is_equal_to("custom");
-                assert_that!(err.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!("expected read error, got {other:?}"));
-            }
-        }
+        assert_that!(subscription.next_event().await).is_matching(pattern!(
+            Some(StreamEvent::ReadError(err))
+                if err.stream_name() == "custom" && err.kind() == io::ErrorKind::BrokenPipe
+        ));
         assert_that!(subscription.next_event().await)
-            .get_some()
+            .some()
             .is_equal_to(StreamEvent::Eof);
         assert_that!(subscription.next_event().await).is_none();
     }
@@ -179,7 +174,7 @@ mod tests {
                 .state
                 .lock()
                 .expect("single-subscriber state poisoned");
-            assert_that!(state.active_id).get_some().is_equal_to(id);
+            assert_that!(state.active_id).some().is_equal_to(id);
         }
 
         drop(subscription);

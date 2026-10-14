@@ -14,8 +14,8 @@
 //!   any [`tokio::io::AsyncRead`] and emit [`StreamEvent`](StreamEvent)s.
 //! - **User-replaceable convenience layer** ([`visitors`]): the built-in `collect`, `inspect`,
 //!   `wait`, and `write` visitor implementations. `consume(my_visitor)` /
-//!   `consume_async(my_visitor)` on any [`Consumable`] stream is the single entry point;
-//!   construct a bundled visitor for the common cases or implement [`StreamVisitor`] /
+//!   `consume_async(my_visitor)` on any [`Consumable`] stream is the single entry point.
+//!   Construct a bundled visitor for the common cases or implement [`StreamVisitor`] /
 //!   [`AsyncStreamVisitor`] for custom ones.
 
 pub(crate) mod consumer;
@@ -50,19 +50,21 @@ use core::error::Error;
 use event::StreamEvent;
 use num_bytes::NumBytes;
 
-/// We support the following implementations:
+/// Common surface shared by all output stream backends.
 ///
-/// - [`crate::BroadcastOutputStream`]
-/// - [`crate::SingleSubscriberOutputStream`]
+/// Implemented by [`crate::BroadcastOutputStream`], [`crate::SingleSubscriberOutputStream`], and
+/// [`crate::DiscardedOutputStream`].
 pub trait OutputStream: Consumable {
-    /// The maximum size of every chunk read by the backing `stream_reader`.
+    /// The maximum size of a single chunk read from the underlying stream.
     fn read_chunk_size(&self) -> NumBytes;
 
     /// The number of chunks held by the underlying async channel.
     fn max_buffered_chunks(&self) -> usize;
 
-    /// Type of stream. Can be "stdout" or "stderr". But we do not guarantee this output.
-    /// It should only be used for logging/debugging.
+    /// A label identifying this stream, such as "stdout" or "stderr".
+    ///
+    /// Intended for logging and diagnostics only. The exact value is not part of any API
+    /// contract, so do not parse or match on it.
     fn name(&self) -> &'static str;
 }
 
@@ -103,7 +105,7 @@ pub trait Subscribable {
 ///
 /// Implementors only need to specify [`Error`](Self::Error). The `consume` and `consume_async`
 /// methods have default impls that subscribe via [`Subscribable::try_subscribe`] and spawn the
-/// consumer task; those defaults additionally require `Self: OutputStream` because they label
+/// consumer task. Those defaults additionally require `Self: OutputStream` because they label
 /// the consumer task with [`OutputStream::name`].
 pub trait Consumable: Subscribable {
     /// Error returned when consumer creation fails. Must be constructible from the underlying
@@ -116,8 +118,8 @@ pub trait Consumable: Subscribable {
     /// [`Consumer`] that owns the spawned task.
     ///
     /// The returned [`Consumer`]'s [`wait`](Consumer::wait) yields whatever the visitor produces
-    /// through [`StreamVisitor::into_output`], allowing visitor implementors to give and get
-    /// back ownership of some value.
+    /// through [`StreamVisitor::into_output`], so a visitor can take ownership of a value and
+    /// hand it back once the consumer finishes.
     ///
     /// # Errors
     ///
@@ -160,16 +162,16 @@ pub trait Consumable: Subscribable {
     }
 }
 
-/// Control flag to indicate whether processing should continue or break.
+/// Control flag returned by visitors to indicate whether they want to keep observing the stream.
 ///
-/// Returning `Break` from an `Inspector`/`Consumer` will let that instance stop visiting any
-/// more data.
+/// Returning [`Next::Break`] from a visitor callback stops the driving consumer early. No further
+/// events are observed and `on_eof` is not called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Next {
-    /// Interested in receiving additional data.
+    /// Keep observing the stream.
     Continue,
 
-    /// Not interested in receiving additional data. Will let the `inspector`/`collector` stop.
+    /// Stop observing the stream. The driving consumer finishes without visiting further events.
     Break,
 }
 

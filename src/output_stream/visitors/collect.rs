@@ -82,8 +82,7 @@ impl CollectedBytes {
     }
 
     /// Returns a closure suitable as the `f` field of a [`CollectChunks`] visitor that appends
-    /// each observed chunk into a [`CollectedBytes`] sink under `options`. Mirrors the
-    /// closure that the removed `collect_chunks_into_vec` factory used to inline.
+    /// each observed chunk into a [`CollectedBytes`] sink under `options`.
     #[must_use = "the returned closure must be wired into a CollectChunks visitor; dropping it discards the collection logic"]
     pub fn collector(
         options: RawCollectionOptions,
@@ -192,8 +191,7 @@ impl CollectedLines {
 
     /// Returns a closure suitable as the `f` field of a [`CollectLines`] (composed inside a
     /// [`ParseLines`](crate::output_stream::line::adapter::ParseLines)) that appends each
-    /// parsed line into a [`CollectedLines`] sink under `options`. Mirrors the closure that
-    /// the removed `collect_lines_into_vec` factory used to inline.
+    /// parsed line into a [`CollectedLines`] sink under `options`.
     #[must_use = "the returned closure must be wired into a CollectLines visitor; dropping it discards the collection logic"]
     pub fn line_collector(
         options: LineCollectionOptions,
@@ -209,7 +207,7 @@ impl CollectedLines {
     /// # Panics
     ///
     /// Panics if an internal invariant is violated while evicting older lines under
-    /// [`CollectionOverflowBehavior::DropOldestData`]; the eviction loop only runs while the
+    /// [`CollectionOverflowBehavior::DropOldestData`]. The eviction loop only runs while the
     /// buffer is non-empty, so this is unreachable in correct use.
     pub fn push_line(&mut self, line: String, options: LineCollectionOptions) {
         match options {
@@ -341,7 +339,7 @@ where
 /// `Send` for `tokio::spawn`. Construct via [`fold`](Self::fold) and pass to
 /// [`Consumable::consume_async`](crate::Consumable::consume_async).
 ///
-/// The boxed future incurs one allocation per observed chunk; for hot paths that cannot afford
+/// The boxed future incurs one allocation per observed chunk. For hot paths that cannot afford
 /// that, implement [`AsyncStreamVisitor`] directly on a struct that owns the sink.
 ///
 /// # Example
@@ -402,7 +400,7 @@ where
     }
 }
 
-/// [`LineVisitor`] holding the user closure and a sink; `on_line` calls the closure with the
+/// [`LineVisitor`] holding the user closure and a sink. `on_line` calls the closure with the
 /// line and a `&mut` borrow of the sink. Compose with
 /// [`ParseLines`](crate::output_stream::line::adapter::ParseLines) (most easily via
 /// [`ParseLines::collect`](crate::output_stream::line::adapter::ParseLines::collect)) to
@@ -445,7 +443,7 @@ where
 /// [`ParseLines::collect_async`](crate::output_stream::line::adapter::ParseLines::collect_async))
 /// to build an async line-aware collecting consumer.
 ///
-/// The boxed future incurs one allocation per observed line; for hot paths that cannot afford
+/// The boxed future incurs one allocation per observed line. For hot paths that cannot afford
 /// that, implement [`AsyncLineVisitor`] directly on a struct that owns the sink.
 pub struct CollectLinesAsync<T, F>
 where
@@ -772,10 +770,9 @@ mod tests {
                 collected.push_line((*line).to_string(), options);
             }
 
-            let actual_lines: Vec<&str> = collected.lines().iter().map(String::as_str).collect();
-            assert_that!(actual_lines)
+            assert_that!(collected.lines())
                 .with_detail_message(format!("case: {}", case.name))
-                .is_equal_to(case.expected_lines.to_vec());
+                .contains_exactly(case.expected_lines);
             assert_that!(collected.truncated())
                 .with_detail_message(format!("case: {}", case.name))
                 .is_equal_to(case.expected_truncated);
@@ -801,7 +798,7 @@ mod tests {
         collected.push_chunk(b"abc", options);
         collected.push_chunk(b"def", options);
 
-        assert_that!(collected.bytes.as_slice()).is_equal_to(b"abcde".as_slice());
+        assert_that!(collected.bytes).is_equal_to(b"abcde");
         assert_that!(collected.truncated).is_true();
 
         let mut collected = CollectedBytes::new();
@@ -813,7 +810,7 @@ mod tests {
         collected.push_chunk(b"abc", options);
         collected.push_chunk(b"def", options);
 
-        assert_that!(collected.bytes.as_slice()).is_equal_to(b"bcdef".as_slice());
+        assert_that!(collected.bytes).is_equal_to(b"bcdef");
         assert_that!(collected.truncated).is_true();
     }
 
@@ -830,14 +827,7 @@ mod tests {
         collected.push_line("two".to_string(), options);
         collected.push_line("three".to_string(), options);
 
-        assert_that!(
-            collected
-                .lines()
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-        )
-        .is_equal_to(vec!["one", "two"]);
+        assert_that!(collected.lines()).contains_exactly(["one", "two"]);
         assert_that!(collected.truncated()).is_true();
 
         let mut collected = CollectedLines::new();
@@ -851,14 +841,7 @@ mod tests {
         collected.push_line("two".to_string(), options);
         collected.push_line("six".to_string(), options);
 
-        assert_that!(
-            collected
-                .lines()
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-        )
-        .is_equal_to(vec!["two", "six"]);
+        assert_that!(collected.lines()).contains_exactly(["two", "six"]);
         assert_that!(collected.truncated()).is_true();
     }
 
@@ -891,7 +874,7 @@ mod tests {
             .with_detail_message(
                 "previously-retained lines must survive an oversized incoming line",
             )
-            .is_equal_to(VecDeque::from(["aaa".to_string(), "bbb".to_string()]));
+            .contains_exactly(["aaa", "bbb"]);
         assert_that!(collected.retained_bytes).is_equal_to(6);
         assert_retained_bytes_match_lines(&collected);
         assert_that!(collected.truncated()).is_true();
@@ -906,8 +889,7 @@ mod tests {
         collected.push_line("bbbb".to_string(), options);
         collected.push_line("cccc".to_string(), options);
 
-        assert_that!(collected.lines())
-            .is_equal_to(VecDeque::from(["bbbb".to_string(), "cccc".to_string()]));
+        assert_that!(collected.lines()).contains_exactly(["bbbb", "cccc"]);
         assert_that!(collected.retained_bytes).is_equal_to(8);
         assert_retained_bytes_match_lines(&collected);
         assert_that!(collected.truncated()).is_true();
@@ -922,8 +904,7 @@ mod tests {
         collected.push_line("bb".to_string(), options);
         collected.push_line("ccc".to_string(), options);
 
-        assert_that!(collected.lines())
-            .is_equal_to(VecDeque::from(["bb".to_string(), "ccc".to_string()]));
+        assert_that!(collected.lines()).contains_exactly(["bb", "ccc"]);
         assert_that!(collected.retained_bytes).is_equal_to(5);
         assert_retained_bytes_match_lines(&collected);
         assert_that!(collected.truncated()).is_true();
@@ -936,7 +917,7 @@ mod tests {
 
         collected.push_line("aaa".to_string(), options);
 
-        assert_that!(collected.lines().is_empty()).is_true();
+        assert_that!(collected.lines()).is_empty();
         assert_that!(collected.retained_bytes).is_equal_to(0);
         assert_retained_bytes_match_lines(&collected);
         assert_that!(collected.truncated()).is_true();
@@ -954,7 +935,7 @@ mod tests {
         collected.push_line("aaa".to_string(), options);
         collected.push_line("x".repeat(13), options);
 
-        assert_that!(collected.lines()).is_equal_to(VecDeque::from(["aaa".to_string()]));
+        assert_that!(collected.lines()).contains_exactly(["aaa"]);
         assert_that!(collected.retained_bytes).is_equal_to(3);
         assert_retained_bytes_match_lines(&collected);
         assert_that!(collected.truncated()).is_true();
@@ -972,7 +953,7 @@ mod tests {
         collected.push_line("aaa".to_string(), options);
         collected.push_line("bbbb".to_string(), options);
 
-        assert_that!(collected.lines()).is_equal_to(VecDeque::from(["aaa".to_string()]));
+        assert_that!(collected.lines()).contains_exactly(["aaa"]);
         assert_that!(collected.retained_bytes).is_equal_to(3);
         assert_retained_bytes_match_lines(&collected);
         assert_that!(collected.truncated()).is_true();
@@ -999,17 +980,10 @@ mod tests {
             ),
         );
 
-        match collector.wait().await {
-            Err(ConsumerError::StreamRead { source }) => {
-                assert_that!(source.stream_name()).is_equal_to("custom");
-                assert_that!(source.kind()).is_equal_to(io::ErrorKind::BrokenPipe);
-            }
-            other => {
-                assert_that!(&other).fail(format_args!(
-                    "expected consumer stream read error, got {other:?}"
-                ));
-            }
-        }
+        assert_that!(collector.wait().await).err().is_matching(pattern!(
+            ConsumerError::StreamRead { source }
+                if source.stream_name() == "custom" && source.kind() == io::ErrorKind::BrokenPipe
+        ));
     }
 
     #[tokio::test]
@@ -1057,7 +1031,7 @@ mod tests {
         );
 
         let seen = collector.wait().await.unwrap();
-        assert_that!(seen).is_equal_to(b"abcdef".to_vec());
+        assert_that!(seen).is_equal_to(b"abcdef");
     }
 
     #[tokio::test]
@@ -1084,7 +1058,7 @@ mod tests {
         );
 
         let indexed_chunks = collector.wait().await.unwrap();
-        assert_that!(indexed_chunks).is_equal_to(vec![
+        assert_that!(indexed_chunks).contains_exactly([
             (1, b"ab".to_vec()),
             (2, b"cd".to_vec()),
             (3, b"ef".to_vec()),
@@ -1113,11 +1087,7 @@ mod tests {
         );
 
         let indexed_lines = collector.wait().await.unwrap();
-        assert_that!(indexed_lines).is_equal_to(vec![
-            "1:alpha".to_string(),
-            "2:beta".to_string(),
-            "3:gamma".to_string(),
-        ]);
+        assert_that!(indexed_lines).contains_exactly(["1:alpha", "2:beta", "3:gamma"]);
     }
 
     #[tokio::test]
