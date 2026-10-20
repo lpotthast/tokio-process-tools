@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dropping a `TerminateOnDrop` outside a multithreaded runtime no longer panics when there is nothing left to
   terminate, i.e. when the child has already exited or was already awaited, terminated, or killed through the wrapper.
 - When a graceful termination fails during drop, the logged error now includes its full structured details.
+- A single-subscriber stream with replay enabled no longer loses or duplicates output while its consumer attaches or
+  is replaced. Output read while a consumer attached could end up neither in its replay nor delivered to it live, e.g.
+  all output of a short-lived process whose inspector was attached right after spawning it. Output still being
+  delivered to a dropped consumer could reach its replacement twice, once replayed and once live.
 
 ## [0.11.3] - 2026-10-06
 

@@ -1,11 +1,11 @@
 use super::super::SingleSubscriberOutputStream;
 use super::common::{
     best_effort_no_replay_options, reliable_replay_options, wait_for_bytes_ingested,
-    wait_for_no_active_consumer, wait_for_terminal,
+    wait_for_no_active_consumer, wait_for_replayed_events, wait_for_terminal,
 };
-use crate::output_stream::Consumable;
 use crate::output_stream::event::StreamEvent;
 use crate::output_stream::visitors::collect::CollectChunks;
+use crate::output_stream::{Consumable, Subscribable};
 use crate::test_support::ReadErrorAfterBytes;
 use crate::{
     CollectedBytes, ConsumerError, LineParsingOptions, NumBytesExt, RawCollectionOptions,
@@ -366,4 +366,76 @@ async fn typed_wait_after_seal_starts_live() {
     assert_that!(waiter.await)
         .ok()
         .is_equal_to(WaitForLineResult::Matched);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_delivers_output_read_while_the_consumer_attaches() {
+    async fn collect_attaching_right_away<D: crate::Delivery, R: crate::Replay>(
+        options: StreamConfig<D, R>,
+    ) -> Vec<u8> {
+        // The reader reads the whole output while the consumer attaches.
+        let stream = SingleSubscriberOutputStream::from_stream(&b"old"[..], "custom", options);
+        stream
+            .consume(CollectChunks::fold(
+                CollectedBytes::new(),
+                CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+            ))
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .bytes
+    }
+
+    for _ in 0..10_000 {
+        assert_that!(
+            collect_attaching_right_away(reliable_replay_options(ReplayRetention::All)).await
+        )
+        .is_equal_to(b"old");
+        assert_that!(
+            collect_attaching_right_away(
+                StreamConfig::builder()
+                    .lossy_without_backpressure()
+                    .replay_all()
+                    .read_chunk_size(4.bytes())
+                    .max_buffered_chunks(4)
+                    .build()
+            )
+            .await
+        )
+        .is_equal_to(b"old");
+    }
+}
+
+#[tokio::test]
+async fn replacing_a_blocked_consumer_delivers_its_pending_output_once() {
+    let (read_half, mut write_half) = tokio::io::duplex(64);
+    let stream = SingleSubscriberOutputStream::from_stream(
+        read_half,
+        "custom",
+        StreamConfig::builder()
+            .reliable_with_backpressure()
+            .replay_all()
+            .read_chunk_size(3.bytes())
+            .max_buffered_chunks(1)
+            .build(),
+    );
+
+    // "aaa" fills the buffer of the stalled consumer, so the reader waits to send it "bbb".
+    let stalled = stream.try_subscribe().unwrap();
+    write_half.write_all(b"aaabbb").await.unwrap();
+    wait_for_replayed_events(&stream, 2).await;
+
+    // The current-thread runtime does not let the reader observe the stalled consumer leaving
+    // before its replacement attached.
+    drop(stalled);
+    let collector = stream
+        .consume(CollectChunks::fold(
+            CollectedBytes::new(),
+            CollectedBytes::collector(RawCollectionOptions::TrustedUnbounded),
+        ))
+        .unwrap();
+    drop(write_half);
+
+    assert_that!(collector.wait().await.unwrap().bytes).is_equal_to(b"aaabbb");
 }

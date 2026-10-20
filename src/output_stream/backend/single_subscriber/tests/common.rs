@@ -73,6 +73,26 @@ pub(super) async fn wait_for_bytes_ingested_shared(shared: &ConfiguredShared, by
         .expect("bytes-ingested watch closed");
 }
 
+pub(super) async fn wait_for_replayed_events<D, R>(
+    stream: &SingleSubscriberOutputStream<D, R>,
+    count: usize,
+) where
+    D: Delivery,
+    R: Replay,
+{
+    while stream
+        .configured_shared
+        .state
+        .lock()
+        .expect("single-subscriber state poisoned")
+        .events
+        .len()
+        < count
+    {
+        tokio::task::yield_now().await;
+    }
+}
+
 pub(super) async fn wait_for_terminal<D, R>(
     stream: &SingleSubscriberOutputStream<D, R>,
 ) -> StreamEvent

@@ -37,20 +37,26 @@ impl ReplayState {
         }
     }
 
+    /// Records `event` for subscribers attaching later. Returns whether they receive it: a
+    /// terminal event always, a chunk while it is retained for replay.
     pub(super) fn push_replay_event(
         &mut self,
         event: StreamEvent,
         retention: Option<ReplayRetention>,
-    ) {
+    ) -> bool {
         match event {
             StreamEvent::Eof | StreamEvent::ReadError(_) => {
                 self.terminal_event = Some(event);
+                true
             }
             StreamEvent::Chunk(_) if retention.is_some() && !self.replay_sealed => {
                 self.push_retained_event(event);
                 self.trim_replay_window(retention);
+                // Trimming removes the oldest events first, so the chunk is retained unless
+                // nothing is.
+                !self.events.is_empty()
             }
-            StreamEvent::Chunk(_) | StreamEvent::Gap => {}
+            StreamEvent::Chunk(_) | StreamEvent::Gap => false,
         }
     }
 
