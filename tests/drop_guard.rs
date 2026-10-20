@@ -233,6 +233,120 @@ fn terminate_on_drop_with_already_exited_child_closes_lifecycle_without_runtime_
     drop(rt);
 }
 
+#[test]
+fn terminate_on_drop_kills_child_without_hanging_when_runtime_shuts_down() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (pid_tx, pid_rx) = mpsc::channel();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+
+    // Drop the runtime on a separate thread, so a hanging shutdown fails this test instead of
+    // blocking the whole test binary.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let guard = spawn_long_running_process().terminate_on_drop(short_graceful_shutdown());
+            pid_tx.send(guard.id().unwrap()).unwrap();
+            tokio::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        // Cancels the task above, dropping the wrapper while the runtime is shutting down.
+        drop(rt);
+        dropped_tx.send(()).unwrap();
+    });
+
+    let pid = pid_rx.recv().unwrap();
+    assert_that!(dropped_rx.recv_timeout(Duration::from_secs(10))).is_ok();
+    assert_child_exited_after_forceful_drop(pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminate_on_drop_kills_child_without_hanging_when_runtime_shuts_down_during_graceful_drop() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tokio_process_tools::{GracefulShutdown, WaitForLineResult};
+
+    const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(20);
+
+    let (pid_tx, pid_rx) = mpsc::channel();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+
+    // Drop the runtime on a separate thread, so a hanging shutdown fails this test instead of
+    // blocking the whole test binary.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Ignores the graceful signal, so the graceful drop keeps waiting until either its
+            // timeout elapses or the runtime shuts down.
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg("trap '' INT TERM; echo ready; sleep 30 & wait");
+            let process = spawn_broadcast_with_replay("ignores-graceful-signal", cmd);
+            let readiness = process
+                .stdout()
+                .wait_for_line(
+                    Duration::from_secs(5),
+                    |line| line == "ready",
+                    line_parsing_options(),
+                )
+                .await
+                .unwrap();
+            assert_that!(readiness).is_equal_to(WaitForLineResult::Matched);
+
+            let guard = process.terminate_on_drop(
+                GracefulShutdown::builder()
+                    .unix_sigterm(GRACEFUL_TIMEOUT)
+                    .windows_ctrl_break(GRACEFUL_TIMEOUT)
+                    .build(),
+            );
+            pid_tx.send(guard.id().unwrap()).unwrap();
+
+            let (dropping_tx, dropping_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                dropping_tx.send(()).unwrap();
+                // The runtime is still running here, so this starts the graceful shutdown and
+                // blocks in it.
+                drop(guard);
+            });
+            dropping_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        // Starts the shutdown while the graceful drop above is still waiting. Tokio's timers
+        // then fail and its "being shutdown" panic, printed to stderr, unwinds out of the drop.
+        drop(rt);
+        dropped_tx.send(()).unwrap();
+    });
+
+    let pid = pid_rx.recv().unwrap();
+    // Well below the graceful timeout, so passing proves that the shutdown cut the graceful
+    // drop short instead of waiting it out.
+    assert_that!(dropped_rx.recv_timeout(Duration::from_secs(10))).is_ok();
+    assert_child_exited_after_forceful_drop(pid);
+}
+
+#[tokio::test]
+async fn terminate_on_drop_into_inner_returns_armed_handle_without_terminating() {
+    use tokio_process_tools::RunningState;
+
+    let guard = spawn_long_running_process().terminate_on_drop(short_graceful_shutdown());
+
+    // A current-thread runtime cannot run the graceful shutdown, so any drop of the wrapper here
+    // would kill the child and panic.
+    let mut process = guard.into_inner();
+
+    assert_that!(process.is_running()).is_matching(pattern!(RunningState::Running));
+    assert_that!(process.is_drop_armed()).is_true();
+
+    process.kill().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn terminate_on_drop_inside_multithreaded_runtime_honors_graceful_shutdown() {
     use std::fs;

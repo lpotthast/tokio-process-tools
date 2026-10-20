@@ -13,9 +13,10 @@
 //!
 //! Because `Drop` is synchronous, the graceful shutdown can only run when the wrapper is
 //! dropped on a thread inside a multithreaded Tokio runtime. Anywhere else (outside any
-//! runtime, inside a current-thread runtime, or while unwinding from a panic), the child's
-//! process group / Job Object is killed immediately instead. `.terminate_on_drop(...)` then
-//! panics to make the lost graceful shutdown impossible to miss. Use
+//! runtime, inside a current-thread runtime, while unwinding from a panic, or while the runtime
+//! is shutting down), the child's process group / Job Object is killed immediately instead.
+//! Outside a runtime or inside a current-thread runtime, `.terminate_on_drop(...)` then panics
+//! to make the lost graceful shutdown impossible to miss. Use
 //! `.terminate_on_drop_with_fallback(..., TerminateOnDropFallback::Trace)` to log an error
 //! through `tracing` instead.
 //!

@@ -40,7 +40,7 @@ fmt-check:
 # Check the code, including the Windows-specific library code.
 check:
     cargo check --all-targets --all-features
-    # Only `--lib`, as tests and benches use Unix-only shell helpers.
+    # Only `--lib`: the dev-dependencies (criterion) need a Windows C toolchain to build. CI runs the tests on Windows.
     cargo check --lib --target x86_64-pc-windows-msvc
 
 # Check that the code still compiles on the minimum supported rust version.

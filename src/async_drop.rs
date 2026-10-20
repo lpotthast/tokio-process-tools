@@ -1,4 +1,6 @@
 use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 /// Why [`try_run_future`] could not run its future on the current thread.
@@ -19,6 +21,12 @@ pub(crate) enum UnsupportedContext {
     /// The tokio runtime entered on the current thread is single-threaded. `block_in_place` needs
     /// other workers to hand the thread's tasks to, so it cannot be used here.
     CurrentThreadRuntime,
+
+    /// The tokio runtime entered on the current thread is shutting down. Its drivers no longer
+    /// wake futures, so blocking on one could hang forever, and with it the shutdown itself.
+    /// This is the case when the future's owner is dropped as part of the runtime shutdown, e.g.
+    /// as the state of a task that is cancelled because the runtime is dropped.
+    RuntimeShuttingDown,
 }
 
 impl UnsupportedContext {
@@ -28,6 +36,7 @@ impl UnsupportedContext {
             Self::Panicking => "while the thread was unwinding from a panic",
             Self::NoRuntime => "outside a tokio runtime context",
             Self::CurrentThreadRuntime => "inside a current-thread tokio runtime",
+            Self::RuntimeShuttingDown => "while its tokio runtime was shutting down",
         }
     }
 }
@@ -55,8 +64,9 @@ impl UnsupportedContext {
 ///    runtimes have no other workers to migrate tasks to, and a thread outside any runtime
 ///    context has no `Handle` to call `block_on` on in the first place. Both cases are reported
 ///    as `Err` instead of being attempted.
-/// 6. `block_in_place` waits indefinitely for the closure body to complete when the executor is
-///    being shut down, which is what makes it safe to use during drop on an active runtime.
+/// 6. The runtime must also still be running. Once it shuts down, its drivers stop waking
+///    futures, so `block_on` would never return and the runtime shutdown, which waits for this
+///    thread, would hang with it. This case is reported as `Err` as well.
 pub(crate) fn try_run_future(future: impl Future<Output = ()>) -> Result<(), UnsupportedContext> {
     if std::thread::panicking() {
         return Err(UnsupportedContext::Panicking);
@@ -70,8 +80,44 @@ pub(crate) fn try_run_future(future: impl Future<Output = ()>) -> Result<(), Uns
         return Err(UnsupportedContext::CurrentThreadRuntime);
     }
 
+    if is_shutting_down(&handle) {
+        return Err(UnsupportedContext::RuntimeShuttingDown);
+    }
+
     tokio::task::block_in_place(|| handle.block_on(future));
     Ok(())
+}
+
+/// Returns whether the runtime behind `handle` has started shutting down.
+///
+/// Tokio offers no direct API for this, so this spawns a no-op probe task and polls its
+/// `JoinHandle` once without blocking. A runtime that is shutting down cancels newly spawned tasks
+/// right away, while a running runtime never cancels a task that was not aborted. The probe is
+/// polled unconstrained so that an exhausted cooperative budget cannot hide the cancellation.
+///
+/// # Limitations
+///
+/// - The answer can be outdated as soon as it is returned, because a shutdown may start right
+///   after the probe. This is harmless for the case the probe exists for. Blocking only hangs
+///   forever when the drop runs as part of the shutdown itself, i.e. while a worker drops the
+///   cancelled tasks: the shutdown then waits for the very thread that is waiting for the
+///   runtime. Tokio closes its task list before dropping any task, so in that case the shutdown
+///   has always started before the probe runs, and the probe reliably sees it.
+/// - If a shutdown instead starts while an earlier `block_on` is already waiting, it does not
+///   hang. The blocked thread has handed its worker over via `block_in_place`, so the shutdown
+///   completes without it, and the runtime's timers then fail. The future panics with Tokio's
+///   "being shutdown" message, and the panic unwinds out of the caller's `Drop`.
+/// - That a task spawned during shutdown is cancelled immediately is observed Tokio behavior,
+///   not a documented guarantee. The `reports_runtime_shutting_down_and_drops_future_unexecuted`
+///   test pins it, so a Tokio release that changes it fails the test suite instead of silently
+///   bringing back the hang.
+/// - The probe is a real task. It is allocated, scheduled onto a worker, and visible to runtime
+///   metrics and task instrumentation. It is only spawned right before a graceful shutdown is
+///   driven, which costs far more.
+fn is_shutting_down(handle: &Handle) -> bool {
+    let probe = pin!(tokio::task::unconstrained(handle.spawn(async {})));
+    let mut cx = Context::from_waker(Waker::noop());
+    matches!(probe.poll(&mut cx), Poll::Ready(Err(err)) if err.is_cancelled())
 }
 
 #[cfg(test)]
@@ -119,6 +165,48 @@ mod tests {
 
             assert_that!(result).is_ok();
             assert_that!(executed.load(Ordering::SeqCst)).is_true();
+        }
+
+        #[test]
+        fn reports_runtime_shutting_down_and_drops_future_unexecuted() {
+            use std::sync::{Arc, Mutex};
+            use std::time::Duration;
+
+            struct ProbeOnDrop {
+                executed: Arc<AtomicBool>,
+                observed: Arc<Mutex<Option<Result<(), UnsupportedContext>>>>,
+            }
+            impl Drop for ProbeOnDrop {
+                fn drop(&mut self) {
+                    let executed = Arc::clone(&self.executed);
+                    let result = try_run_future(async move {
+                        executed.store(true, Ordering::SeqCst);
+                    });
+                    *self.observed.lock().unwrap() = Some(result);
+                }
+            }
+
+            let executed = Arc::new(AtomicBool::new(false));
+            let observed = Arc::new(Mutex::new(None));
+            let probe = ProbeOnDrop {
+                executed: Arc::clone(&executed),
+                observed: Arc::clone(&observed),
+            };
+
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.spawn(async move {
+                let _probe = probe;
+                std::future::pending::<()>().await;
+            });
+            // Let a worker start the task, so the probe is dropped by the shutdown below.
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+            drop(rt);
+
+            assert_that!(*observed.lock().unwrap())
+                .some()
+                .err()
+                .is_equal_to(UnsupportedContext::RuntimeShuttingDown);
+            assert_that!(executed.load(Ordering::SeqCst)).is_false();
         }
 
         #[tokio::test(flavor = "multi_thread")]

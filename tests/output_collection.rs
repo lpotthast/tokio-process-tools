@@ -11,6 +11,7 @@ use tokio_process_tools::{
     LineOutputOptions, UnixGracefulShutdown, WaitWithOutputError, WindowsGracefulShutdown,
 };
 
+#[cfg(unix)]
 fn exits_while_descendant_keeps_stdout_open_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg("printf 'ready\n'; sleep 0.5 &");
@@ -146,6 +147,7 @@ mod with_line_output {
         assert_that!(output.stderr.truncated()).is_false();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn times_out_when_descendant_keeps_output_open() {
         let mut process = spawn_broadcast_with_replay(
@@ -170,6 +172,7 @@ mod with_line_output {
         assert_eof_timeout(&err, eof_timeout);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn single_subscriber_timeout_releases_collector_claim() {
         let mut process = spawn_single_subscriber_with_replay(
@@ -375,6 +378,7 @@ mod with_line_output_or_terminate {
         assert_that!(output.stderr.lines()).contains_exactly(["line-err"]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn times_out_when_descendant_keeps_output_open() {
         let mut process = spawn_broadcast_with_replay(

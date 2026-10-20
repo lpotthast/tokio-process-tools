@@ -87,12 +87,21 @@ silent leak.
 
 `TerminateOnDrop` (in `src/terminate_on_drop.rs` + `src/async_drop.rs`) drives async graceful termination from
 synchronous `Drop`, which **requires the drop to happen on a thread inside a multithreaded Tokio runtime**. In any
-other context (no runtime entered on the dropping thread, a current-thread runtime, or a thread unwinding from a
-panic) the drop kills the process group immediately and reports according to `TerminateOnDropFallback`: `Panic` (used
-by `terminate_on_drop`) or the explicit non-panicking `Trace` opt-out. The panic is always suppressed during an
-existing unwind, where a second panic would abort. A wrapper whose handle is already disarmed (including via
-`must_not_be_terminated()` through `DerefMut`) or whose child has already exited is left alone in every context. Tests
-that exercise the graceful drop path must use `#[tokio::test(flavor = "multi_thread")]`.
+other context (no runtime entered on the dropping thread, a current-thread runtime, a thread unwinding from a panic, or
+a runtime that is shutting down) the drop kills the process group immediately and reports according to
+`TerminateOnDropFallback`: `Panic` (used by `terminate_on_drop`) or the explicit non-panicking `Trace` opt-out. The
+panic is always suppressed during an existing unwind, where a second panic would abort, and during runtime shutdown,
+which is regular application exit. A wrapper whose handle is already disarmed (including via `must_not_be_terminated()`
+through `DerefMut`) or whose child has already exited is left alone in every context. Tests that exercise the graceful
+drop path must use `#[tokio::test(flavor = "multi_thread")]`.
+
+Never `block_on` from a drop that runs as part of a runtime shutdown (a worker dropping cancelled tasks): the shutdown
+waits for that thread, so the drop and the shutdown would hang forever. `async_drop::try_run_future` detects this case
+with a spawn probe. The probe relies on undocumented Tokio behavior (tasks spawned during shutdown are cancelled
+immediately), pinned by a unit test in `async_drop`. Its result can go stale, but only harmlessly: a shutdown that
+starts while a graceful drop is already waiting does not hang. Tokio's timers fail instead, the "being shutdown" panic
+unwinds out of the drop, and the inner handle's guard kills the group. Both outcomes are pinned by integration tests
+in `tests/drop_guard.rs`.
 
 The fallback policy does not govern a graceful termination attempt that runs and returns `Err`. The error is logged
 and the inner handle stays armed, so its own drop then kills again and the armed `PanicOnDrop` raises its generic

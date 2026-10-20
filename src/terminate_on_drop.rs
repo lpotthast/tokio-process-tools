@@ -2,7 +2,9 @@ use crate::async_drop::UnsupportedContext;
 use crate::process_handle::ProcessHandle;
 use crate::process_handle::termination::GracefulShutdown;
 use crate::{OutputStream, RunningState, async_drop};
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
+use std::ptr;
 
 /// How a [`TerminateOnDrop`] reports that it was dropped in a context that cannot run its
 /// graceful shutdown.
@@ -19,8 +21,10 @@ pub enum TerminateOnDropFallback {
     /// should fail loudly in normal execution and tests. This is what
     /// [`ProcessHandle::terminate_on_drop`] uses.
     ///
-    /// If the thread is already unwinding from another panic, the drop logs a warning instead,
-    /// because a second panic from `Drop` would abort the process and hide the original failure.
+    /// The drop logs a warning instead of panicking when the thread is already unwinding from
+    /// another panic, because a second panic from `Drop` would abort the process and hide the
+    /// original failure. The same applies while the Tokio runtime is shutting down, which is a
+    /// regular way for an application to end, not a programming error.
     Panic,
 
     /// Log an error through `tracing` after killing the child, without panicking.
@@ -35,7 +39,8 @@ pub enum TerminateOnDropFallback {
 ///
 /// Created by [`ProcessHandle::terminate_on_drop`] or
 /// [`ProcessHandle::terminate_on_drop_with_fallback`]. It dereferences to the wrapped
-/// [`ProcessHandle`], so the process can still be used, awaited, or terminated explicitly.
+/// [`ProcessHandle`], so the process can still be used, awaited, or terminated explicitly. Use
+/// [`into_inner`](Self::into_inner) to take the handle back out without terminating the process.
 ///
 /// # Drop behavior
 ///
@@ -54,13 +59,19 @@ pub enum TerminateOnDropFallback {
 ///   even while a runtime is still alive elsewhere,
 /// - on a thread inside a current-thread Tokio runtime, which includes plain `#[tokio::test]`
 ///   (use `#[tokio::test(flavor = "multi_thread")]` instead),
-/// - on a thread that is unwinding from a panic.
+/// - on a thread that is unwinding from a panic,
+/// - while the Tokio runtime is shutting down, e.g. because a task owning the wrapper is
+///   cancelled when the runtime is dropped at the end of `main`.
 ///
 /// In these contexts, the process group / Job Object is killed immediately instead, and the
 /// configured [`TerminateOnDropFallback`] decides how this is reported. The killed child is not
 /// reaped, as that would require an async wait. On Unix, Tokio's orphan reaper collects it while
 /// a runtime is still alive. Otherwise, the zombie entry is released when the parent process
 /// exits.
+///
+/// A runtime shutdown can also begin while a graceful shutdown started by this drop is already
+/// running. The runtime's timers then fail, and Tokio's "being shutdown" panic unwinds out of the
+/// drop. The wrapped handle's drop safeguard still kills the process group during that unwind.
 ///
 /// If the graceful shutdown runs but fails, the error is logged through `tracing` and the
 /// wrapped handle stays armed. Its own drop safeguard then attempts a forceful kill and raises
@@ -112,6 +123,23 @@ where
     Stdout: OutputStream,
     Stderr: OutputStream,
 {
+    /// Unwraps the [`ProcessHandle`] without terminating the process.
+    ///
+    /// The returned handle keeps its drop safeguard state. Unless its lifecycle was already
+    /// closed, it is armed, so dropping it without waiting for, terminating, or killing the
+    /// process kills the process group and panics.
+    #[must_use]
+    pub fn into_inner(self) -> ProcessHandle<Stdout, Stderr> {
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: `this` is wrapped in `ManuallyDrop`, so neither our `Drop` implementation nor the
+        // field destructors run for it. `shutdown` is dropped in place exactly once and
+        // `process_handle` is moved out exactly once. The remaining field is `Copy`.
+        unsafe {
+            ptr::drop_in_place(&raw mut this.shutdown);
+            ptr::read(&raw const this.process_handle)
+        }
+    }
+
     /// Returns whether drop has nothing left to terminate, closing the handle's lifecycle if the
     /// child turns out to have exited already.
     ///
@@ -188,15 +216,20 @@ where
         let name = &self.process_handle.name;
         let reason = context.describe();
 
-        // Even under the `Panic` fallback, a panic during an unwind would abort the process and
-        // hide the original panic, so the unwinding case is always just logged.
-        if context == UnsupportedContext::Panicking {
-            tracing::warn!(
-                process = %name,
-                "TerminateOnDrop was dropped {reason}. Killed the process instead of shutting it \
-                 down gracefully."
-            );
-            return;
+        match context {
+            // These contexts are only logged, even under the `Panic` fallback. A panic during an
+            // unwind would abort the process and hide the original panic. A runtime shutdown is a
+            // regular way for an application to end, and Tokio swallows panics raised while it
+            // cancels tasks anyway.
+            UnsupportedContext::Panicking | UnsupportedContext::RuntimeShuttingDown => {
+                tracing::warn!(
+                    process = %name,
+                    "TerminateOnDrop was dropped {reason}. Killed the process instead of \
+                     shutting it down gracefully."
+                );
+                return;
+            }
+            UnsupportedContext::NoRuntime | UnsupportedContext::CurrentThreadRuntime => {}
         }
 
         match self.fallback {

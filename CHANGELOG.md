@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.11.4] - 2026-10-14
+## [0.11.4] - 2026-10-20
 
 ### Added
 
@@ -14,9 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unwinding), it kills the process group / Job Object immediately and then either panics (`Panic`, still the behavior
   of `terminate_on_drop(...)`) or logs an error through `tracing` (`Trace`). The panic is never raised while the thread
   is already unwinding.
+- `TerminateOnDrop::into_inner()`, which takes the still-armed `ProcessHandle` back out of the wrapper without
+  terminating the process.
 
 ### Fixed
 
+- Dropping a Tokio runtime while one of its tasks owns a `TerminateOnDrop` no longer hangs forever, e.g. when `main`
+  returns while a spawned task still owns one. The graceful shutdown cannot complete once the runtime's drivers stop,
+  so the wrapper now kills the process group immediately and logs a warning instead.
 - Calling `must_not_be_terminated()` on a `TerminateOnDrop` now actually lets the child outlive the wrapper. Previously,
   the wrapper still terminated the child when dropped inside a multithreaded runtime.
 - Dropping a `TerminateOnDrop` outside a multithreaded runtime no longer panics when there is nothing left to
@@ -773,7 +778,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added process state helpers such as `id()` and `is_running()`.
 - Added `collect_into_*` helpers on `OutputStream`.
 
-[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.3...HEAD
+[Unreleased]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.4...HEAD
+
+[0.11.4]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.3...v0.11.4
 
 [0.11.3]: https://github.com/lpotthast/tokio-process-tools/compare/v0.11.2...v0.11.3
 

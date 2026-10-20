@@ -305,17 +305,19 @@ for a termination attempt during drop. The signature mirrors `terminate(...)` an
 Because `Drop` is synchronous, the graceful shutdown can only run when the wrapper is dropped on a thread inside a
 multithreaded Tokio runtime. The drop then blocks the current thread while the runtime drives the termination. Under
 `#[tokio::test]`, opt in to `flavor = "multi_thread"`. Anywhere else (outside any runtime, inside a current-thread
-runtime, or while unwinding from a panic), the child's process group / Job Object is killed immediately instead, and a
-`TerminateOnDropFallback` decides how this is reported:
+runtime, while unwinding from a panic, or while the runtime is shutting down), the child's process group / Job Object is
+killed immediately instead, and a `TerminateOnDropFallback` decides how this is reported:
 
 - `Panic`, used by `.terminate_on_drop(shutdown)`, makes the lost graceful shutdown impossible to miss. While the
   thread is already unwinding, it logs a warning instead, because a second panic from `Drop` would abort the process.
+  The same applies during a runtime shutdown, e.g. when a task owning the wrapper is cancelled at the end of `main`.
 - `Trace`, chosen with `.terminate_on_drop_with_fallback(shutdown, TerminateOnDropFallback::Trace)`, logs an error
   through `tracing` instead of panicking. Use it when the wrapper may legitimately be dropped outside a supported
   context, and make sure error events are collected.
 
 If the graceful shutdown runs but fails, the error is logged and the wrapped handle falls back to its usual kill and
-panic. See [`examples/terminate_on_drop.rs`](examples/terminate_on_drop.rs).
+panic. To opt out again, `TerminateOnDrop::into_inner()` returns the still-armed `ProcessHandle`. See
+[`examples/terminate_on_drop.rs`](examples/terminate_on_drop.rs).
 
 When the child genuinely needs to outlive the handle (a daemon spawned intentionally), call `must_not_be_terminated()`.
 That suppresses both the kill and the panic on drop. The library still drops its owned stdio, however: the child loses
